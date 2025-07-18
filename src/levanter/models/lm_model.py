@@ -25,6 +25,7 @@ class LmExample(eqx.Module):
     tokens: hax.NamedArray
     loss_mask: hax.NamedArray
     attn_mask: AttentionMask | NamedArray = AttentionMask.causal()
+    index: Optional[jnp.ndarray] = None
 
     @staticmethod
     def causal(
@@ -35,6 +36,7 @@ class LmExample(eqx.Module):
         eos_id: Optional[int] = None,
         segment_ids: Optional[hax.NamedArray] = None,
         sliding_window: int | None = None,
+        index: Optional[jnp.ndarray] = None,
     ) -> "LmExample":
         if tokens.ndim != 1:
             raise ValueError("tokens must be a 1D array")
@@ -70,7 +72,7 @@ class LmExample(eqx.Module):
         elif segment_ids is not None:
             attn_mask = attn_mask.with_segment_ids(segment_ids)
 
-        return LmExample(tokens=tokens, loss_mask=loss_mask, attn_mask=attn_mask)
+        return LmExample(tokens=tokens, loss_mask=loss_mask, attn_mask=attn_mask, index=index)
 
     @staticmethod
     def from_prompt_and_completion(
@@ -292,3 +294,4 @@ def compute_next_token_loss(
     )
 
     return loss + aux_loss
+
