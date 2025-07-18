@@ -230,6 +230,9 @@ class DataLoader(Iterable[Ex]):
         step = self.scheduler.find_step_containing_offset(total_length) + 1
         return step
 
+    def reversed(self, num_train_steps: int | None = None):
+        return ReversedDataLoader(self, num_train_steps=num_train_steps)
+
 
 class DataLoaderIterator(Iterator[Ex]):
     def __init__(self, data_loader: DataLoader, start_from_batch: int | None = None):
@@ -629,3 +632,126 @@ def _make_padding_example(ex: Ex) -> Ex:
 
 def _round_to_nearest_multiple(x: int, multiple: int) -> int:
     return ((x + multiple - 1) // multiple) * multiple
+
+
+class ReversedDataLoader(Iterable[Ex]):
+    """A thin wrapper that exposes the same interface as :class:DataLoader but iterates in reverse batch order."""
+
+    def __init__(self, dl: DataLoader, num_train_steps: int | None = None):
+        self._dl = dl
+        self._num_train_steps = num_train_steps
+
+    # ---------------- Iterable interface ----------------
+    def __iter__(self):
+        return _ReversedDataLoaderIterator(self._dl, num_train_steps=self._num_train_steps)
+
+    # --------------- convenience passthroughs ------------
+    def __getattr__(self, item):
+        """Delegate attribute access to the wrapped DataLoader for convenience (read-only)."""
+        return getattr(self._dl, item)
+
+
+class _ReversedDataLoaderIterator(DataLoaderIterator):
+    """
+    Iterator that yields batches in the opposite order compared to
+    :class:`DataLoaderIterator`, but only over the first `num_train_steps`
+    batches if that argument is supplied.
+    """
+
+    # ------------------------------------------------------------------
+    # Constructor
+    # ------------------------------------------------------------------
+    def __init__(
+        self,
+        data_loader: DataLoader,
+        *,
+        num_train_steps: int | None = None,   # ← NEW
+    ):
+        # -------------------------------------------------------------
+        # 1.  Work out the *upper-most* batch number we are allowed to
+        #     visit.  If `num_train_steps` is provided, it wins; otherwise
+        #     we fall back to whatever the dataset length allows.
+        # -------------------------------------------------------------
+        if not data_loader.data_store.is_finite():
+            raise ValueError(
+                "ReversedDataLoader requires a finite dataset with a known length."
+            )
+
+        total_len = blocking_wait(data_loader.data_store.async_len())
+
+        # “Natural” last batch in the dataset.
+        last_bn_dataset = 0
+        while data_loader.scheduler.global_data_offset_by_step(last_bn_dataset) < total_len:
+            last_bn_dataset += 1
+        last_bn_dataset -= 1
+        if last_bn_dataset < 0:
+            raise ValueError("Dataset appears to be empty – nothing to iterate over in reverse.")
+
+        # If the caller limits us, respect it (but never exceed the dataset’s end).
+        if num_train_steps is not None:
+            self._last_batch_number = min(num_train_steps - 1, last_bn_dataset)
+        else:
+            self._last_batch_number = last_bn_dataset
+
+        # Figure out sizing info for that *new* last batch.
+        self._final_batch_start = data_loader.scheduler.global_data_offset_by_step(
+            self._last_batch_number
+        )
+        self._final_batch_expected_size = data_loader.scheduler.batch_size_at_step(
+            self._last_batch_number
+        )
+        self._final_batch_size = total_len - self._final_batch_start
+        if self._final_batch_size == 0:
+            # Perfectly divisible – treat as a full batch.
+            self._final_batch_size = self._final_batch_expected_size
+
+        # Remember the limit so we know when to stop in `_produce_batches`.
+        self._num_train_steps = num_train_steps
+
+        # -------------------------------------------------------------
+        # 2.  Now it’s safe to invoke the parent, which launches the
+        #     background pre-fetch thread that calls `_produce_batches`.
+        # -------------------------------------------------------------
+        super().__init__(data_loader, start_from_batch=None)  # type: ignore[arg-type]
+
+    # ------------------------------------------------------------------
+    # Core producer
+    # ------------------------------------------------------------------
+    async def _produce_batches(self):  # type: ignore[override]
+        bn = self._last_batch_number
+        prefetch = self.dl.prefetch_size
+
+        # How many batches we’ve yielded so far (needed if we are limited).
+        yielded = 0
+        to_yield_total = (
+            self._num_train_steps if self._num_train_steps is not None else None
+        )
+
+        while bn >= 0 and (to_yield_total is None or yielded < to_yield_total):
+            lower_bn = max(0, bn - prefetch + 1)
+            next_batch_numbers = list(range(lower_bn, bn + 1))[::-1]
+
+            # Trim window so we don’t overshoot `num_train_steps`.
+            if to_yield_total is not None:
+                remaining = to_yield_total - yielded
+                next_batch_numbers = next_batch_numbers[:remaining]
+
+            batches: list[_Batch[None]] = []
+            for batch_number in next_batch_numbers:
+                global_offset = self.dl.scheduler.global_data_offset_by_step(batch_number)
+                global_size = self.dl.scheduler.batch_size_at_step(batch_number)
+                if (
+                    batch_number == self._last_batch_number
+                    and self._final_batch_size != global_size
+                ):
+                    global_size = self._final_batch_size
+                batches.append(_Batch(batch_number, global_offset, global_size, {}))
+
+            batch_of_batches = await self._do_retrieve_batch_of_batches(batches)
+
+            for batch in batch_of_batches:
+                yield self._batchify_local_data(batch)
+                yielded += 1
+
+            # Move cursor to the preceding window.
+            bn = lower_bn - 1
