@@ -153,7 +153,7 @@ class TokenSeqDataset(AsyncDataset[np.ndarray]):
         return length
 
 
-class CausalLmDataset(MappedAsyncDataset[np.ndarray, LmExample]):
+class CausalLmDataset(AsyncDataset[LmExample]):
     def __init__(
         self,
         dataset: AsyncDataset[np.ndarray],
@@ -162,26 +162,38 @@ class CausalLmDataset(MappedAsyncDataset[np.ndarray, LmExample]):
         ignore_index: Optional[int] = None,
         eos_id: Optional[int] = None,
     ):
+        super().__init__()
         self.dataset = dataset
         self.Pos = Pos
         self.ignore_id = ignore_index
         self.eos_id = eos_id
 
+    async def get_batch(self, indices: Sequence[int]) -> Sequence[LmExample]:
+        tokens_batch = await self.dataset.get_batch(indices)
+
         sharding = jax.sharding.SingleDeviceSharding(jax.local_devices(backend="cpu")[0])
 
         @functools.partial(eqx.filter_jit)
-        def _create_lm_example(tokens):
+        def _create_lm_example(tokens, index):
             tokens = hax.named(tokens, self.Pos)
-            example = LmExample.causal(tokens=tokens, ignore_id=self.ignore_id, eos_id=eos_id)
-
-            example = jax.lax.with_sharding_constraint(example, sharding)
-
+            example = LmExample.causal(
+                tokens=tokens, ignore_id=self.ignore_id, eos_id=self.eos_id, index=index
+            )
             return example
 
-        super().__init__(self.dataset, _create_lm_example)
+        return [_create_lm_example(tokens, np.array(index, dtype=np.int32)) for tokens, index in zip(tokens_batch, indices)]
 
     async def async_len(self) -> int:
         return await self.dataset.async_len()
+
+    def is_finite(self) -> bool:
+        return self.dataset.is_finite()
+
+    async def current_len(self) -> Optional[int]:
+        return await self.dataset.current_len()
+
+    async def final_length_is_known(self) -> bool:
+        return await self.dataset.final_length_is_known()
 
 
 def _maybe_force_tokenizer_parallelism(tokenizer: PreTrainedTokenizerBase):
