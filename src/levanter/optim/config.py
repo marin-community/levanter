@@ -155,7 +155,7 @@ class OptimizerConfig(draccus.ChoiceRegistry, abc.ABC):
             if "RmsNorm" in path:
                 return False
             if "Embedding" in path:
-                return False
+                return False # TODO: CHANGE BACK
             if path.endswith("bias"):
                 return False
             return None
@@ -407,7 +407,8 @@ class AdamConfig(OptimizerConfig):
     # https://x.com/giffmana/status/1692641748445438301
     beta2: float = 0.95
     epsilon: float = 1e-8
-    max_grad_norm: Optional[float] = 1.0
+    epsilon_root: float = 1e-8
+    max_grad_norm: Optional[float] = None
     nesterov: bool = False
     update_rms_clipping: Optional[float] = None
     """
@@ -461,7 +462,7 @@ class AdamConfig(OptimizerConfig):
             if self.max_grad_norm:
                 components.append(optax.clip_by_global_norm(self.max_grad_norm))
 
-            components.append(optax.scale_by_adam(self.beta1, self.beta2, self.epsilon, nesterov=self.nesterov))
+            components.append(optax.scale_by_adam(self.beta1, self.beta2, self.epsilon, self.epsilon_root, nesterov=self.nesterov))
 
             if self.weight_decay > 0:
                 if self.adamc_weight_decay:

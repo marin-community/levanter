@@ -218,7 +218,7 @@ class BatchTokenizer(BatchProcessor[dict, dict]):
         self,
         tokenizer: HfTokenizer,
         text_field="text",
-        enforce_bos=True,
+        enforce_bos=False,
         enforce_eos=True,
         *,
         override_resources=None,
@@ -549,11 +549,18 @@ class LMTaskConfig(abc.ABC):
     shuffle: bool | int = False
     """whether to shuffle the dataset. True means shuffle the whole dataset, False means don't shuffle.
     If you want to shuffle in eras, set this to the era length"""
-    permutation_type: Literal["feistel", "linear"] | None = None
+    permutation_type: Literal["feistel", "linear", "predefined"] | None = None
     """
     Type of permutation to use for shuffle.
 
     If None, defaults to linear, but this will change in the future since Feistel is better.
+    If "predefined", uses a permutation loaded from permutation_file.
+    """
+    permutation_file: Optional[str] = None
+    """
+    Path to a .npy file containing a predefined permutation array.
+    Only used when permutation_type is "predefined".
+    The file should contain a numpy array that is a valid permutation of range(dataset_length).
     """
 
     @cached_property
@@ -1025,8 +1032,16 @@ class SingleDatasetLMConfigBase(LmDatasetSourceConfigBase, LMTaskConfig):
             perm_type = "linear"
 
         if self.shuffle is True:
-            ds = ds.shuffle(key, perm_type=perm_type)
+            if perm_type == "predefined":
+                if self.permutation_file is None:
+                    raise ValueError("permutation_file must be specified when using predefined permutation type")
+                print(f"🔀 CREATING PREDEFINED PERMUTATION DATASET with file: {self.permutation_file}")
+                ds = ds.shuffle(key=None, perm_type=perm_type, permutation_file_path=self.permutation_file)
+            else:
+                ds = ds.shuffle(key, perm_type=perm_type)
         elif isinstance(self.shuffle, int) and self.shuffle > 0:
+            if perm_type == "predefined":
+                raise ValueError("Era shuffling is not supported with predefined permutations")
             ds = ds.era_shuffle(self.shuffle, key=key, perm_type=perm_type)
 
         if epochs:
@@ -1254,8 +1269,16 @@ class LMMixtureDatasetConfig(LMTaskConfig):
 
         def shuffle_ds(ds, key):
             if self.shuffle is True:
-                ds = ds.shuffle(key, perm_type=perm_type)
+                if perm_type == "predefined":
+                    if self.permutation_file is None:
+                        raise ValueError("permutation_file must be specified when using predefined permutation type")
+                    print(f"🔀 CREATING PREDEFINED PERMUTATION DATASET (mixture) with file: {self.permutation_file}")
+                    ds = ds.shuffle(key=None, perm_type=perm_type, permutation_file_path=self.permutation_file)
+                else:
+                    ds = ds.shuffle(key, perm_type=perm_type)
             elif isinstance(self.shuffle, int) and self.shuffle > 0:
+                if perm_type == "predefined":
+                    raise ValueError("Era shuffling is not supported with predefined permutations")
                 ds = ds.era_shuffle(self.shuffle, key=key, perm_type=perm_type)
 
             return ds
