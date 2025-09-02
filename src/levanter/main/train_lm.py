@@ -5,9 +5,16 @@ import dataclasses
 import functools
 import gc
 import logging
+import jax
 import os
 from dataclasses import dataclass, field
 from typing import Optional, Union
+from pathlib import Path
+import numpy as np
+#from jax import config as jcfg
+#jcfg.update("jax_experimental_name_stack", True)
+
+os.environ['XLA_FLAGS'] = '--xla_gpu_deterministic_ops=true'
 
 import jax.numpy as jnp
 import jax.random as jrandom
@@ -30,6 +37,30 @@ from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, compute_n
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.utils.jax_utils import parameter_count
+
+import fsspec
+import subprocess
+
+def print_host_memory_usage():
+    """Prints the host's current memory usage using the 'free -h' command."""
+    try:
+        print("--- Host Memory Availability ---")
+        # The 'free -h' command provides human-readable memory stats
+        result = subprocess.run(
+            ['free', '-h'],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        print(result.stdout)
+        print("------------------------------")
+    except FileNotFoundError:
+        print("Error: The 'free' command was not found. This code is intended for Linux systems.")
+    except subprocess.CalledProcessError as e:
+        print(f"Error executing command: {e.stderr}")
+
+# --- Insert this call at the start of your training script ---
+print_host_memory_usage()
 
 
 logger = logging.getLogger(__name__)
@@ -70,9 +101,26 @@ class TrainLmConfig:
     # TODO: really need to add callback framework
     log_entropy: bool = False
 
+    out_dir: str = 'out_dir'
+    cfx_seed: int = 0
+    train_only: bool = False
+
+    load_debug_weights: bool = False
+
 
 def main(config: TrainLmConfig):
     tokenizer = config.data.the_tokenizer
+
+    # print the special tokens
+    print(tokenizer)
+    print(f"Special tokens: {tokenizer.special_tokens_map}")
+    print(f"eos token: {tokenizer.eos_token}")
+    print(f"eos token id: {tokenizer.eos_token_id}")
+    print(f"pad token: {tokenizer.pad_token}")
+    print(f"pad token id: {tokenizer.pad_token_id}")
+    print(f"unk token: {tokenizer.unk_token}")
+    print(f"unk token id: {tokenizer.unk_token_id}")
+    print(f"bos token: {tokenizer.bos_token}")
 
     # this is some unpleasant code to allow us to initialize from a hf checkpoint. If this is your first read through,
     # I recommend skipping it for now
@@ -103,6 +151,7 @@ def main(config: TrainLmConfig):
     levanter.initialize(config)
     optimizer = config.optimizer.build(config.trainer.num_train_steps)
 
+    print('Z-loss weight: ', config.z_loss_weight, flush=True)
     loss_function = functools.partial(compute_next_token_loss, logsumexp_weight=config.z_loss_weight)
 
     # Using the trainer as a context manager does 3 things:
@@ -149,8 +198,14 @@ def main(config: TrainLmConfig):
 
         state = trainer.initial_state(training_key, model_init=lambda: config.model.build(Vocab, key=model_key))
 
+
         if int(state.step) == 0 and config.initialize_from_checkpoint_path is not None:
-            state = load_checkpoint(state, config.initialize_from_checkpoint_path)
+            logger.info(f"Initializing model weights from checkpoint {config.initialize_from_checkpoint_path}")
+            # By default, state.step is 0 and we have a fresh model.
+            # We load just the model weights from the checkpoint and replace the model in the fresh state.
+            # This leaves the step and optimizer state as new.
+            model_from_checkpoint = load_checkpoint(state.model, config.initialize_from_checkpoint_path, subpath="model")
+            state = dataclasses.replace(state, model=model_from_checkpoint)
 
         if int(state.step) == 0:
             # TODO: I don't love that we init the model twice, but it's not a big deal i think?
@@ -243,6 +298,12 @@ def main(config: TrainLmConfig):
             logits = hax.dot(activations, head, axis=model.Embed)
             return logits
 
+        print("Validation sets:")
+        for name, dataset in config.data.validation_sets(Pos).items():
+            print(f"> Dataset {name}", dataset)
+            val_loader = trainer.data_loader(dataset, trainer.EvalBatch)
+            val_loader = val_loader.iter_from_step(0)
+
         if config.log_entropy:
             for name, dataset in config.data.validation_sets(Pos).items():
                 trainer.add_hook(
@@ -257,7 +318,31 @@ def main(config: TrainLmConfig):
                     every=config.trainer.steps_per_eval,
                 )
 
+
         train_loader = trainer.data_loader(train_dataset)
+
+        '''
+        # Decode and print the first few examples
+        print("Decoding first few examples...")
+        for i, example in enumerate(iter(train_loader)):
+            if i >= 5: # Print 5 examples
+                break
+
+            # example is a dict, get the input_ids which is a NamedArray
+            # with axes (batch, position)
+            input_ids = example.tokens.array
+
+            for j in range(input_ids.shape[0]): # iterate over batch
+                # don't decode padding tokens
+                non_padding_ids = input_ids[j][input_ids[j] != tokenizer.pad_token_id]
+                print(non_padding_ids)
+                text = tokenizer.decode(non_padding_ids.tolist())
+                print(f"Example {i*input_ids.shape[0] + j}:")
+                print(text)
+                print("-" * 20)
+        '''
+
+        reversed_train_loader = train_loader.reversed(config.trainer.num_train_steps)
         if state.step > 0:
             logger.info(f"Resuming training from step {state.step}")
             train_loader = train_loader.iter_from_step(state.step)
@@ -265,7 +350,25 @@ def main(config: TrainLmConfig):
             train_loader = train_loader.iter_from_step(0)
 
         ## OK, actually run training!
-        last_info = trainer.train(state, train_loader)
+        #last_info = trainer.train(state, train_loader)
+        #data_weight_vector = jnp.ones(len(train_dataset) * trainer.config.batch_size)
+        data_weight_vector = jnp.ones(100_000) # TODO: placeholder
+
+        if config.train_only:
+            # randomly set 5% of indices to 0
+            data_weight_vector = jax.random.bernoulli(jax.random.PRNGKey(config.cfx_seed), 0.95, data_weight_vector.shape).astype(jnp.float32)
+            #data_weight_vector = data_weight_vector.at[:1024*40].set(1.0)
+        print(f"data_weight_vector: {data_weight_vector[:100]}")
+
+        ret = trainer.train_and_replay(state, train_loader, reversed_train_loader, val_loader,
+                                             data_weight_vector, train_only=config.train_only)
+        reward, metagrads = ret
+        out_dir = Path(config.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        np.save(out_dir / 'reward.npy', reward)
+        np.save(out_dir / 'metagrads.npy', metagrads)
+        np.save(out_dir / 'data_weight_vector.npy', data_weight_vector)
+
 
         # If running EpochDataset save latest checkpoint by default
         if trainer.config.checkpointer is not None and config.epoch > 0:
@@ -279,3 +382,4 @@ def main(config: TrainLmConfig):
 
 if __name__ == "__main__":
     levanter.config.main(main)()
+
