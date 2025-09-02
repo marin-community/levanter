@@ -62,6 +62,7 @@ class LmExample(eqx.Module):
 
         attn_mask = AttentionMask.causal(sliding_window=sliding_window)
 
+        '''
         if eos_id is not None and segment_ids is None:
             # the next token after an eos token is in a new segment
             eos_mask = hax.roll(tokens, 1, Pos) == eos_id
@@ -71,6 +72,7 @@ class LmExample(eqx.Module):
             attn_mask = attn_mask.with_segment_ids(segment_ids)
         elif segment_ids is not None:
             attn_mask = attn_mask.with_segment_ids(segment_ids)
+        '''
 
         return LmExample(tokens=tokens, loss_mask=loss_mask, attn_mask=attn_mask, index=index)
 
