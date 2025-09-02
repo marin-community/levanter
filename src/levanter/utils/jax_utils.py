@@ -114,7 +114,7 @@ def multihost_broadcast_sync(obj: X, is_source: Optional[bool] = None, timeout: 
     return obj
 
 
-def barrier_sync(timeout: float = 200):
+def barrier_sync(timeout: float = 30):
     """
     Uses jax's unpublished distributed api to wait for all processes to reach a barrier. This is useful for ensuring
     that all processes have reached a certain point in the code before continuing.

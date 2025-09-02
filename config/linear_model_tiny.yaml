@@ -1,0 +1,34 @@
+data:
+  id: roneneldan/TinyStories
+  #id: Tristan/RedPajama-Data-V2-sample-100B-filtered-shuffled-tokenized-with-token-counts
+model:
+  type: linear
+  dim: 512
+  seq_len: 128
+trainer:
+  mp: p=f32,c=f32
+  model_axis_size: 1
+  per_device_parallelism: 64
+  per_device_eval_parallelism: 64
+
+  train_batch_size: 128
+  num_train_steps: 50
+  max_eval_batches: 1
+
+  ray:
+    auto_start_cluster: false
+
+  tracker:
+    - type: wandb
+      project: "levanter"
+
+  checkpointer:
+    keep:
+      - every: 1
+    save_interval: 5m
+out_dir: out_dir_test
+optimizer:
+  lr_schedule: linear
+  learning_rate: 1E-3
+  weight_decay: 0.1
+  warmup: 0.1

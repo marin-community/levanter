@@ -1,0 +1,44 @@
+data:
+  train_urls:
+    - "/juice5/scr5/nlp/data/huggingface/lingua-data/fineweb_edu_10bt_shuffled/fineweb_edu_10bt.chunk.00.jsonl"
+  validation_urls:
+    - "/juice5/scr5/nlp/data/huggingface/lingua-data/fineweb_edu_10bt_shuffled/fineweb_edu_10bt.val.jsonl"
+  cache_dir: /scr-ssd/sampark/levanter/data_cache/fineweb_edu_10bt_shuffled
+  #id: dlwh/wikitext_103_detokenized
+  #id: Tristan/RedPajama-Data-V2-sample-100B-filtered-shuffled-tokenized-with-token-counts
+model:
+  type: llama
+  hidden_dim: 768
+  intermediate_dim: 2048
+  num_heads: 12
+  num_kv_heads: 12
+  num_layers: 12
+  seq_len: 128
+  gradient_checkpointing: true
+trainer:
+  mp: p=f32,c=bfloat16
+  model_axis_size: 1
+  per_device_parallelism: 64
+  per_device_eval_parallelism: 64
+
+  train_batch_size: 8192
+  num_train_steps: 1000
+
+  ray:
+    auto_start_cluster: false
+
+  tracker:
+    - type: wandb
+      project: "levanter"
+
+  checkpointer:
+    keep:
+      - every: 1
+    save_interval: 5m
+out_dir: out_dir_test
+optimizer:
+  learning_rate: 1E-3
+  weight_decay: 0.1
+  warmup: 0.1
+
+initialize_from_checkpoint_path: /juice5b/scr5b/sampark/levanter/checkpoints/fineweb_bs_8k_800its/step-800

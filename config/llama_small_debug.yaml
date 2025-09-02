@@ -1,0 +1,40 @@
+data:
+  id: roneneldan/TinyStories
+model:
+  type: llama
+  hidden_dim: 128
+  intermediate_dim: 512
+  num_heads: 1
+  num_kv_heads: 1
+  num_layers: 1
+  seq_len: 1024
+  gradient_checkpointing: true
+trainer:
+  mp: p=f32,c=f32
+  model_axis_size: 1
+  per_device_parallelism: 64
+  per_device_eval_parallelism: 64
+
+  train_batch_size: 128
+  num_train_steps: 50
+  max_eval_batches: 1
+
+  ray:
+    auto_start_cluster: false
+
+  tracker:
+    - type: wandb
+      project: "levanter"
+
+  checkpointer:
+    keep:
+      - every: 1
+    save_interval: 5m
+  load_debug_weights: true
+
+out_dir: out_dir_test
+optimizer:
+  lr_schedule: linear
+  learning_rate: 1E-3
+  weight_decay: 0.1
+  warmup: 0.1

@@ -1,0 +1,65 @@
+data:
+  train_urls:
+    - "/juice5/scr5/nlp/data/huggingface/lingua-data/fineweb_edu_10bt_shuffled/fineweb_edu_10bt.chunk.00.jsonl"
+  validation_urls:
+    - "/juice5/scr5/nlp/data/huggingface/lingua-data/fineweb_edu_10bt_shuffled/fineweb_edu_10bt.val.jsonl"
+  cache_dir: /scr-ssd/sampark/levanter/data_cache/fineweb_edu_10bt_shuffled
+  #id: dlwh/wikitext_103_detokenized
+  #id: Tristan/RedPajama-Data-V2-sample-100B-filtered-shuffled-tokenized-with-token-counts
+model:
+  type: gpt2
+  hidden_dim: 2048
+  num_heads: 16
+  num_layers: 16
+  seq_len: 1024
+  gradient_checkpointing: true
+  layer_norm_epsilon: 1e-2
+  qk_norm: true
+trainer:
+  mp: p=f32,c=f32
+  model_axis_size: 1
+  per_device_parallelism: 1
+  per_device_eval_parallelism: 1
+
+  profiler: false
+  profiler_start_step: 7
+  profiler_num_steps: 2
+  backward_profiler: false
+  backward_profiler_start_step: 3
+  backward_profiler_num_steps: 2
+  log_dir: "jax_profile_traces"
+
+  train_batch_size: 8192
+  num_train_steps: 2
+  max_eval_batches: 1
+
+  ray:
+    auto_start_cluster: false
+
+  tracker:
+    - type: wandb
+      project: "levanter"
+
+  checkpointer:
+    keep:
+      - every: 1
+    save_interval: 5m
+    base_path: /scr-ssd/sampark/levanter/checkpoints/
+
+  load_debug_weights: false
+
+  metagrad_checkpoint_frequency: 20
+
+  # Enable logging of gradients, parameters, and Adam optimizer state (mu and nu)
+  watch:
+    watch_targets: ["grads", "params", "adam_mu", "adam_nu"]
+    include_norms: true
+    include_per_parameter_norms: true
+    interval: 10
+
+out_dir: out_dir_test
+optimizer:
+  lr_schedule: linear
+  learning_rate: 1E-4
+  weight_decay: 0.1
+  warmup: 0.1

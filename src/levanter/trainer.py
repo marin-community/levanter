@@ -27,24 +27,31 @@ from typing import (
     Union,
     ContextManager,
 )
+from tqdm import tqdm
 
 import equinox as eqx
 import fsspec
 import jax
+#jax.config.update("jax_log_compiles", True)
 import jax.numpy as jnp
 import jmp
 import numpy as np
+import time
+import wandb
 from draccus import field
 from jax.experimental import multihost_utils
-from jax.sharding import Mesh
+from jax.sharding import Mesh, PartitionSpec as P
+from jax._src import mesh as mesh_lib
+import jax.debug as debug
 from jaxtyping import PRNGKeyArray, PyTree
+import optax
 from optax import GradientTransformation
 
 import haliax as hax
 import haliax.tree_util
 from haliax import Axis
 from haliax.partitioning import ResourceAxis, ResourceMapping, named_jit
-from haliax.quantization import QuantizationConfig
+from haliax.quantization import QuantizationConfig, apply_updates, partition_for_grad_overwrite
 from haliax.types import Scalar
 
 import levanter.callbacks._metrics
@@ -61,14 +68,16 @@ from levanter.data import AsyncDataset, DataLoader
 from levanter.data.loader import _round_to_nearest_multiple
 from levanter.distributed import DistributedConfig, RayConfig
 from levanter.grad_accum import microbatched
+from levanter.models.lm_model import compute_next_token_loss
 from levanter.optim.model_averaging import ModelAveragingConfig
 from levanter.schedule import BatchSchedule, IntSchedule, ScheduleStep, value_at_step
 from levanter.tracker import TrackerConfig, capture_time
-from levanter.trainer_state import InsideJitInfo, TrainerState, saveable_training_mask
+from levanter.trainer_state import InsideJitInfo, TrainerState, saveable_training_mask, trainables_only
 from levanter.utils import cloud_utils, fsspec_utils
-from levanter.utils.jax_utils import create_fsdp_mesh, zeros_like_tree
-from levanter.utils.tree_utils import inference_mode
-from levanter.utils.types import ComputeLossFunction, FilterSpec
+from levanter.utils.jax_utils import barrier_sync, create_fsdp_mesh, zeros_like_tree
+from levanter.utils.tree_utils import inference_mode, tree_statistics
+from levanter.utils.types import ComputeLossFunction, FilterSpec, FilterTree
+from levanter.layers.attention import AttentionMask
 
 
 logger = pylogging.getLogger(__name__)
@@ -80,6 +89,7 @@ S = TypeVar("S", bound=TrainerState)  # State
 DEFAULT_JAX_CONFIG: Dict[str, JsonAtom] = {
     "jax_threefry_partitionable": True,
     "jax_softmax_custom_jvp": True,
+    "jax_explain_cache_misses": True,
 }
 
 
@@ -169,6 +179,341 @@ def _unify_model_and_model_init(model: Optional[M], model_init: Optional[Callabl
     return model_init
 
 
+def _make_opt_sharding(x, dim, mesh: Mesh | None = None):
+    current_mesh = mesh or mesh_lib.get_concrete_mesh()
+    if current_mesh is None or not getattr(current_mesh, "axis_names", ()):
+        return None  # no named mesh active; don't attach NamedSharding
+
+    data_axis = ResourceAxis.DATA if ResourceAxis.DATA in current_mesh.axis_names else "data"
+
+    if x.size > 1024:
+        if x.shape[0] % dim == 0:
+            return jax.NamedSharding(current_mesh, P(data_axis))
+        if x.shape[1] % dim == 0:
+            return jax.NamedSharding(current_mesh, P(None, data_axis))
+        if x.shape[2] % dim == 0:
+            return jax.NamedSharding(current_mesh, P(None, None, data_axis))
+        raise ValueError(f"Neither first, second, nor third dim of tensor divides {dim}")
+    return None
+
+
+def lmexample_to_weighted_batch(
+    example_batch: levanter.models.lm_model.LmExample, grad_accum_size: int, global_idx_start: int, pad_token_id: int
+):
+    """
+    Convert a Levanter LmExample batch into the dict expected by the
+    gradient-accumulation training loop.
+
+    Returns a dict of NamedArrays:
+        {
+          "input_ids":  NamedArray with axes ("microbatch", batch, Pos),
+          "labels":     NamedArray with axes ("microbatch", batch, Pos),
+          "index":      NamedArray with axes ("microbatch", batch),
+        }
+    """
+    # 1 – Get Haliax arrays and axes
+    tokens = example_batch.tokens
+
+    # We need to figure out which axis is Batch and which is Position.
+    # The DataLoader is responsible for adding the batch axis. The model defines the position axis.
+    # A bit of a hack, but we'll assume the position axis is the one with "pos" in its name.
+    pos_axis = None
+    batch_axis = None
+    for axis in tokens.axes:
+        if "pos" in axis.name.lower():
+            pos_axis = axis
+        else:
+            batch_axis = axis
+
+    if pos_axis is None or batch_axis is None:
+        # Fallback to assuming (Batch, Pos) order
+        batch_axis, pos_axis = tokens.axes
+
+    B = batch_axis.size
+
+    # 2 – targets are next-token ids; last position is padding
+    labels = hax.roll(tokens, -1, axis=pos_axis)
+    labels = labels.at[pos_axis, -1].set(pad_token_id)
+
+    # 3 – sample indices (use your own if the loader provides one)
+    index_vec_jnp = example_batch.index #jnp.arange(B, dtype=jnp.int32) + global_idx_start
+    #debug.print("index_vec_jnp: {}", index_vec_jnp)
+    #debug.print("orig index: {}", example_batch.index)
+
+    # 4 – reshape for micro-batching
+    batch_size = B // grad_accum_size
+    Microbatch = hax.Axis("microbatch", grad_accum_size)
+    MiniBatch = hax.Axis(batch_axis.name, batch_size)
+
+    batched_input_ids = tokens.unflatten_axis(batch_axis, (Microbatch, MiniBatch))
+    batched_labels = labels.unflatten_axis(batch_axis, (Microbatch, MiniBatch))
+
+    index_vec = hax.named(index_vec_jnp, batch_axis)
+    batched_index = index_vec.unflatten_axis(batch_axis, (Microbatch, MiniBatch))
+
+    batched = {
+        "input_ids": batched_input_ids,
+        "labels": batched_labels,
+        "index": batched_index,
+    }
+    return batched
+
+
+def compute_weighted_loss(
+    logits: hax.NamedArray,
+    targets: hax.NamedArray,
+    pad_token_id: int,
+    weights: Optional[hax.NamedArray] = None,
+    base_loss_fn: Callable[
+        [jnp.ndarray, jnp.ndarray], jnp.ndarray
+    ] = optax.softmax_cross_entropy_with_integer_labels,
+    reduce: bool = True,
+) -> Union[hax.NamedArray, Scalar]:
+    """Compute weighted loss.
+
+    Args:
+        logits: Model predictions [batch, seq_len, vocab_size]
+        targets: Target tokens [batch, seq_len]
+        weights: Per-sample weights [batch] or None for uniform weighting
+    """
+    vocab_axis = logits.axes[-1]
+    # flatten all axes except vocab
+    batch_axes = logits.axes[:-1]
+    flat_logits = logits.flatten_axes(batch_axes, "flat_batch")  # shape (flat_batch, vocab)
+    flat_targets = targets.flatten_axes(targets.axes, "flat_batch")  # shape (flat_batch,)
+
+    # these are now named arrays, but base_loss_fn expects jnp arrays
+    losses_flat = base_loss_fn(flat_logits.array, flat_targets.array)  # shape (flat_batch,)
+
+    # un-flatten
+    losses = hax.named(losses_flat, flat_targets.axes).unflatten_axis("flat_batch", targets.axes)
+
+    if pad_token_id is not None:
+        mask = targets != pad_token_id
+        losses = losses * mask
+
+    pos_axis = targets.axes[-1]  # assuming position is last axis of targets
+    losses = hax.mean(losses, axis=pos_axis)
+
+    if weights is not None:
+        # losses is a NamedArray, but weights might be a raw jax array tracer.
+        # we handle both cases by getting the raw array out of weights if it's a NamedArray.
+        weights_array = weights.array if isinstance(weights, hax.NamedArray) else weights
+        weighted_losses_array = losses.array * weights_array
+        losses = hax.named(weighted_losses_array, losses.axes)
+
+    if reduce:
+        return hax.mean(losses).scalar()
+    else:
+        return losses
+
+
+def make_train_functions(optimizer: optax.GradientTransformation, pad_token_id: int,
+                         is_trainable: FilterTree = True, compute_axis_mapping: ResourceMapping = None):
+    """Takes in the static arguments and returns training functions.
+
+    Training operates over single batches, where each batch consists of grad_accum_size microbatches.
+    We checkpoint the inside of the batch step, so that during the VJP we only materialize each microbatch worth of data gradients at once.
+
+    Note how we do the VJP in two steps - first propagating back to the summed gradient, and then back to the individual exampeles.
+    For the second step, using a JVP is faster for batched inner products with per-example gradients so we have a manual version of that.
+    """
+
+    def microbatch_step_full(data_weights, train_state, carry, microbatch_data):
+        """ runs a single microbatch step, accumulating the gradients and the loss """
+        grad_buffer, loss_sum = carry
+        model, _ = train_state
+        inputs = microbatch_data["input_ids"]
+        targets = microbatch_data["labels"]
+        index = microbatch_data["index"]
+        weights = data_weights[index.array]
+
+        def weighted_loss(model):
+            logits = model(inputs, attn_mask=AttentionMask.causal())
+            return compute_weighted_loss(logits, targets, pad_token_id, weights)
+
+        #loss, grads = eqx.filter_checkpoint(eqx.filter_value_and_grad(weighted_loss))(model)
+        differentiable_model, static_model = eqx.partition(model, eqx.is_inexact_array)
+        loss, grads = eqx.filter_checkpoint(
+            lambda m: eqx.filter_value_and_grad(weighted_loss)(eqx.combine(m, static_model))
+        )(differentiable_model)
+
+        grad_buffer = jax.tree.map(lambda g_new, g: g + g_new, grads, grad_buffer)
+        return (grad_buffer, loss_sum + loss), loss
+
+
+    def _make_zero_grad_tree(model):
+        """Arrays → zeros, everything else → None."""
+        def _zero_or_none(leaf):
+            return jnp.zeros_like(leaf) if eqx.is_inexact_array(leaf) else None
+        return jax.tree.map(_zero_or_none, model)
+
+
+    def compute_grads(data_weights, train_state, batch_data):
+        """
+        Accumulate gradients over all micro-batches; return (grad_buffer, mean_loss).
+        `train_state` is (model, opt_state) as elsewhere.
+        """
+        with hax.axis_mapping(compute_axis_mapping):
+            model, _ = train_state
+
+            # 1️⃣  zero-initialised buffer with full model structure
+            #grad_buffer = _make_zero_grad_tree(model)
+            diff_model, _ = eqx.partition(model, eqx.is_inexact_array)
+            grad_buffer = jax.tree.map(jnp.zeros_like, diff_model)
+            loss_sum    = 0.0
+
+            debug.print("compute_grads > batch_data: {}", batch_data['input_ids'].shape)
+
+            # 2️⃣  partially-applied micro-batch step
+            micro_step = functools.partial(
+                microbatch_step_full,      # ← uses the _add_or_keep helper above
+                data_weights,
+                train_state,
+            )
+
+            # 3️⃣  scan over micro-batches
+            (grad_buffer, loss_sum), _ = hax.scan(
+                eqx.filter_checkpoint(micro_step), 'microbatch',
+                unroll=1,
+            )((grad_buffer, loss_sum), batch_data)
+
+            # 4️⃣  average loss and gradients
+            #import pdb; pdb.set_trace()
+            num_mb   = batch_data["input_ids"].shape['microbatch']
+            mean_loss = loss_sum / num_mb
+            grad_buffer = jax.tree.map(lambda g: g / num_mb, grad_buffer)
+
+            debug.print("compute_grads > mean_loss: {}", mean_loss)
+            #debug.print("compute_grads > grad_buffer: {}", grad_buffer.embedding.weight)
+            return grad_buffer, mean_loss
+
+
+    def update_with_grads(avg_grad: jnp.ndarray, train_state):
+        """ updates the model parameters with the average gradient """
+        model, opt_state = train_state
+
+        train_grads = trainables_only(avg_grad, is_trainable)
+        overwrites, train_grads = partition_for_grad_overwrite(train_grads)
+        trainable_model = trainables_only(model, is_trainable)
+        _, trainable_model = partition_for_grad_overwrite(trainable_model)
+
+        updates, opt_state = optimizer.update(train_grads, opt_state, params=trainable_model)
+        model = apply_updates(model, updates, overwrites)
+        return model, opt_state
+
+
+    def single_batch_step(data_weights: jnp.ndarray, train_state: Tuple[Any, Any], batch_data: Dict[str, jnp.ndarray]) -> Tuple[Tuple[Any, Any], jnp.ndarray]:
+        """Runs for 1 global batch, which is grad_accum_steps * batch_size."""
+        grad_buffer, loss = compute_grads(data_weights, train_state, batch_data)
+        model_params, opt_params = update_with_grads(grad_buffer, train_state)
+        return (model_params, opt_params), loss
+
+
+    def unreduced_microbatch_losses(model, data_weights, microbatch_data):
+        """ Computes the loss of a single microbatch """
+        inputs = microbatch_data["input_ids"]
+        targets = microbatch_data["labels"]
+        index = microbatch_data["index"]
+        weights = data_weights[index.array]
+
+        def weighted_loss(model):
+            with hax.axis_mapping(compute_axis_mapping):
+                logits = model(inputs, attn_mask=AttentionMask.causal()) #, training=True)
+                return compute_weighted_loss(logits, targets, pad_token_id, weights, reduce=False)
+
+        example_losses = weighted_loss(model)
+
+        return example_losses
+
+
+    def microbatch_vjp_grad_fun(avg_grad_grad: jnp.ndarray, data_weights, train_state, batch_data):
+        """ /Manually/ computes the per-example metagrad VJP.
+        Any time we make changes to the updates, we have to check this against the true VJP.
+
+        The logic is simple - if we know the gradient wrt the average gradient, then upweighting any individual example's gradient
+        has the derivative which is just the inner product of the example's gradient with the average gradient.
+        """
+
+        model_params, opt_params = train_state
+        def jvp_microbatch(microbatch_data):
+            recued_microbatch_fn = jax.tree_util.Partial(unreduced_microbatch_losses, data_weights=data_weights, microbatch_data=microbatch_data)
+            return eqx.filter_jvp(recued_microbatch_fn, (model_params,), (avg_grad_grad,))[1]
+        data_weights_list = hax.scan(lambda carry, x: (None, jvp_microbatch(x)), "microbatch")(None, batch_data)[1]
+        # data_weights_list is now of size (grad_accum_size, batch_size) and need to flatten it.
+        # The ordering matches that of flattening the microbatch, but we want to reorder it to match the data_weights, which is controlled by the index
+        #import pdb; pdb.set_trace()
+        #debug.print(">>>>> batch_data: {} | data_weights_list: {}", batch_data["input_ids"].array, data_weights_list.array)
+        data_weights_list = data_weights_list.flatten("batch")
+        #debug.print(f">>>>> data_weights_list: {data_weights_list.axes}")
+        inverse_index = jnp.argsort(batch_data["index"].flatten("batch").array)
+        data_weights_list = data_weights_list.array[inverse_index]
+
+        return data_weights_list, None, None
+
+
+    def run_vjp_update(non_donated_args, params_grad, opt_grad, grad_sharding):
+        """ computes the backwards functions that reverse state->compute_grads->update_with_grads->new_state.
+        this computes the branch that does not involve the metagrads themselves  """
+        initial_params, initial_opt_state, data_weights, batch_data = non_donated_args
+        train_state = (initial_params, initial_opt_state)
+        current_mesh = mesh_lib.get_abstract_mesh() if mesh_lib.get_concrete_mesh() is not None else mesh_lib.thread_resources.env.physical_mesh # shard opt state across accelerators
+        replicated_sharding = jax.sharding.NamedSharding(current_mesh, jax.sharding.PartitionSpec())
+        # first, run forward from state -> average grads and do bookkeeping for the later backwards
+        def train_state_to_grads_with_sharding(state):
+            # Partition the model to apply sharding constraints only to arrays
+            with jax.named_scope("train_state_to_grads_with_sharding"):
+                model, opt_state = state
+                arrays, static = eqx.partition(model, eqx.is_array)
+                arrays = jax.lax.with_sharding_constraint(arrays, replicated_sharding)
+                opt_state = jax.lax.with_sharding_constraint(opt_state, replicated_sharding)
+                model = eqx.combine(arrays, static)
+                train_state = (model, opt_state)
+
+                grad_buffer, loss = compute_grads(data_weights, train_state, batch_data)
+                grad_buffer = jax.lax.with_sharding_constraint(grad_buffer, replicated_sharding)
+                return grad_buffer, loss
+        (grad_buffer, loss), vjp_grad_state_fun = eqx.filter_vjp(train_state_to_grads_with_sharding, train_state)
+
+        # now the second forward part from avg grads + state -> new state, but this is very memory expensive (each residual is the size of a model) so we shard the train state and re-collect
+        grad_buffer = jax.lax.with_sharding_constraint(grad_buffer, grad_sharding) # TODO: switch back; grad_sharding is not used
+        _, vjp_update_fun = eqx.filter_vjp(update_with_grads, grad_buffer, train_state)  # do computation with sharding
+        avg_grad_grad, train_state_grad = vjp_update_fun((params_grad, opt_grad))
+
+        if False:
+            self.debug_print("run_vjp_update > avg_grad_grad (embedding): {}", avg_grad_grad.embedding.weight.array)
+            self.debug_print("run_vjp_update > avg_grad_grad (lm_head): {}", avg_grad_grad.lm_head.weight.array.T)
+
+        # re-collect results onto the same device, for computational efficiency in the next step
+        avg_grad_grad = jax.lax.with_sharding_constraint(avg_grad_grad, replicated_sharding)
+        # now we do the second backwards through the grads (avg grads -> state)
+        train_state_grad_through_grads = vjp_grad_state_fun((avg_grad_grad, 0.0))[0]
+        # the state affects the next state via two paths, so sum the backward partials
+        train_state_grad = jax.tree.map(lambda x, y: x + y if x.dtype is not jax.dtypes.float0 else x, train_state_grad, train_state_grad_through_grads) #float 0 is the opt state accumulator, so ignore it.
+        train_state_grad = jax.lax.with_sharding_constraint(train_state_grad, replicated_sharding)
+        return avg_grad_grad, train_state_grad, loss
+
+
+    def run_vjp_grad_manual(initial_model, initial_opt_state, data_weights, batch_data, avg_grad_grad):
+        """ computes the backwards functions that reverse data_weights -> compute grads
+        this is the second part that propagates gradients at the batch level to each example and uses a hand computed VJP """
+        train_state = (initial_model, initial_opt_state)
+        manual_vjp_grad_fun = jax.tree_util.Partial(microbatch_vjp_grad_fun, data_weights=data_weights, train_state=train_state, batch_data=batch_data)
+        return manual_vjp_grad_fun(avg_grad_grad)
+
+
+    def run_vjp_grad_jax(initial_model, initial_opt_state, data_weights, batch_data, avg_grad_grad):
+        """ computes the backwards functions that reverse data_weights -> compute grads
+        this is the second part that propagates gradients at the batch level to each example. this is a slower, jax computed version to be used for a reference in tests"""
+        train_state = (initial_model, initial_opt_state)
+        _, vjp_grad_fun, loss = eqx.filter_vjp(
+            compute_grads, data_weights, train_state, batch_data, has_aux=True
+        )
+        return vjp_grad_fun(avg_grad_grad)
+
+    return single_batch_step, run_vjp_update, run_vjp_grad_manual, run_vjp_grad_jax
+
+
 class Trainer:
     config: "TrainerConfig"
     optimizer: GradientTransformation
@@ -177,6 +522,7 @@ class Trainer:
     is_trainable_param: PyTree[FilterSpec]
     _raw_loss_function: Callable
     _cmanagers: List[typing.ContextManager] = []
+    consumed_tokens: int = 0
 
     def __init__(
         self,
@@ -185,6 +531,7 @@ class Trainer:
         loss_fn: ComputeLossFunction,
         *,
         add_default_hooks: bool = True,
+        debug: bool = False,
     ):
         """
 
@@ -198,18 +545,23 @@ class Trainer:
         self.config = config
         self.optimizer = optimizer
         self._raw_loss_function = loss_fn
+        self.data_weight_vector: Optional[jnp.ndarray] = None
+        self.consumed_tokens = 0
+        self.debug = debug
         if isinstance(config.tracker, Sequence):
             self.tracker = levanter.tracker.CompositeTracker([c.init(self.run_id) for c in config.tracker])
         else:
             self.tracker = config.tracker.init(self.run_id)
 
         self._cmanagers = []
+        self.profiler_running = False
 
         if add_default_hooks:
             self._add_default_hooks()
 
         self._cmanagers = []
         self._logged_jaxprs: set[str] = set()
+
 
     @cached_property
     def loss_fn(self):
@@ -424,6 +776,7 @@ class Trainer:
 
             levanter.tracker.log({**metrics, "throughput/hook_time": hook_time()}, step=info.step)
 
+        print('[Timing Info] > step time:', step_time(), 'hook time:', hook_time())
         return info
 
     def training_steps(self, state: S, train_loader) -> typing.Iterator[StepInfo[S]]:
@@ -432,27 +785,63 @@ class Trainer:
         """
         iter_data = iter(train_loader)
 
+        # print optimizer info
+        print('$$$$ Optimizer info:', state.opt_state)
+
         while int(state.step) < self.num_train_steps:
+            print(f'\n\n------------------------------- Forward it: {state.step} -------------------------------')
             with capture_time() as loading_time:
                 try:
                     example = next(iter_data)
+                    self.consumed_tokens += example.tokens.size
                 except StopIteration:
                     logger.info("Reached end of training data loader")
                     break
+
+            print('[Timing Info] > data loading time:', loading_time(), flush=True)
+
             info = self.train_step(state, example)
             state = info.state
 
-            levanter.tracker.log({"throughput/loading_time": loading_time()}, step=info.step)
+            levanter.tracker.log(
+                {"throughput/loading_time": loading_time(), "metrics/consumed_tokens": self.consumed_tokens},
+                step=info.step,
+            )
 
             yield info
 
-    def train(self, state: S, train_loader: Iterable[X]) -> StepInfo[S]:
+    def train(self, state: S, train_loader: Iterable[X], data_weight_vector: Optional[jnp.ndarray] = None) -> StepInfo[S]:
         """
         Performs training until the number of steps is reached.
         """
         info: Optional[StepInfo[S]] = None
+        self.data_weight_vector = data_weight_vector
+
+        # initialize consumed_tokens
+        if int(state.step) > 0:
+            # TODO: this is not exactly correct if the batch size has changed during training
+            # a better way would be to save this in the checkpoint
+            loader = getattr(train_loader, "dl", train_loader)
+            if hasattr(loader.data_store, "seq_len"):
+                seq_len = loader.data_store.seq_len
+                batch_size = self.config.batch_schedule.value_at_step(state.step)
+                self.consumed_tokens = int(state.step) * batch_size * seq_len
+        else:
+            self.consumed_tokens = 0
+
+        # force hooks to run at the beginning
+        if state.step == 0:
+            self.run_hooks(StepInfo(state, jnp.array(0.0), 0.0), force=True)
+
+        last_info: Optional[StepInfo[S]] = None
         for info in self.training_steps(state, train_loader):
-            pass
+            last_info = info
+
+        # if we didn't train, info is None, so we should use the initial state
+        if last_info is None:
+            print('No training steps were taken (WAIT 10 seconds)')
+            time.sleep(10)
+            last_info = StepInfo(state, jnp.array(float("nan")), 0.0)
 
         if info is None:
             raise RuntimeError(
@@ -460,9 +849,414 @@ class Trainer:
             )
 
         # force hooks to run at the end
-        self.run_hooks(info, force=True)
+        self.run_hooks(last_info, force=True)
 
-        return info
+        return last_info
+
+
+    def construct_metagrad_helpers(self, use_manual_vjp=True):
+        pad_token_id = -100
+        single_batch_step, run_vjp_update, run_vjp_grad_manual, run_vjp_grad_jax = make_train_functions(self.optimizer, pad_token_id, compute_axis_mapping=self.compute_axis_mapping)
+        if use_manual_vjp: # this should be the faster manual VJP that uses JVPs internally.
+            self.run_vjp_grad = run_vjp_grad_manual
+        else: # this is the 'exact' VJP chaining approach. used to check correctness.
+            self.run_vjp_grad = run_vjp_grad_jax
+        self.single_batch_step = single_batch_step
+        self.run_vjp_update = run_vjp_update
+
+
+    def debug_print(self, *args, **kwargs):
+        if self.debug:
+            print(*args, **kwargs)
+        else:
+            pass
+
+    def jax_debug_print(self, *args, **kwargs):
+        if self.debug:
+            debug.print(*args, **kwargs)
+        else:
+            pass
+
+
+    def train_and_replay(self, state: S, train_loader: Iterable[X], reversed_train_loader: Iterable[X],
+                         val_loader: Iterable[X],
+                         data_weight_vector: jnp.ndarray,
+                         train_only=False) -> StepInfo[S]:
+        init_state = state
+
+        info = self.train(state, train_loader, data_weight_vector)
+        final_model, final_opt_state = info.state.model, info.state.opt_state
+        final_model = inference_mode(final_model, True)
+        final_model = self.mp.cast_to_compute(final_model)
+
+        @eqx.filter_jit
+        def single_batch_reward(model, batch):
+            with hax.axis_mapping(self.compute_axis_mapping):
+                losses = compute_next_token_loss(model, batch, reduction=None, reduction_axis=())
+                mask = batch.loss_mask  # [Batch, Pos]
+                return -hax.einsum("->", losses, mask).scalar() / losses.axes[1].size # to scalar
+
+        # get gradient wrt final reward by accumulating gradients per batch
+        def value_and_grad_fn(model, batch):
+            reward_fn = lambda m: single_batch_reward(m, batch)
+            return eqx.filter_value_and_grad(reward_fn)(model)
+
+        value_and_grad_fn = eqx.filter_jit(value_and_grad_fn)
+
+        # Get zero-like gradients for accumulation
+        differentiable_final_model, _ = eqx.partition(final_model, eqx.is_inexact_array)
+        params_grad = jax.tree_util.tree_map(jnp.zeros_like, differentiable_final_model)
+
+        total_loss = 0.0
+        total_weights = 0.0
+
+        for i, val_batch in tqdm(enumerate(val_loader), desc="Computing reward"):
+            #print('\n\n\nREWARD val_batch.tokens.array:', val_batch.tokens.array, flush=True)
+            loss, p_grad = value_and_grad_fn(final_model, val_batch)
+
+            params_grad = jax.tree_util.tree_map(jnp.add, params_grad, p_grad)
+            total_loss += loss
+            total_weights += val_batch.tokens.array.shape[0]
+            # TODO: put this in config
+            if i == 1:
+                break
+            #break
+
+        if total_weights > 0:
+            reward = (total_loss / total_weights)
+            params_grad = jax.tree_util.tree_map(lambda g: g / total_weights, params_grad)
+        else:
+            reward = jnp.array(0.0)
+            # params_grad is already zeros
+
+        # The original code differentiated wrt (final_model, final_opt_state).
+        # final_opt_state isn't used in reward computation, so its gradient is zero.
+        differentiable_opt_state, _ = eqx.partition(final_opt_state, eqx.is_inexact_array)
+        opt_grad = jax.tree_util.tree_map(jnp.zeros_like, differentiable_opt_state)
+
+        print(f"Final reward: {reward}")
+
+        if self.debug:
+            self.jax_debug_print("grad_buffer (embedding): {}", params_grad.embedding.weight.array)
+            self.jax_debug_print("grad_buffer (embedding[257]): {}", params_grad.embedding.weight.array[257])
+            self.jax_debug_print("grad_buffer (lm_head): {} {}", params_grad.lm_head.weight.array.T, params_grad.lm_head.weight.array.T.shape)
+
+        if self.debug:
+            DIR = Path('/juice5b/scr5b/sampark/debug_levanter/')
+            params_grad_embedding_pre_backward = np.load(DIR / 'params_grad_embedding_pre_backward.npy')
+            self.debug_print(f' agreement (params_grad_embedding_pre_backward): {np.all(params_grad.embedding.weight.array == params_grad_embedding_pre_backward)}')
+
+        print('***** COMPUTED FINAL STATE GRADIENTS *****\n\n\n', flush=True)
+        if train_only:
+            return reward, None
+
+        self.construct_metagrad_helpers()
+
+        # define custom x-axis for metagrads in wandb
+        if wandb.run is not None:
+            wandb.define_metric("rev_it")
+            wandb.define_metric("metagrads/*", step_metric="rev_it")
+
+        # TODO: get this from actual config
+        dim = 32 # self.config.model.hidden_dim
+        grad_sharding = jax.tree.map(lambda x: _make_opt_sharding(x, dim, self.device_mesh), params_grad)
+        print('opt grad_sharding:', grad_sharding, flush=True)
+        sharded_update = jax.tree_util.Partial(self.run_vjp_update, grad_sharding=grad_sharding)
+
+        metagrads = jnp.zeros_like(data_weight_vector)
+        iter_data = iter(reversed_train_loader)
+
+        rev_it = self.config.num_train_steps - 1
+
+        # Metagrad checkpointing setup
+        checkpointer = self.config.checkpointer.create(
+            self.run_id, axis_mapping=self.parameter_axis_mapping, mesh=self.device_mesh
+        )
+        metagrad_ckpt_dir = Path(self.checkpoint_path) / "metagrad_checkpoints"
+        if self.config.metagrad_checkpoint_frequency > 0:
+            fsspec_utils.mkdirs(str(metagrad_ckpt_dir))
+
+        # Backward profiler setup
+        if self.config.backward_profiler:
+            backward_profile_path = str(self.config.log_dir / self.run_id / "backward_profiler")
+            start_step = self.config.backward_profiler_start_step
+            num_steps = self.config.backward_profiler_num_steps
+
+            # The profiler will start when rev_it is at start_step and run for num_steps.
+            # Since rev_it is decreasing, the profiler will stop at start_step - num_steps.
+            # We need to ensure that this range is valid.
+            if start_step - num_steps < -1:
+                logger.warning(
+                    f"Adjusting backward_profiler_num_steps from {num_steps} to {start_step + 1}"
+                )
+                num_steps = start_step + 1
+
+        backward_profiler_started_by_us = False
+
+        # Resume from metagrad checkpoint if available
+        if self.config.metagrad_checkpoint_frequency > 0 and fsspec_utils.exists(str(metagrad_ckpt_dir)):
+            try:
+                # with fsspec, we can't glob, so we list and filter
+                fs, _, paths = fsspec.get_fs_token_paths(str(metagrad_ckpt_dir))
+                files = fs.ls(paths[0])
+                # fs.ls can return a list of dicts (with file details) or a list of strings (paths)
+                if files and isinstance(files[0], dict):
+                    checkpoints = [f["name"] for f in files if f["name"].endswith(".npz")]
+                else:
+                    checkpoints = [str(f) for f in files if str(f).endswith(".npz")]
+            except (FileNotFoundError, IndexError):
+                checkpoints = []
+
+            if checkpoints:
+                # Find the checkpoint with the lowest rev_it, which is the latest one saved.
+                steps = [int(Path(c).stem.split("_")[1]) for c in checkpoints]
+                if steps:
+                    latest_step = min(steps)
+                    logger.info(f"Resuming metagrad computation from step {latest_step}")
+
+                    ckpt_path = str(metagrad_ckpt_dir / f"step_{latest_step}.npz")
+
+                    with fsspec.open(ckpt_path, "rb") as f:
+                        with np.load(f, allow_pickle=True) as data:
+                            params_grad_flat = list(data["params_grad"])
+                            opt_grad_flat = list(data["opt_grad"])
+                            metagrads = jnp.array(data["metagrads"])
+
+                            differentiable_final_model, _ = eqx.partition(final_model, eqx.is_inexact_array)
+                            params_grad = jax.tree_util.tree_unflatten(
+                                jax.tree_util.tree_structure(differentiable_final_model), params_grad_flat
+                            )
+
+                            differentiable_opt_state, _ = eqx.partition(final_opt_state, eqx.is_inexact_array)
+                            opt_grad = jax.tree_util.tree_unflatten(
+                                jax.tree_util.tree_structure(differentiable_opt_state), opt_grad_flat
+                            )
+
+                    # we need to fast forward the dataloader and set rev_it to the step *before* the one we loaded
+                    steps_to_skip = (self.config.num_train_steps - 1) - (latest_step - 1) - 1
+                    if steps_to_skip > 0:
+                        logger.info(f"Skipping {steps_to_skip} batches in reversed_train_loader to resume.")
+                        for _ in tqdm(range(steps_to_skip), desc="Fast-forwarding dataloader"):
+                            next(iter_data)
+
+                    rev_it = latest_step - 1
+
+        global_idx_start = (rev_it) * self.config.train_batch_size
+        print(self.config)
+
+        # Prefetch the first checkpoint
+        if rev_it > 0:
+            checkpointer.begin_checkpoint_loading(rev_it - 1, state)
+
+        while rev_it >= 0:
+            print(f'------------------------------- Backward it: {rev_it} -------------------------------')
+
+            if self.config.backward_profiler:
+                if rev_it == start_step:
+                    try:
+                        jax.profiler.stop_trace()
+                    except RuntimeError:
+                        # it's okay if the profiler was not running
+                        pass
+                    # Reset the trainer's profiler state to prevent forward profiler interference
+                    self.profiler_running = False
+                    _create_perfetto_link = self.config.profiler_perfetto_link and jax.process_index() == 0
+                    logger.info(f"Starting backward profiler at rev_it {rev_it} for {num_steps} steps.")
+                    _tpu_trace_mode = getattr(self.config, "profiler_tpu_trace_mode", None)
+                    if _tpu_trace_mode:
+                        try:
+                            options = jax.profiler.ProfileOptions()
+                            options.advanced_configuration = {"tpu_trace_mode": _tpu_trace_mode}
+                            jax.profiler.start_trace(
+                                backward_profile_path,
+                                create_perfetto_link=_create_perfetto_link,
+                                create_perfetto_trace=True,
+                                options=options,
+                            )
+                        except TypeError:
+                            jax.profiler.start_trace(
+                                backward_profile_path,
+                                create_perfetto_link=_create_perfetto_link,
+                                create_perfetto_trace=True,
+                            )
+                    else:
+                        jax.profiler.start_trace(
+                            backward_profile_path,
+                            create_perfetto_link=_create_perfetto_link,
+                            create_perfetto_trace=True,
+                        )
+                    backward_profiler_started_by_us = True
+                elif rev_it == start_step - num_steps:
+                    if backward_profiler_started_by_us:
+                        logger.info(f"Stopping backward profiler at rev_it {rev_it}.")
+                        jax.profiler.stop_trace()
+                        levanter.tracker.current_tracker().log_artifact(backward_profile_path, type="jax_profile")
+                        barrier_sync()
+                        backward_profiler_started_by_us = False
+
+            data_load_start_time = time.time()
+            example = next(iter_data)
+            data_load_end_time = time.time()
+            data_load_duration = data_load_end_time - data_load_start_time
+            print(f"[Timing] Data loading for step {rev_it} took {data_load_duration:.3f}s", flush=True)
+
+            #  rev_it is the *iteration* (step) you want to rewind to
+            checkpoint_start_time = time.time()
+            state = self._restore_step(state, rev_it-1, checkpointer) # if rev_it > 0 else -1)
+            jax.block_until_ready(state)
+            checkpoint_end_time = time.time()
+            checkpoint_duration = checkpoint_end_time - checkpoint_start_time
+            print(f"[Timing] Checkpoint restoration for step {rev_it-1} took {checkpoint_duration:.3f}s", flush=True)
+
+            # Prefetch the next checkpoint while we compute the current one
+            if rev_it > 1:
+                checkpointer.begin_checkpoint_loading(rev_it - 2, state)
+
+            batch_kwargs = {}
+            Batch = _resolve_axis_in_tree((example, batch_kwargs), self.config.batch_axis)
+            bs = Batch.size
+            mbs = self.config.microbatch_size
+            grad_accum_size = bs // mbs
+            print(f"bs: {bs}, mbs: {mbs}, grad_accum_size: {grad_accum_size}", flush=True)
+
+            pad_token_id = -100
+            batch = lmexample_to_weighted_batch(example, grad_accum_size, global_idx_start, pad_token_id)
+            global_idx_start -= bs
+
+            self.rev_it = rev_it
+
+            with jax.profiler.StepTraceAnnotation("backward_step", step_num=rev_it):
+                params_grad, opt_grad, metagrads_for_batch_local, unique_indices = self._vjp_update_step(
+                    batch,
+                    data_weight_vector,
+                    inference_mode(state.model, True),
+                    state.opt_state,
+                    params_grad,
+                    opt_grad,
+                    sharded_update,
+                )
+                jax.block_until_ready((params_grad, opt_grad, metagrads_for_batch_local, unique_indices))
+
+            # Accumulate metagrads by scattering local grads into the global tensor
+            metagrads = metagrads.at[unique_indices].add(metagrads_for_batch_local)
+
+            if self.config.metagrad_checkpoint_frequency > 0 and (rev_it % self.config.metagrad_checkpoint_frequency == 0):
+                logger.info(f"Checkpointing metagrad computation at step {rev_it}")
+                ckpt_path = str(metagrad_ckpt_dir / f"step_{rev_it}.npz")
+
+                params_grad_leaves = jax.tree_util.tree_leaves(params_grad)
+                opt_grad_leaves = jax.tree_util.tree_leaves(opt_grad)
+
+                # Use a temporary file to prevent corruption from pre-emption
+                tmp_path = ckpt_path + ".tmp"
+                with fsspec.open(tmp_path, "wb") as f:
+                    np.savez(
+                        f,
+                        params_grad=np.array([np.asarray(p) for p in params_grad_leaves], dtype=object),
+                        opt_grad=np.array([np.asarray(o) for o in opt_grad_leaves], dtype=object),
+                        metagrads=np.asarray(metagrads),
+                    )
+
+                fs, _, (path,) = fsspec.get_fs_token_paths(ckpt_path)
+                fs.mv(tmp_path, path, recursive=True)
+
+                # After saving the current checkpoint, delete the previous one to save space.
+                # The reverse iteration goes down, so the previous checkpoint is at a higher step number.
+                prev_ckpt_step = rev_it + self.config.metagrad_checkpoint_frequency
+                if prev_ckpt_step < self.config.num_train_steps:
+                    prev_ckpt_path = str(metagrad_ckpt_dir / f"step_{prev_ckpt_step}.npz")
+                    try:
+                        # fs is from get_fs_token_paths, for the same directory, so it's fine
+                        if fs.exists(prev_ckpt_path):
+                            logger.info(f"Deleting old metagrad checkpoint at step {prev_ckpt_step}")
+                            fs.rm(prev_ckpt_path)
+                    except Exception as e:
+                        logger.warning(f"Failed to delete old metagrad checkpoint {prev_ckpt_path}: {e}")
+
+            iter_end_time = time.time()
+            iter_duration = iter_end_time - data_load_start_time
+            print(f"[Timing] Iteration {rev_it} took {iter_duration:.3f}s", flush=True)
+
+            #self.debug_print('> iter:', rev_it, 'global_idx_start:', global_idx_start, 'example.tokens:', example.tokens)
+            rev_it -= 1
+
+        print(f"metagrads: {metagrads[:100]}")
+
+        return reward, metagrads
+
+    def _reindex_interval_data(
+        self,
+        batch_data: Dict[str, hax.NamedArray]
+    ) -> Tuple[Dict[str, hax.NamedArray], jnp.ndarray]:
+        """Re-indexes batch data for data weights"""
+        original_indices = batch_data["index"]
+        indices_np = np.asarray(original_indices.array)
+        indices_flat = indices_np.flatten()
+        unique_indices_np, inverse_indices_np = np.unique(indices_flat, return_inverse=True)
+
+        local_indices_jnp = jnp.array(inverse_indices_np.reshape(indices_np.shape), dtype=original_indices.dtype)
+        local_indices = hax.named(local_indices_jnp, original_indices.axes)
+        unique_indices = jnp.array(unique_indices_np)
+
+        batch_data_local = batch_data.copy()
+        batch_data_local["index"] = local_indices
+        return batch_data_local, unique_indices
+
+
+    def _vjp_update_step(
+        self,
+        batch_data: Dict[str, jnp.ndarray],
+        data_weight_vector: jnp.ndarray,
+        initial_params: Any,
+        initial_opt_state: Any,
+        params_grad: Any,
+        opt_grad: Any,
+        sharded_update: Any,
+        use_wandb: bool = True,
+    ) -> Tuple[Any, Any, jnp.ndarray, jnp.ndarray]:
+        """Performs a single VJP update step, walking backwards from the final iteration to the first, passing partial derivatives backward and computing metagrads for the batch.
+
+        Returns:
+            Tuple of (updated_params_grad, updated_opt_grad, metagrads_for_batch, unique_indices)
+        """
+        data_processing_start = time.time()
+        batch_data_local, unique_indices = self._reindex_interval_data(batch_data)
+        interval_weights = data_weight_vector.at[unique_indices].get()
+        #print(f"Prefetch and reindex took {time.time() - data_processing_start:.3f}s")
+
+        vjp_start = time.time()
+
+        avg_grad_grad, train_state_grad, loss = eqx.filter_jit(sharded_update, donate='all-except-first')( # donate_argnums=(4, 5))(
+            (initial_params, initial_opt_state, interval_weights,
+            batch_data_local), params_grad, opt_grad
+        )
+        params_grad_new, opt_grad_new = train_state_grad
+
+        metagrads_for_batch_local, _, _ = eqx.filter_jit(self.run_vjp_grad)( #), donate_argnums=(0, 1, 4))(
+            initial_params, initial_opt_state, interval_weights,
+            batch_data_local, avg_grad_grad
+        )
+
+        tree_statistics(params_grad_new, "params_grad")
+
+        if use_wandb and wandb.run is not None:
+            params_grad_norm = optax.global_norm(params_grad_new)
+            opt_grad_norm = optax.global_norm(opt_grad_new)
+            wandb.log({
+                "rev_it": self.rev_it,
+                "metagrads/mean": jnp.mean(metagrads_for_batch_local),
+                "metagrads/std": jnp.std(metagrads_for_batch_local),
+                "metagrads/max": jnp.max(metagrads_for_batch_local),
+                "metagrads/min": jnp.min(metagrads_for_batch_local),
+                "metagrads/params_grad_norm": params_grad_norm,
+                "metagrads/opt_grad_norm": opt_grad_norm,
+                "metagrads/processing_time": time.time() - data_processing_start,
+                #"metagrads/examples_per_second": (self.config.train_batch_size * self.config.grad_accum_size) / (time.time() - data_processing_start),
+                #"metagrads/tokens_per_second": (self.config.train_batch_size * self.config.grad_accum_size * batch_data_local["input_ids"].shape[-1]) / (time.time() - data_processing_start)
+            }, commit=True)
+
+        return params_grad_new, opt_grad_new, metagrads_for_batch_local, unique_indices
+
 
     def _add_default_hooks(self):
         from levanter import callbacks
@@ -470,12 +1264,16 @@ class Trainer:
         self.add_hook(levanter.callbacks.pbar_logger(total=self.config.num_train_steps), every=1)
         self.add_hook(levanter.callbacks.log_step_info(self.config.num_train_steps), every=1)
         # engine.add_hook(callbacks.log_memory_usage(), every=1)
-        checkpointer = self.config.checkpointer.create(self.run_id)
+        checkpointer = self.config.checkpointer.create(
+            self.run_id, axis_mapping=self.parameter_axis_mapping, mesh=self.device_mesh
+        )
         self.add_hook(checkpointer.on_step, every=1)  # checkpointer manages its own frequency
 
         # Add watch callback if configured
         if self.config.watch.is_enabled:
-            self.add_hook(self.config.watch.build(), every=self.config.watch.interval)
+            watch_callback = self.config.watch.build()
+            self.add_hook(watch_callback, every=self.config.watch.interval)
+            #print(f"*** DEBUG: Added watch callback with interval: {self.config.watch.interval}")
 
         if self.config.profiler:
             profile_path = self.config.log_dir / self.run_id / "profiler"
@@ -488,6 +1286,7 @@ class Trainer:
                 total_prof_steps = self.config.num_train_steps - self.config.profiler_start_step
             self.add_hook(
                 callbacks.profile(
+                    self,
                     str(profile_path),
                     self.config.profiler_start_step,
                     total_prof_steps,
@@ -495,6 +1294,7 @@ class Trainer:
                 ),
                 every=1,
             )
+
 
     def add_eval_hook(self, eval_dataset, name: Optional[str] = None):
         from levanter import callbacks
@@ -505,6 +1305,7 @@ class Trainer:
 
             @eqx.filter_jit
             def eval_loss(model, *batch, **batch_kwargs):
+                print('>>>>> EVAL MODE <<<<<')
                 model = self.mp.cast_to_compute(model)
                 return self.loss_fn(model, *batch, **batch_kwargs, key=None)
 
@@ -534,6 +1335,7 @@ class Trainer:
         else:
             batch_name = self.config.batch_axis
             batch_size = self.config.train_batch_size
+
         return DataLoader(
             dataset,
             batch_size=batch_size,
@@ -543,6 +1345,7 @@ class Trainer:
             prefetch_size=32,
             batch_axis_name=batch_name,
             allow_nondivisible_batch_size=self.config.allow_nondivisible_batch_size,
+            #num_train_steps=self.config.num_train_steps,
         )
 
     @cached_property
@@ -570,7 +1373,34 @@ class Trainer:
             key, new_key = jax.random.split(state.training_key)
             model = inference_mode(state.model, False)
 
-            loss, grads = self._compute_gradients_microbatched(self.loss_fn, model, *batch, **batch_kwargs, key=key)
+            loss, grads = self._compute_gradients_microbatched(self.loss_fn, model, *batch,**batch_kwargs, key=key)
+            '''
+            def loss_fn(model, *batch, key, **kwargs):
+                with hax.axis_mapping(self.compute_axis_mapping):
+                    model = self.mp.cast_to_compute(model)
+                    # we have to here because of how microbatching works
+                    unreduced_loss = self._raw_loss_function(
+                        model, *batch, key=key, reduction=None, reduction_axis=(), **kwargs
+                    )
+                    if self.data_weight_vector is not None:
+                        # assume the batch has an "index" field
+                        batch_example = batch[0]
+                        #print(f"Batch example: {batch_example}")
+                        weights = self.data_weight_vector[batch_example.index]
+                        #debug.print("batch_example.index: {}", batch_example.index)
+                        #print(unreduced_loss.shape)
+                        unreduced_loss = hax.mean(unreduced_loss, axis="position")
+                        # multiply on the raw arrays and then wrap back in a NamedArray.
+                        # this is necessary because haliax doesn't support this kind of indexing on a NamedArray,
+                        # and also doesn't support broadcasting from a raw jax array in a jitted context.
+                        weighted_loss_array = unreduced_loss.array * weights
+                        unreduced_loss = hax.named(weighted_loss_array, unreduced_loss.axes)
+
+                    return hax.mean(unreduced_loss).scalar()
+            '''
+
+            #loss, grads = self._compute_gradients_microbatched(loss_fn, model, *batch, **batch_kwargs, key=key)
+            #metrics["grad_norm"] = optax.global_norm(grads)
 
             # Sophia needs to be able to access the loss function in the optimizer
             def obj_fun(trainable_model):
@@ -580,6 +1410,7 @@ class Trainer:
                     return self._raw_loss_function(model, *batch, **batch_kwargs, key=key).scalar()
 
             new_state, updates = state.take_step(grads, obj_fun=obj_fun, loss=loss, key=new_key)
+            #metrics["update_norm"] = optax.global_norm(updates)
             new_state = hax.shard(new_state, self.parameter_axis_mapping)
 
             if not _no_hooks:
@@ -645,6 +1476,22 @@ class Trainer:
 
         return fn(*args, **kwargs)
 
+    def _restore_step(self, exemplar_state, step_to_load: int, checkpointer: "Checkpointer"):
+        if step_to_load < 0:
+            return exemplar_state
+
+        restored_state = checkpointer.get_loaded_checkpoint()
+
+        if restored_state is None:
+            # This can happen on the first step if we didn't prefetch.
+            return checkpointer.load_checkpoint(
+                exemplar_state,
+                path=os.path.join(checkpointer.base_path, f"step-{step_to_load}"),
+                discover_latest=False,
+            )
+
+        return restored_state
+
 
 def _initialize_global_tracker(config, run_id):
     if isinstance(config, Sequence):
@@ -671,9 +1518,15 @@ class TrainerConfig:
 
     # TODO: refactor callbacks
     profiler: bool = False
-    profiler_start_step: int = 5
-    profiler_num_steps: int = 100
+    profiler_start_step: int = 3
+    profiler_num_steps: int = 2
     profiler_perfetto_link: bool = False
+    profiler_tpu_trace_mode: Optional[str] = None
+
+    # A separate profiler for the backward pass
+    backward_profiler: bool = False
+    backward_profiler_start_step: int = 3
+    backward_profiler_num_steps: int = 2
 
     log_jaxprs: bool = True
     """Whether to log the jaxpr of the training step. This is useful for debugging and understanding the model."""
@@ -734,6 +1587,11 @@ class TrainerConfig:
     allow_partial_checkpoint: bool = False
     """If True, we allow loading a checkpoint that doesn't have all the parameters in the model.
         Missing parameters are initialized from the model_init function."""
+
+    load_debug_weights: bool = False
+
+    metagrad_checkpoint_frequency: int = 0
+    """Frequency to checkpoint metagrad computation. 0 to disable."""
 
     jax_config: Mapping[str, JsonAtom] = field(
         default_factory=lambda: copy.deepcopy(DEFAULT_JAX_CONFIG)
@@ -808,6 +1666,15 @@ class TrainerConfig:
                 self.shutdown_at_exit = 5.0 * 60
             logger.info(f"At end of run, shutting down TPU VM in {self.shutdown_at_exit} seconds")
             atexit.register(cloud_utils.shutdown_tpu_vm, self.shutdown_at_exit)
+
+        # ensure the profiler is stopped at exit
+        def safe_stop_trace():
+            try:
+                jax.profiler.stop_trace()
+            except RuntimeError:
+                pass
+
+        atexit.register(safe_stop_trace)
 
     @cached_property
     def device_mesh(self) -> Mesh:
@@ -1025,3 +1892,4 @@ def _resolve_axis_in_tree(tree, axis):
                 pass
 
     raise ValueError(f"Could not find axis {axis} in tree {tree}")
+
