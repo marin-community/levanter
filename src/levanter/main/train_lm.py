@@ -7,7 +7,9 @@ import gc
 import logging
 import os
 from dataclasses import dataclass, field
+import itertools
 from typing import Optional, Union
+from tqdm_loggable.auto import tqdm
 
 import jax.numpy as jnp
 import jax.random as jrandom
@@ -18,6 +20,7 @@ from haliax.partitioning import named_jit, round_axis_for_partitioning
 
 import levanter
 import levanter.callbacks
+from levanter.data.loader import DataLoader
 import levanter.eval
 import levanter.eval_harness
 from levanter import callbacks
@@ -69,6 +72,8 @@ class TrainLmConfig:
 
     # TODO: really need to add callback framework
     log_entropy: bool = False
+
+    data_only: bool = False
 
 
 def main(config: TrainLmConfig):
@@ -143,6 +148,47 @@ def main(config: TrainLmConfig):
             key=data_key,
             epochs=config.epoch,
         )
+
+        if config.data_only:
+            # batch_size = 512 # was hitting OOM
+            batch_size = 1
+            data_loader = DataLoader(train_dataset, batch_size=batch_size)
+            it = data_loader.iter_from_step(0)
+            for batch in it:
+                # DataLoaderIterator returns
+                # LmExample(
+                #   tokens=NamedArray(
+                #     array=i32[512,131072],
+                #     axes=(Axis(name='batch', size=512), Axis(name='position', size=131072))
+                #   ),
+                #   loss_mask=NamedArray(
+                #     array=i32[512,131072],
+                #     axes=(Axis(name='batch', size=512), Axis(name='position', size=131072))
+                #   ),
+                #   attn_mask=AttentionMask(
+                #     is_causal=True,
+                #     segment_ids=(
+                #       NamedArray(
+                #         array=i32[512,131072],
+                #         axes=(Axis(name='batch', size=512), Axis(name='position', size=131072))
+                #       ),
+                #       NamedArray(
+                #         array=i32[512,131072],
+                #         axes=(Axis(name='batch', size=512), Axis(name='position', size=131072))
+                #       )
+                #     )
+                #   )
+                # )
+                # TODO Why do we only have is_causal=True and segment_ids but not prefix_mask?
+                print(batch.attn_mask)
+                for i in range(batch_size):
+                    print(batch.tokens['batch', i].array)
+                    print(tokenizer.decode(batch.tokens['batch', i].array))
+                    print(batch.loss_mask['batch', i].array)
+                    # TODO print more from batch
+                    break
+            logger.info("Exiting early because data_only is True")
+            return
 
         # Get the tagged evaluation datasets
         tagged_eval_datasets = config.data.tagged_eval_sets(Pos)

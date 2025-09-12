@@ -530,6 +530,9 @@ def _te_flash_attention(
         fused_attn,  # noqa: F401
     )
 
+    if isinstance(mask, AttentionMask) and mask.is_prefix:
+        raise NotImplementedError("is_prefix not supported for NVTE fused attention")
+
     if logits_soft_cap is not None:
         raise NotImplementedError(
             "logits_soft_cap is not supported for NVTE fused attention. "
@@ -792,6 +795,8 @@ def _materialize_segment_mask(
         kv_segment_ids = segment_ids.rename({QPos.name: KPos.name})[KPos.name, k_slice]
         q_segment_ids = segment_ids[QPos.name, q_slice]
 
+    # TODO Does this need to worry about padding segments?
+
     return q_segment_ids.broadcast_axis(kv_segment_ids.axes) == kv_segment_ids
 
 
@@ -837,12 +842,16 @@ class AttentionMask(eqx.Module):
     # we apply a shifted causal mask such that a query at position *i* can attend to key *j* whenever
     # ``j <= i + causal_offset``. A ``None`` offset means a static offset of 0 (i.e., standard causal masking).
     is_causal: bool = eqx.field(default=False, static=True)
+    is_prefix: bool = eqx.field(default=False, static=True)
     causal_offset: None | NamedArray = None
     explicit_mask: Optional[NamedArray] = None
     segment_ids: tuple[NamedArray, NamedArray] | None = None
     sliding_window: Optional[int] = eqx.field(default=None, static=True)
+    # `input_mask` is used when `is_prefix`. Queries at input positions can
+    # attend to keys from all other input positions in the same segment in a
+    # non-causal way. Requires `segment_ids`.
+    input_mask: Optional[NamedArray] = None
     # CF https://github.com/jax-ml/jax/blob/47858c4ac2fd4757a3b6fc5bb2981b71a71f00c2/jax/experimental/pallas/ops/tpu/flash_attention.py#L34
-    # TODO: add prefixlm
     # cf https://github.com/google-research/t5x/blob/51a99bff8696c373cc03918707ada1e98cbca407/t5x/examples/decoder_only/layers.py#L978
 
     def materialize(
@@ -896,9 +905,19 @@ class AttentionMask(eqx.Module):
             )
             mask = combine_masks_and(mask, sw_mask)
 
+        segment_mask = None
         if self.segment_ids is not None:
             segment_mask = _materialize_segment_mask(self.segment_ids, QPos, KPos, q_slice, k_slice)
             mask = combine_masks_and(mask, segment_mask)
+
+        if self.is_prefix and self.input_mask is not None and segment_mask is not None:
+            # TODO is this right? we need to rename so QPos is the outer axis to
+            # match `mask`.
+            input_attn_mask = self.input_mask.rename({QPos.name: KPos.name})
+            input_attn_mask = input_attn_mask[KPos, k_slice].broadcast_axis(QPos)
+            input_attn_mask_sliced = input_attn_mask[QPos, q_slice]
+            prefix_mask = segment_mask & input_attn_mask_sliced
+            mask = combine_masks_or(mask, prefix_mask)
 
         return mask
 
@@ -932,6 +951,9 @@ class AttentionMask(eqx.Module):
             warnings.warn("Storing segment_ids as a single NamedArray is deprecated. Use a tuple instead.")
             object.__setattr__(self, "segment_ids", (self.segment_ids, self.segment_ids))
 
+        if self.is_prefix and (self.input_mask is None or self.segment_ids is None):
+            raise ValueError("is_prefix requires input_mask and segment_ids")
+
     def with_segment_ids(self, segment_ids: NamedArray, kv_segment_ids: NamedArray | None = None) -> "AttentionMask":
         """Attach segment ids to the mask.
 
@@ -947,20 +969,24 @@ class AttentionMask(eqx.Module):
 
         return AttentionMask(
             is_causal=self.is_causal,
+            is_prefix=self.is_prefix,
             causal_offset=self.causal_offset,
             explicit_mask=self.explicit_mask,
             segment_ids=seg_field,
             sliding_window=self.sliding_window,
+            input_mask=self.input_mask,
         )
 
     def with_sliding_window(self, sliding_window: int | None) -> "AttentionMask":
         """Return a copy of this mask with ``sliding_window`` applied."""
         return AttentionMask(
             is_causal=self.is_causal,
+            is_prefix=self.is_prefix,
             causal_offset=self.causal_offset,
             explicit_mask=self.explicit_mask,
             segment_ids=self.segment_ids,
             sliding_window=sliding_window,
+            input_mask=self.input_mask,
         )
 
     def __and__(self, other) -> "AttentionMask":
@@ -996,10 +1022,12 @@ class AttentionMask(eqx.Module):
 
         return AttentionMask(
             is_causal=is_causal,
+            is_prefix=self.is_prefix,
             causal_offset=causal_offset,
             explicit_mask=explicit_mask,
             segment_ids=segment_ids,
             sliding_window=sliding_window,
+            input_mask=self.input_mask,
         )
 
     def __or__(self, other) -> "AttentionMask":
@@ -1025,10 +1053,12 @@ class AttentionMask(eqx.Module):
             sliding_window = max(self.sliding_window, other.sliding_window)
         return AttentionMask(
             is_causal=is_causal,
+            is_prefix=self.is_prefix,
             causal_offset=causal_offset,
             explicit_mask=explicit_mask,
             segment_ids=segment_ids,
             sliding_window=sliding_window,
+            input_mask=self.input_mask,
         )
 
     def _check_for_same_segment_ids(self, other):
@@ -1204,6 +1234,9 @@ def _tpu_splash_attention(
         splash_attention_kernel,
         splash_attention_mask,
     )
+
+    if isinstance(mask, AttentionMask) and mask.is_prefix:
+        raise NotImplementedError("Splash attention does not support is_prefix")
 
     # Splash attention requires BHSD format
     # We need to reshape the input to match this format
