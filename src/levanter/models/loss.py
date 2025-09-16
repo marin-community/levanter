@@ -398,6 +398,63 @@ def _block_cross_entropy_forward(
     return (loss, logsumexp), (logsumexp,)
 
 
+def _block_cross_entropy_backward_kernel(
+    lm_head_ref: jax.Array,
+    pred_embeddings_ref: jax.Array,
+    labels_y_ref: jax.Array,
+    log_z_ref: jax.Array,
+    grad_loss_ref: jax.Array,
+    grad_log_z_ref: jax.Array,
+    grad_embeddings_ref: jax.Array,
+    grad_lm_head_ref: jax.Array,
+    *,
+    logit_soft_cap: Optional[float],
+    Pos: hax.Axis,
+    VocabSlice: hax.Axis,
+    Embed: hax.Axis,
+    Label: hax.Axis,
+):
+    """
+    Pallas kernel for computing gradients in block-wise cross-entropy loss.
+    """
+    # Load inputs and wrap with NamedArray for clarity and axis safety
+    lm_head_block = hax.NamedArray(array=pl.load(lm_head_ref, ...), axes=(Embed, VocabSlice))
+
+    embeddings_arr = pl.load(pred_embeddings_ref, ...)  # [Batch, Pos, Embed]
+    if len(embeddings_arr.shape) > 2:
+        Batch = hax.Axis("batch", size=embeddings_arr.shape[0])
+    else:
+        Batch = hax.Axis("batch", size=1)
+    embeddings = hax.NamedArray(array=embeddings_arr, axes=(Batch, Pos, Embed))
+
+    labels = hax.NamedArray(array=pl.load(labels_y_ref, ...), axes=(Batch, Pos))
+    log_z = hax.NamedArray(array=pl.load(log_z_ref, ...), axes=(Batch, Pos))
+    grad_loss = hax.NamedArray(array=pl.load(grad_loss_ref, ...), axes=(Batch, Pos))
+    grad_log_z = hax.NamedArray(array=pl.load(grad_log_z_ref, ...), axes=(Batch, Pos))
+
+    # Compute logits for this block
+    logits = hax.dot(embeddings, lm_head_block, axis=Embed)  # [Batch, Pos, VocabSlice]
+    if logit_soft_cap is not None:
+        logits = hax.tanh(logits / logit_soft_cap) * logit_soft_cap
+
+    # Probabilities for this block
+    probs = hax.exp(logits - log_z)  # broadcast over VocabSlice
+
+    # One-hot targets for this block
+    targets = _block_to_one_hot(labels, VocabSlice, logits.dtype)
+
+    # Gradient wrt logits
+    grad_logits = grad_loss * (probs - targets) + grad_log_z * probs  # [Batch, Pos, VocabSlice]
+
+    # Gradients
+    grad_embeddings_block = hax.dot(grad_logits, lm_head_block, axis=VocabSlice)  # [Batch, Pos, Embed]
+    grad_lm_head_block = hax.sum(hax.dot(embeddings, grad_logits, axis=Pos), axis=Batch)  # [Embed, VocabSlice]
+
+    # Store into outputs
+    pl.store(grad_embeddings_ref, ..., grad_embeddings_block.array[..., None])  # last dim is Block=1 slice
+    pl.store(grad_lm_head_ref, ..., grad_lm_head_block.array)
+
+
 def _block_cross_entropy_backward(
     residuals: tuple[NamedArray,],
     grad_in: tuple[NamedArray, NamedArray],
@@ -412,7 +469,7 @@ def _block_cross_entropy_backward(
     logit_soft_cap: Optional[float] = None,
 ) -> tuple[NamedArray, NamedArray]:
     """
-    Compute the gradients of the block-wise cross-entropy loss.
+    Compute the gradients of the block-wise cross-entropy loss using Pallas.
 
     Args:
         residuals (tuple[NamedArray, NamedArray]): Residuals from the forward pass.
@@ -429,108 +486,80 @@ def _block_cross_entropy_backward(
     Returns:
         tuple[NamedArray, NamedArray]: Gradients.
     """
-
     (log_z,) = residuals
     grad_loss, grad_log_z = grad_in
 
     vocab_size = Label.size
+    num_blocks = math.ceil(vocab_size / block_size)
+    pred_embeddings, lm_head_orig = pred
 
-    pred_embeddings, lm_head = pred
+    lm_head_orig_axes = lm_head_orig.axes
+    pad = (-Label.size) % block_size
+    lm_head = hax.rearrange(lm_head_orig, (Contract, Label))
+    if pad > 0:
+        lm_head = hax.pad(lm_head, {Label: (0, pad)}, constant_values=0)
 
-    if vocab_size % block_size != 0:
-        has_stragglers = True
-    else:
-        has_stragglers = False
+    VocabSlice = Label.resize(block_size)
+    Block = Label.resize(num_blocks)
+    Batch = pred_embeddings.axes[0]
 
-    num_blocks = vocab_size // block_size
+    # Grads may be None if corresponding output wasn't used
+    if grad_loss.array is None:
+        grad_loss = hax.zeros((Batch, Pos), dtype=pred_embeddings.dtype)
+    if grad_log_z.array is None:
+        grad_log_z = hax.zeros((Batch, Pos), dtype=pred_embeddings.dtype)
 
-    grad_embeddings = hax.zeros(pred_embeddings.axes, dtype=pred_embeddings.dtype)
-    grad_lm_head = hax.zeros(lm_head.axes, dtype=lm_head.dtype)
+    # Compute per-block grads via Pallas
+    grad_embeddings_blocks, grad_lm_head_full = pl.pallas_call(
+        functools.partial(
+            _block_cross_entropy_backward_kernel,
+            logit_soft_cap=logit_soft_cap,
+            Pos=Pos,
+            VocabSlice=VocabSlice,
+            Embed=Contract,
+            Label=Label,
+        ),
+        out_shape=[
+            # Per-block embeddings gradient, last dim is Block
+            jax.ShapeDtypeStruct((Batch.size, Pos.size, Contract.size, Block.size), dtype=pred_embeddings.dtype),
+            # Full lm_head gradient over padded vocab
+            jax.ShapeDtypeStruct((Contract.size, vocab_size + pad), dtype=lm_head.dtype),
+        ],
+        grid=(num_blocks,),
+        in_specs=[
+            pl.BlockSpec([Contract.size, VocabSlice.size], index_map=lambda b: (0, b)),  # lm_head
+            pl.BlockSpec([Batch.size, Pos.size, Contract.size], index_map=lambda b: (0, 0, 0)),  # embeddings
+            pl.BlockSpec([Batch.size, Pos.size], index_map=lambda b: (0, 0)),  # labels
+            pl.BlockSpec([Batch.size, Pos.size], index_map=lambda b: (0, 0)),  # log_z
+            pl.BlockSpec([Batch.size, Pos.size], index_map=lambda b: (0, 0)),  # grad_loss
+            pl.BlockSpec([Batch.size, Pos.size], index_map=lambda b: (0, 0)),  # grad_log_z
+        ],
+        out_specs=[
+            # Place each block's embeddings grad into its Block slice
+            pl.BlockSpec([Batch.size, Pos.size, Contract.size, 1], index_map=lambda b: (0, 0, 0, b)),
+            # Directly scatter blocks into vocab slices of the full matrix
+            pl.BlockSpec([Contract.size, VocabSlice.size], index_map=lambda b: (0, b)),
+        ],
+        interpret=use_interpret,
+    )(
+        lm_head.array,
+        pred_embeddings.array,
+        labels_y.array,
+        log_z.array,
+        grad_loss.array,
+        grad_log_z.array,
+    )
 
-    def process_block(block_idx, acc, current_block_size):
-        """
-        Process a single block of the Vocab dimension.
+    grad_embeddings_blocks = hax.NamedArray(array=grad_embeddings_blocks, axes=(Batch, Pos, Contract, Block))
+    grad_embeddings = hax.sum(grad_embeddings_blocks, axis=Block)
 
-        Args:
-            block_idx (int): Index of the current block.
-            acc (tuple[NamedArray, NamedArray]): Accumulators for gradients.
-            current_block_size (int): Size of the current block (used for stragglers).
+    # Remove padding if it was added (grad_lm_head_full is [Contract, vocab_size+pad])
+    if pad > 0:
+        grad_lm_head_full = grad_lm_head_full[:, :-pad]
+    grad_lm_head = hax.NamedArray(array=grad_lm_head_full, axes=(Contract, Label))
+    grad_lm_head = hax.rearrange(grad_lm_head, lm_head_orig_axes)
 
-        Returns:
-            tuple[NamedArray, NamedArray]: Updated accumulators.
-        """
-        grad_embeddings_prev, grad_lm_head_prev = acc
-
-        start = block_idx * block_size
-        Block = Label.resize(current_block_size)
-
-        # Materialize the logits for the current block
-        lm_head_b = lm_head[Label, hax.dslice(start, Block)]  # [Contract, Block]
-        logits_b = hax.dot(pred_embeddings, lm_head_b, axis=Contract)  # [Batch, Pos, Block]
-
-        # Materialize the target for the current block (one-hot)
-        target_y_block = _block_one_hot(Block, start, labels_y, logits_b.dtype)  # [Batch, Pos, Block]
-
-        # materialize the softmax for the current block
-        if dtype is not None:
-            logits_b = logits_b.astype(dtype)
-
-        if logit_soft_cap is not None:
-            logits_b = hax.tanh(logits_b / logit_soft_cap) * logit_soft_cap
-
-        p_b = hax.exp(logits_b - log_z)  # [Batch, Pos, Block]
-
-        delta_b = p_b - target_y_block
-
-        #  # dLoss/dL = g_loss * delta_b + g_log_z * probs_b
-        #         # = g_loss * (probs_b - Y) + g_log_z * probs_b
-        #         # = (g_loss + g_log_z) * probs_b - g_loss * Y
-
-        # Compute gradients. We get None if the gradient is not provided.
-        if grad_loss.array is not None:
-            dLoss = grad_loss * delta_b  # [Batch, Pos, Block]
-        else:
-            dLoss = 0.0
-
-        # Add the gradient of the logsumexp term (should be None if not provided)
-        if grad_log_z.array is not None:
-            dLoss += grad_log_z * p_b  # [Batch, Pos, Block]
-
-        # Compute gradients for the current block
-        # embeddings has shape [Batch, Seq, Embed], so we need to eliminate Block
-        g_embeddings_b = hax.dot(
-            dLoss, lm_head_b, axis=Block, preferred_element_type=grad_embeddings.dtype
-        )  # [Batch, Pos, Embed]
-
-        # lm_head has shape [Block, Embed], so we need to eliminate Batch, Seq, etc.
-        eliminated_axes_W = hax.axis.without_axes(pred_embeddings.axes, lm_head_b.axes)
-        g_lm_head_b = hax.dot(
-            dLoss, pred_embeddings, axis=eliminated_axes_W, preferred_element_type=grad_lm_head_prev.dtype
-        )  # [Block, Embed]
-
-        g_lm_head = grad_lm_head_prev.at[Label, hax.dslice(start, Block)].set(g_lm_head_b)
-        g_embeddings = grad_embeddings_prev + g_embeddings_b
-
-        return g_embeddings, g_lm_head
-
-    if num_blocks == 0:
-        pass
-    elif num_blocks == 1:
-        grad_embeddings, grad_lm_head = process_block(0, (grad_embeddings, grad_lm_head), vocab_size)
-    else:
-        grad_embeddings, grad_lm_head = jax.lax.fori_loop(
-            lower=0,
-            upper=num_blocks,
-            body_fun=functools.partial(process_block, current_block_size=block_size),
-            init_val=(grad_embeddings, grad_lm_head),
-        )
-
-    if has_stragglers:
-        # Handle the stragglers
-        remainder_size = vocab_size - num_blocks * block_size
-        grad_embeddings, grad_lm_head = process_block(num_blocks, (grad_embeddings, grad_lm_head), remainder_size)
-
-    return grad_embeddings.astype(pred_embeddings.dtype), grad_lm_head.astype(lm_head.dtype)
+    return (grad_embeddings, grad_lm_head)
 
 
 _blockwise_cross_entropy_loss.def_fwd(_block_cross_entropy_forward)
