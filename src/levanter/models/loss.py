@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import math
 from typing import Optional
+import jax.experimental.pallas as pl
 
 import equinox
 import jax
@@ -12,13 +14,15 @@ import haliax as hax
 from haliax import NamedArray
 from haliax.nn import cross_entropy_loss_and_log_normalizers
 
+use_interpret = jax.default_backend() == "cpu"
+
 
 def maybe_fused_next_token_loss(
     Pos: hax.AxisSelector,
     Embed: hax.AxisSelector,
     Vocab: hax.AxisSelector,
     pred_embeddings: NamedArray,
-    pred_lm_head: NamedArray,
+    lm_head: NamedArray,
     true_ids: NamedArray,
     loss_mask: Optional[NamedArray] = None,
     reduction: Optional[hax.ReductionFunction] = hax.mean,
@@ -35,7 +39,7 @@ def maybe_fused_next_token_loss(
         Pos (hax.AxisSelector): Position axis selector.
         Vocab (hax.AxisSelector): Vocabulary axis selector.
         pred_embeddings (NamedArray): Predicted embeddings.
-        pred_lm_head (NamedArray): Language model head weights.
+        lm_head (NamedArray): Language model head weights.
         true_ids (NamedArray): True token IDs.
         loss_mask (Optional[NamedArray]): Mask to apply to the loss.
         reduction (Optional[hax.ReductionFunction]): Reduction function.
@@ -49,11 +53,11 @@ def maybe_fused_next_token_loss(
     """
     # Resolve axes
     Pos = pred_embeddings.resolve_axis(Pos.name)
-    Vocab = pred_lm_head.resolve_axis(Vocab)
+    Vocab = lm_head.resolve_axis(Vocab)
 
     if block_size is None:
         # Full softmax computation
-        logits = hax.dot(pred_embeddings, pred_lm_head, axis=Embed)
+        logits = hax.dot(pred_embeddings, lm_head, axis=Embed)
         if dtype is not None:
             logits = logits.astype(dtype)
 
@@ -76,7 +80,8 @@ def maybe_fused_next_token_loss(
     # Compute the loss with optional block-wise processing
     return fused_cross_entropy_loss_and_logsumexp_penalty(
         pred_embeddings,
-        pred_lm_head,
+        lm_head,
+        Pos=Pos,
         Contract=Embed,
         Label=Vocab,
         target_y=target_y,
@@ -161,9 +166,10 @@ def cross_entropy_and_logsumexp_penalty(
 
 def fused_cross_entropy_loss_and_logsumexp_penalty(
     pred_embeddings: NamedArray,
-    pred_lm_head: NamedArray,
+    lm_head: NamedArray,
     Contract: hax.AxisSelector,
     Label: hax.AxisSelector,
+    Pos: hax.AxisSelector,
     target_y: NamedArray,
     *,
     reduction: Optional[hax.ReductionFunction] = hax.mean,
@@ -180,9 +186,10 @@ def fused_cross_entropy_loss_and_logsumexp_penalty(
 
     Args:
         pred_embeddings (NamedArray): Predicted embeddings.
-        pred_lm_head (NamedArray): Language model head weights.
+        lm_head (NamedArray): Language model head weights.
         Contract (hax.AxisSelector): Axis to contract over.
         Label (hax.AxisSelector): Label (Vocab) axis.
+        Pos (hax.AxisSelector): Position axis.
         target_y (NamedArray): One-hot encoded target tokens.
         reduction (Optional[hax.ReductionFunction]): Reduction function.
         reduction_axis (Optional[hax.AxisSelection]): Axis to apply reduction.
@@ -197,9 +204,10 @@ def fused_cross_entropy_loss_and_logsumexp_penalty(
 
     # Block-wise softmax computation
     loss, log_normalizers = _blockwise_cross_entropy_loss(
-        (pred_embeddings, pred_lm_head),
+        (pred_embeddings, lm_head),
         Contract,
         Label,
+        Pos,
         target_y,
         block_size,
         dtype=dtype,
@@ -215,10 +223,11 @@ def fused_cross_entropy_loss_and_logsumexp_penalty(
 @equinox.filter_custom_vjp
 def _blockwise_cross_entropy_loss(
     # pred_embeddings: NamedArray,
-    # pred_lm_head: NamedArray,
+    # lm_head: NamedArray,
     pred: tuple[NamedArray, NamedArray],
     Contract: hax.Axis,
     Label: hax.Axis,
+    Pos: hax.Axis,
     labels_y: NamedArray,
     block_size: int,
     dtype: Optional[jnp.dtype],
@@ -229,9 +238,10 @@ def _blockwise_cross_entropy_loss(
 
     Args:
         pred_embeddings (NamedArray): Predicted embeddings.
-        pred_lm_head (NamedArray): Language model head weights.
+        lm_head (NamedArray): Language model head weights.
         Contract (hax.Axis): Axis to contract over.
         Label (hax.AxisSelector): Label (Vocab) axis.
+        Pos (hax.AxisSelector): Position axis.
         labels_y (NamedArray): label tensor.
         block_size (int): Size of each block for processing.
         dtype (Optional[jnp.dtype]): Data type for the loss.
@@ -245,7 +255,65 @@ def _blockwise_cross_entropy_loss(
         tuple[NamedArray, NamedArray]: tuple of loss and log_normalizers.
     """
 
-    return _block_cross_entropy_forward(None, pred, Contract, Label, labels_y, block_size, dtype, logit_soft_cap)[0]
+    return _block_cross_entropy_forward(None, pred, Contract, Label, Pos, labels_y, block_size, dtype, logit_soft_cap)[
+        0
+    ]
+
+
+def _block_to_one_hot(labels: NamedArray, VocabSlice: hax.Axis, dtype: jnp.dtype):
+    pid_vblock = pl.program_id(0)
+    start = pid_vblock * VocabSlice.size
+    end = start + VocabSlice.size
+    target_is_in_this_block = hax.logical_and(labels >= start, labels < end)
+    one_hot = hax.nn.one_hot(labels - start, class_axis=VocabSlice, dtype=dtype)
+    return one_hot * target_is_in_this_block
+
+
+def _block_cross_entropy_forward_kernel(
+    lm_head_ref,  # [Embed x VocabSlice]
+    pred_embeddings_ref,  # [Batch x Pos x Embed]
+    labels_ref,  # [Batch x Pos]
+    dot_ref,
+    log_sum_exp_ref,
+    max_logit_ref,
+    *,
+    VocabSlice: hax.Axis,
+    Pos: hax.Axis,
+    Embed: hax.Axis,
+    Label: hax.Axis,
+    logit_soft_cap: Optional[float] = None,
+):
+    pid_vblock = pl.program_id(0)
+    start = pid_vblock * VocabSlice.size
+    block_pos = hax.arange(VocabSlice) + start
+    valid_cols = block_pos < Label.size
+
+    pred_embeddings = pred_embeddings_ref[...]
+    if len(pred_embeddings.shape) > 2:
+        Batch = hax.Axis("batch", size=pred_embeddings.shape[0])
+    else:
+        Batch = hax.Axis("batch", size=1)
+
+    pred_embeddings = hax.NamedArray(array=pred_embeddings, axes=(Batch, Pos, Embed))
+    lm_head = hax.NamedArray(array=pl.load(lm_head_ref, ..., mask=valid_cols.array, other=0), axes=(Embed, VocabSlice))
+
+    labels = hax.NamedArray(array=labels_ref[...], axes=(Batch, Pos))
+
+    logits = hax.dot(pred_embeddings, lm_head, axis=Embed)  # [Batch x Pos x VocabSlice]
+    if logit_soft_cap is not None:
+        logits = hax.tanh(logits / logit_soft_cap) * logit_soft_cap
+
+    max_logit = hax.max(logits, axis=VocabSlice)
+    targets = _block_to_one_hot(labels, VocabSlice, logits.dtype)
+
+    # Mask out logits which aren't in the block. Must happen after max_logit but before dot.
+    logits = logits * valid_cols
+    dot = hax.dot(logits, targets, axis=VocabSlice)  # [Batch x Pos]
+    log_sum_exp = hax.log(hax.sum(hax.exp(logits - max_logit) * valid_cols, axis=VocabSlice))
+
+    dot_ref[...] = dot.array[..., None]
+    max_logit_ref[...] = max_logit.array[..., None]
+    log_sum_exp_ref[...] = log_sum_exp.array[..., None]
 
 
 def _block_cross_entropy_forward(
@@ -253,6 +321,7 @@ def _block_cross_entropy_forward(
     pred: tuple[NamedArray, NamedArray],
     Contract: hax.Axis,
     Label: hax.Axis,
+    Pos: hax.Axis,
     labels_y: NamedArray,
     block_size: int,
     dtype: Optional[jnp.dtype],
@@ -269,7 +338,8 @@ def _block_cross_entropy_forward(
         pred (Tuple[NamedArray, NamedArray]): Tuple containing predicted embeddings and language model head weights.
         Contract (hax.Axis): Axis to contract over (e.g., embedding axis).
         Label (hax.Axis): Label axis (e.g., vocabulary axis).
-        labels_y (NamedArray): True target labels [Batch, Seq].
+        Pos (hax.Axis): Position axis.
+        labels_y (NamedArray): True target labels [Batch, Pos].
         block_size (int): Number of vocabulary tokens per block.
         dtype (Optional[jnp.dtype]): Data type for the computations.
 
@@ -279,99 +349,53 @@ def _block_cross_entropy_forward(
             - Tuple[NamedArray]: Residuals needed for the backward pass.
     """
     vocab_size = Label.size
+    num_blocks = math.ceil(vocab_size / block_size)
+    pred_embeddings, lm_head = pred
+    pad = (-Label.size) % block_size
+    lm_head = hax.rearrange(lm_head, (Contract, Label))
+    if pad > 0:
+        lm_head = hax.pad(lm_head, {Label: (0, pad)}, constant_values=0)
 
-    pred_embeddings, pred_lm_head = pred
+    VocabSlice = Label.resize(block_size)
+    Block = Label.resize(num_blocks)
+    Batch = pred_embeddings.axes[0]
+    block_dots, block_max_logits, block_logsumexps = pl.pallas_call(
+        functools.partial(
+            _block_cross_entropy_forward_kernel,
+            logit_soft_cap=logit_soft_cap,
+            Pos=Pos,
+            VocabSlice=VocabSlice,
+            Embed=Contract,
+            Label=Label,
+        ),
+        out_shape=[
+            jax.ShapeDtypeStruct((Batch.size, Pos.size, Block.size), dtype=dtype),  # loss
+            jax.ShapeDtypeStruct((Batch.size, Pos.size, Block.size), dtype=dtype),  # max_logit
+            jax.ShapeDtypeStruct((Batch.size, Pos.size, Block.size), dtype=dtype),  # max_logit-normalized logsumexp
+        ],
+        grid=(num_blocks,),  # TODO: Maybe parametrize the kernel by Batch and Pos
+        in_specs=[
+            pl.BlockSpec([Contract.size, VocabSlice.size], index_map=lambda b: (0, b)),  # lm_head
+            pl.BlockSpec([Batch.size, Pos.size, Contract.size], index_map=lambda b: (0, 0, 0)),  # embeddings
+            pl.BlockSpec([Batch.size, Pos.size], index_map=lambda b: (0, 0)),  # labels
+        ],
+        out_specs=[
+            pl.BlockSpec([Batch.size, Pos.size, 1], index_map=lambda b: (0, 0, b)),  # loss
+            pl.BlockSpec([Batch.size, Pos.size, 1], index_map=lambda b: (0, 0, b)),  # max_logit
+            pl.BlockSpec([Batch.size, Pos.size, 1], index_map=lambda b: (0, 0, b)),  # max_logit-normalized logsumexp
+        ],
+        interpret=use_interpret,
+    )(lm_head.array, pred_embeddings.array, labels_y.array)
 
-    #
-    # if num_blocks == 1:
-    #     # No need for block-wise processing
-    #     logits = hax.dot(pred_embeddings, pred_lm_head, axis=Contract)
-    #     labels_y = hax.nn.one_hot(labels_y, Label, dtype=pred_embeddings.dtype)
-    #     return cross_entropy_loss_and_log_normalizers(logits, Label, labels_y)
-    #
-    # ensure block size divides vocab size
-    if vocab_size % block_size != 0:
-        has_stragglers = True
-    else:
-        has_stragglers = False
+    block_max_logits = hax.NamedArray(array=block_max_logits, axes=(Batch, Pos, Block))
+    block_logsumexps = hax.NamedArray(array=block_logsumexps, axes=(Batch, Pos, Block))
+    block_dots = hax.NamedArray(array=block_dots, axes=(Batch, Pos, Block))
 
-    num_blocks = vocab_size // block_size
-
-    # Initialize accumulators: loss, logsumexp, max_logits
-    initial_O = hax.zeros(labels_y.axes)
-    initial_logsumexp = hax.full(labels_y.axes, -jnp.inf)
-    initial_max = hax.full(labels_y.axes, -jnp.inf)
-    # We don't need this b/c we're using one-hot targets
-    # initial_sumV = hax.full(labels_y.axes, 0.0)
-
-    def process_block(block_idx, acc, current_block_size):
-        """
-        Process a single block of the Vocab dimension.
-
-        Args:
-            block_idx (int): Index of the current block.
-            acc (tuple[NamedArray, NamedArray, jnp.ndarray]): Accumulators for loss, logsumexp, and max logits.
-            current_block_size (int): Size of the current block (used for stragglers).
-
-        Returns:
-            tuple[NamedArray, NamedArray, jnp.ndarray]: Updated accumulators
-        """
-        loss, logsumexp_prev, max_logit_prev = acc
-
-        start = block_idx * block_size
-        Block = Label.resize(current_block_size)
-
-        # Materialize the logits for the current block
-        lm_head_b = pred_lm_head[Label, hax.dslice(start, Block)]  # [Contract, Block]
-        logits_b = hax.dot(pred_embeddings, lm_head_b, axis=Contract)  # [Batch, Seq, Block]
-
-        if dtype is not None:
-            logits_b = logits_b.astype(dtype)
-
-        if logit_soft_cap is not None:
-            logits_b = hax.tanh(logits_b / logit_soft_cap) * logit_soft_cap
-
-        # Update max and logsumexp
-        max_logit = hax.maximum(max_logit_prev, hax.max(logits_b, axis=Block))  # [Batch, Seq]
-        # reweight the previous logsumexp by the new max, fold in the new logits' contribution
-        logsumexp = max_logit + hax.log(
-            hax.exp(logsumexp_prev - max_logit) + hax.sum(hax.exp(logits_b - max_logit), axis=Block)
-        )  # [Batch, Seq]
-
-        # Materialize the target for the current block (one-hot)
-        target_y_b = _block_one_hot(Block, start, labels_y, logits_b.dtype)  # [Batch, Seq, Block]
-
-        # Update sumV. This is actually unnecessary if we're using one-hot targets
-        # sV = sV_prev + hax.sum(target_y_b, axis=Label.name)
-
-        loss += hax.dot(logits_b, target_y_b, axis=Block)  # [Batch, Seq]
-
-        return loss, logsumexp, max_logit  # , sV
-
-    if num_blocks == 0:
-        o = initial_O
-        log_z = initial_logsumexp
-        max_logits = initial_max
-    elif num_blocks == 1:
-        o, log_z, max_logits = process_block(0, (initial_O, initial_logsumexp, initial_max), vocab_size)
-    else:
-        (o, log_z, max_logits) = jax.lax.fori_loop(
-            lower=0,
-            upper=num_blocks,
-            body_fun=functools.partial(process_block, current_block_size=block_size),
-            init_val=(initial_O, initial_logsumexp, initial_max),  # , initial_sumV
-        )
-
-    if has_stragglers:
-        # Handle the stragglers
-        remainder_size = vocab_size - num_blocks * block_size
-        o, log_z, _ = process_block(num_blocks, (o, log_z, max_logits), remainder_size)
-
-    # unnecessary if we're using one-hot targets
-    # logz_outer = hax.einsum("->...", log_z, sum_v)
-    o = log_z - o
-
-    return (o, log_z), (log_z,)
+    max_logit = hax.max(block_max_logits, axis=Block)
+    logsumexp = max_logit + hax.log(hax.sum(hax.exp(block_logsumexps + block_max_logits - max_logit), axis=Block))
+    dot = hax.sum(block_dots, axis=Block)
+    loss = logsumexp - dot
+    return (loss, logsumexp), (logsumexp,)
 
 
 def _block_cross_entropy_backward(
@@ -381,6 +405,7 @@ def _block_cross_entropy_backward(
     pred: tuple[NamedArray, NamedArray],
     Contract: hax.Axis,
     Label: hax.Axis,
+    Pos: hax.Axis,
     labels_y: NamedArray,
     block_size: int,
     dtype: Optional[jnp.dtype],
@@ -395,6 +420,7 @@ def _block_cross_entropy_backward(
         pred (tuple[NamedArray, NamedArray]): Predictions.
         Contract (hax.Axis): Axis to contract over.
         Label (hax.Axis): Label axis.
+        Pos (hax.Axis): Position axis.
         labels_y (NamedArray): Target labels.
         block_size (int): Size of each block.
         dtype (Optional[jnp.dtype]): Data type for the loss.
@@ -409,7 +435,7 @@ def _block_cross_entropy_backward(
 
     vocab_size = Label.size
 
-    pred_embeddings, pred_lm_head = pred
+    pred_embeddings, lm_head = pred
 
     if vocab_size % block_size != 0:
         has_stragglers = True
@@ -419,7 +445,7 @@ def _block_cross_entropy_backward(
     num_blocks = vocab_size // block_size
 
     grad_embeddings = hax.zeros(pred_embeddings.axes, dtype=pred_embeddings.dtype)
-    grad_lm_head = hax.zeros(pred_lm_head.axes, dtype=pred_lm_head.dtype)
+    grad_lm_head = hax.zeros(lm_head.axes, dtype=lm_head.dtype)
 
     def process_block(block_idx, acc, current_block_size):
         """
@@ -439,11 +465,11 @@ def _block_cross_entropy_backward(
         Block = Label.resize(current_block_size)
 
         # Materialize the logits for the current block
-        lm_head_b = pred_lm_head[Label, hax.dslice(start, Block)]  # [Contract, Block]
-        logits_b = hax.dot(pred_embeddings, lm_head_b, axis=Contract)  # [Batch, Seq, Block]
+        lm_head_b = lm_head[Label, hax.dslice(start, Block)]  # [Contract, Block]
+        logits_b = hax.dot(pred_embeddings, lm_head_b, axis=Contract)  # [Batch, Pos, Block]
 
         # Materialize the target for the current block (one-hot)
-        target_y_block = _block_one_hot(Block, start, labels_y, logits_b.dtype)  # [Batch, Seq, Block]
+        target_y_block = _block_one_hot(Block, start, labels_y, logits_b.dtype)  # [Batch, Pos, Block]
 
         # materialize the softmax for the current block
         if dtype is not None:
@@ -452,7 +478,7 @@ def _block_cross_entropy_backward(
         if logit_soft_cap is not None:
             logits_b = hax.tanh(logits_b / logit_soft_cap) * logit_soft_cap
 
-        p_b = hax.exp(logits_b - log_z)  # [Batch, Seq, Block]
+        p_b = hax.exp(logits_b - log_z)  # [Batch, Pos, Block]
 
         delta_b = p_b - target_y_block
 
@@ -462,19 +488,19 @@ def _block_cross_entropy_backward(
 
         # Compute gradients. We get None if the gradient is not provided.
         if grad_loss.array is not None:
-            dLoss = grad_loss * delta_b  # [Batch, Seq, Block]
+            dLoss = grad_loss * delta_b  # [Batch, Pos, Block]
         else:
             dLoss = 0.0
 
         # Add the gradient of the logsumexp term (should be None if not provided)
         if grad_log_z.array is not None:
-            dLoss += grad_log_z * p_b  # [Batch, Seq, Block]
+            dLoss += grad_log_z * p_b  # [Batch, Pos, Block]
 
         # Compute gradients for the current block
         # embeddings has shape [Batch, Seq, Embed], so we need to eliminate Block
         g_embeddings_b = hax.dot(
             dLoss, lm_head_b, axis=Block, preferred_element_type=grad_embeddings.dtype
-        )  # [Batch, Seq, Embed]
+        )  # [Batch, Pos, Embed]
 
         # lm_head has shape [Block, Embed], so we need to eliminate Batch, Seq, etc.
         eliminated_axes_W = hax.axis.without_axes(pred_embeddings.axes, lm_head_b.axes)
@@ -504,7 +530,7 @@ def _block_cross_entropy_backward(
         remainder_size = vocab_size - num_blocks * block_size
         grad_embeddings, grad_lm_head = process_block(num_blocks, (grad_embeddings, grad_lm_head), remainder_size)
 
-    return grad_embeddings.astype(pred_embeddings.dtype), grad_lm_head.astype(pred_lm_head.dtype)
+    return grad_embeddings.astype(pred_embeddings.dtype), grad_lm_head.astype(lm_head.dtype)
 
 
 _blockwise_cross_entropy_loss.def_fwd(_block_cross_entropy_forward)

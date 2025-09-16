@@ -36,29 +36,30 @@ def test_data():
     pred_embeddings = hax.random.normal(next(key), (Batch, Seq, Embed), dtype=jnp.float32) / math.sqrt(Embed.size)
 
     # Initialize pred_lm_head with ones
-    pred_lm_head = hax.random.normal(next(key), (Vocab, Embed), dtype=jnp.float32) / math.sqrt(Embed.size)
+    lm_head = hax.random.normal(next(key), (Vocab, Embed), dtype=jnp.float32) / math.sqrt(Embed.size)
 
     # Define true_ids such that the target is always the first token in vocab
     true_ids = hax.random.randint(next(key), (Batch, Seq), 0, Vocab.size)
 
-    return pred_embeddings, pred_lm_head, true_ids
+    return pred_embeddings, lm_head, true_ids
 
 
 def test_basic_equivalence(test_data):
     """
     Test that block-wise loss equals full loss when block_size perfectly divides vocab_size.
     """
-    pred_embeddings, pred_lm_head, true_ids = test_data
+    pred_embeddings, lm_head, true_ids = test_data
 
     # Compute full loss
-    logits_full = hax.dot(pred_embeddings, pred_lm_head, axis="embed")
+    logits_full = hax.dot(pred_embeddings, lm_head, axis="embed")
     target_y_full = hax.nn.one_hot(true_ids, Vocab, dtype=pred_embeddings.dtype)
     loss_full, norm_full = cross_entropy_loss_and_log_normalizers(logits_full, Vocab, target_y_full)
 
     loss_block, norm_this = _blockwise_cross_entropy_loss(
-        (pred_embeddings, pred_lm_head),
+        (pred_embeddings, lm_head),
         Contract=Embed,
         Label=Vocab,
+        Pos=Seq,
         labels_y=true_ids,
         block_size=8,
         dtype=pred_embeddings.dtype,
@@ -80,15 +81,15 @@ def test_single_block(test_data):
     loss_full, sumexp_full = _compute_full(Vocab, pred_embeddings, pred_lm_head, true_ids)
 
     # Compute block-wise loss with block_size=4 (vocab_size=4)
-    with jax.disable_jit():
-        loss_block, sumexp_block = _blockwise_cross_entropy_loss(
-            (pred_embeddings, pred_lm_head),
-            Contract=Embed,
-            Label=Vocab,
-            labels_y=true_ids,
-            block_size=Vocab.size,
-            dtype=pred_embeddings.dtype,
-        )
+    loss_block, sumexp_block = _blockwise_cross_entropy_loss(
+        (pred_embeddings, pred_lm_head),
+        Contract=Embed,
+        Label=Vocab,
+        Pos=Seq,
+        labels_y=true_ids,
+        block_size=Vocab.size,
+        dtype=pred_embeddings.dtype,
+    )
 
     # Assert that the losses are close
     assert hax.all(
@@ -120,6 +121,7 @@ def test_multiple_blocks(test_data):
         (pred_embeddings, pred_lm_head),
         Contract=Embed,
         Label=Vocab,
+        Pos=Seq,
         labels_y=true_ids,
         block_size=1,
         dtype=pred_embeddings.dtype,
@@ -138,13 +140,14 @@ def test_block_size_not_dividing_vocab(test_data):
     pred_embeddings, pred_lm_head, true_ids = test_data
 
     # Set block_size that does not divide vocab_size
-    block_size = 3  # vocab_size=4
+    block_size = 3  # vocab_size=16
 
     # should be fine now
     loss_block, logz_block = _blockwise_cross_entropy_loss(
         (pred_embeddings, pred_lm_head),
         Contract=Embed,
         Label=Vocab,
+        Pos=Seq,
         labels_y=true_ids,
         block_size=block_size,
         dtype=pred_embeddings.dtype,
@@ -180,6 +183,7 @@ def test_vocab_size_less_than_block_size(test_data):
         (pred_embeddings, pred_lm_head),
         Contract=Embed,
         Label=Vocab,
+        Pos=Seq,
         labels_y=true_ids,
         block_size=block_size,
         dtype=pred_embeddings.dtype,
@@ -231,6 +235,7 @@ def test_large_vocab():
         (pred_embeddings, pred_lm_head),
         Contract=Embed,
         Label=Vocab,
+        Pos=Seq,
         labels_y=true_ids,
         block_size=3,
         dtype=pred_embeddings.dtype,
@@ -259,6 +264,7 @@ def test_gradient_block_cross_entropy(block_size, test_data):
             (pred_embeddings, pred_lm_head),
             Contract=Embed,
             Label=Vocab,
+            Pos=Seq,
             labels_y=true_ids,
             block_size=block_size,
             dtype=pred_embeddings.dtype,
@@ -303,6 +309,7 @@ def test_grad_loss_without_logz(test_data):
             (pred_embeddings, pred_lm_head),
             Contract=Embed,
             Label=Vocab,
+            Pos=Seq,
             labels_y=true_ids,
             block_size=2,
             dtype=pred_embeddings.dtype,
