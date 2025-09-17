@@ -356,7 +356,7 @@ def _block_cross_entropy_forward_kernel(
         axes=(Batch, Pos),
     )
 
-    logits = hax.dot(pred_embeddings, lm_head, axis=Embed)  # [BatchSlice x PosSlice x Vocab]
+    logits = hax.dot(pred_embeddings, lm_head, axis=Embed)  # [Batch x Pos x Vocab]
     if logit_soft_cap is not None:
         logits = hax.tanh(logits / logit_soft_cap) * logit_soft_cap
 
@@ -365,9 +365,9 @@ def _block_cross_entropy_forward_kernel(
     max_logit = hax.max(masked_for_max, axis=Vocab)
     targets = _block_to_one_hot(labels, Vocab, vocab_start, logits.dtype) * pos_mask * batch_mask
 
-    # Mask out logits which aren't in the block, and invalid rows. Must happen after max_logit but before dot.
+    # Mask out logits which aren't in the block. Must happen after max_logit but before dot.
     logits = logits * vocab_mask * pos_mask * batch_mask
-    dot = hax.dot(logits, targets, axis=Vocab)  # [BatchSlice x Pos]
+    dot = hax.dot(logits, targets, axis=Vocab)  # [Batch x Pos]
     log_sum_exp = hax.log(hax.sum(hax.exp(logits - max_logit) * vocab_mask, axis=Vocab))
 
     # Zero out invalid rows explicitly in outputs
@@ -439,9 +439,6 @@ def _block_cross_entropy_forward(
 
     VocabBlock = Label.resize(num_vocab_blocks)
 
-    padded_batch = num_batch_blocks * BatchSlice.size
-    padded_pos = num_seq_blocks * PosSlice.size
-
     block_dots, block_max_logits, block_logsumexps = pl.pallas_call(
         functools.partial(
             _block_cross_entropy_forward_kernel,
@@ -455,9 +452,9 @@ def _block_cross_entropy_forward(
             Label=Label,
         ),
         out_shape=[
-            jax.ShapeDtypeStruct((padded_batch, padded_pos, VocabBlock.size), dtype=dtype),  # dot
-            jax.ShapeDtypeStruct((padded_batch, padded_pos, VocabBlock.size), dtype=dtype),  # max_logit
-            jax.ShapeDtypeStruct((padded_batch, padded_pos, VocabBlock.size), dtype=dtype),  # logsumexp
+            jax.ShapeDtypeStruct((Batch.size, Pos.size, VocabBlock.size), dtype=dtype),  # dot
+            jax.ShapeDtypeStruct((Batch.size, Pos.size, VocabBlock.size), dtype=dtype),  # max_logit
+            jax.ShapeDtypeStruct((Batch.size, Pos.size, VocabBlock.size), dtype=dtype),  # logsumexp
         ],
         grid=(num_batch_blocks, num_seq_blocks, num_vocab_blocks),
         in_specs=[
@@ -484,11 +481,6 @@ def _block_cross_entropy_forward(
         ],
         interpret=use_interpret,
     )(lm_head.array, pred_embeddings.array, labels_y.array)
-
-    # Slice off the padding to restore original Batch/Pos sizes
-    block_max_logits = block_max_logits[: Batch.size, : Pos.size]
-    block_logsumexps = block_logsumexps[: Batch.size, : Pos.size]
-    block_dots = block_dots[: Batch.size, : Pos.size]
 
     block_max_logits = hax.NamedArray(array=block_max_logits, axes=(Batch, Pos, VocabBlock))
     block_logsumexps = hax.NamedArray(array=block_logsumexps, axes=(Batch, Pos, VocabBlock))
@@ -562,7 +554,7 @@ def _block_cross_entropy_backward_kernel(
     if logit_soft_cap is not None:
         logits = hax.tanh(logits / logit_soft_cap) * logit_soft_cap
 
-    probs = hax.exp(logits - log_z) * vocab_mask  # broadcast over Vocab and zero invalid cols
+    probs = hax.exp(logits - log_z) * vocab_mask
 
     targets = _block_to_one_hot(labels, Vocab, vocab_start, logits.dtype) * pos_mask * batch_mask
 
