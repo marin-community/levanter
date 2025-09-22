@@ -5,6 +5,7 @@ import dataclasses
 import functools
 import gc
 import logging
+logging.getLogger('jax._src.compiler').setLevel(logging.ERROR)
 import jax
 import os
 from dataclasses import dataclass, field
@@ -310,7 +311,7 @@ def main(config: TrainLmConfig):
             logits = hax.dot(activations, head, axis=model.Embed)
             return logits
 
-        print("Validation sets:")
+        print("$$$$$ Validation sets:")
         for name, dataset in config.data.validation_sets(Pos).items():
             print(f"> Dataset {name}", dataset)
             val_loader = trainer.data_loader(dataset, trainer.EvalBatch)
@@ -333,28 +334,47 @@ def main(config: TrainLmConfig):
 
         train_loader = trainer.data_loader(train_dataset)
 
-        '''
+
         # Decode and print the first few examples
         print("Decoding first few examples...")
+
+        '''
         for i, example in enumerate(iter(train_loader)):
-            if i >= 5: # Print 5 examples
+            if i >= 1: # Print 5 examples
                 break
 
-            # example is a dict, get the input_ids which is a NamedArray
-            # with axes (batch, position)
-            input_ids = example.tokens.array
+            # Decode a whole batch at once; rely on skip_special_tokens to drop PAD/EOS
+            input_ids = np.asarray(example.tokens.array).astype(int)
+            texts = tokenizer.batch_decode(
+                input_ids.tolist(),
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
 
-            for j in range(input_ids.shape[0]): # iterate over batch
-                # don't decode padding tokens
-                non_padding_ids = input_ids[j][input_ids[j] != tokenizer.pad_token_id]
-                print(non_padding_ids)
-                text = tokenizer.decode(non_padding_ids.tolist())
+            for j, text in enumerate(texts):
                 print(f"Example {i*input_ids.shape[0] + j}:")
                 print(text)
                 print("-" * 20)
+        import pdb; pdb.set_trace()
         '''
 
-        reversed_train_loader = train_loader.reversed(config.trainer.num_train_steps)
+        # Build segment boundaries for replay using metagrad_segment_size S:
+        # segment_starts = [0, S, 2*S, ...] up to the max batch number (num_train_steps).
+        # Do not use metagrad_checkpoint_frequency for segmentation.
+        seg_size = int(getattr(config.trainer, "metagrad_segment_size", 0) or 0)
+        num_steps = int(config.trainer.num_train_steps)
+        if seg_size > 0:
+            segment_starts = list(range(0, num_steps, seg_size))
+        else:
+            segment_starts = [0]
+
+        print(f"[REPLAY] segment_starts: {segment_starts}", flush=True)
+
+        # Construct a reversed loader that is segment-aware and supports iter_segment
+        reversed_train_loader = train_loader.reversed(
+            num_train_steps=config.trainer.num_train_steps,
+            segment_starts=segment_starts,
+        )
         if state.step > 0:
             logger.info(f"Resuming training from step {state.step}")
             train_loader = train_loader.iter_from_step(state.step)
@@ -372,13 +392,22 @@ def main(config: TrainLmConfig):
             #data_weight_vector = data_weight_vector.at[:1024*40].set(1.0)
         print(f"data_weight_vector: {data_weight_vector[:100]}")
 
-        ret = trainer.train_and_replay(state, train_loader, reversed_train_loader, val_loader,
-                                             data_weight_vector, train_only=config.train_only)
-        reward, metagrads = ret
+        ret = trainer.train_and_replay(
+            state,
+            train_loader,
+            reversed_train_loader,
+            val_loader,
+            data_weight_vector,
+            segment_starts,
+            train_only=config.train_only,
+        )
+        reward, metagrads, dataset_ids_global, local_indices_global = ret
         out_dir = Path(config.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         np.save(out_dir / 'reward.npy', reward)
         np.save(out_dir / 'metagrads.npy', metagrads)
+        np.save(out_dir / 'dataset_ids_global.npy', dataset_ids_global)
+        np.save(out_dir / 'local_indices_global.npy', local_indices_global)
         np.save(out_dir / 'data_weight_vector.npy', data_weight_vector)
 
 
