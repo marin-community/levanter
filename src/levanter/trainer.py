@@ -9,6 +9,7 @@ import os
 import sys
 import typing
 import warnings
+import dataclasses
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -371,10 +372,15 @@ def lmexample_to_weighted_batch(
     labels = hax.roll(tokens, -1, axis=pos_axis)
     labels = labels.at[pos_axis, -1].set(pad_token_id)
 
-    # 3 – sample indices (use your own if the loader provides one)
-    index_vec_jnp = example_batch.index #jnp.arange(B, dtype=jnp.int32) + global_idx_start
-    #debug.print("index_vec_jnp: {}", index_vec_jnp)
-    #debug.print("orig index: {}", example_batch.index)
+    # 3 – construct indices/ids
+    # Global train-order index for this batch
+    global_index_vec_jnp = jnp.arange(B, dtype=jnp.int32) + jnp.int32(global_idx_start)
+    # Per-dataset local index (may collide across datasets)
+    local_index_vec_jnp = example_batch.index if example_batch.index is not None else jnp.full((B,), -1, dtype=jnp.int32)
+    # Dataset id if provided by mixture, else -1
+    dataset_id_vec_jnp = (
+        example_batch.dataset_id if getattr(example_batch, "dataset_id", None) is not None else jnp.full((B,), -1, dtype=jnp.int32)
+    )
 
     # 4 – reshape for micro-batching
     batch_size = B // grad_accum_size
@@ -384,13 +390,24 @@ def lmexample_to_weighted_batch(
     batched_input_ids = tokens.unflatten_axis(batch_axis, (Microbatch, MiniBatch))
     batched_labels = labels.unflatten_axis(batch_axis, (Microbatch, MiniBatch))
 
-    index_vec = hax.named(index_vec_jnp, batch_axis)
-    batched_index = index_vec.unflatten_axis(batch_axis, (Microbatch, MiniBatch))
+    # Named and unflatten
+    global_index_vec = hax.named(global_index_vec_jnp, batch_axis)
+    batched_index = global_index_vec.unflatten_axis(batch_axis, (Microbatch, MiniBatch))
+
+    local_index_vec = hax.named(local_index_vec_jnp, batch_axis)
+    batched_local_index = local_index_vec.unflatten_axis(batch_axis, (Microbatch, MiniBatch))
+
+    dataset_id_vec = hax.named(dataset_id_vec_jnp, batch_axis)
+    batched_dataset_id = dataset_id_vec.unflatten_axis(batch_axis, (Microbatch, MiniBatch))
 
     batched = {
         "input_ids": batched_input_ids,
         "labels": batched_labels,
+        # index is the global train-order index used to index weight vectors and scatter metagrads
         "index": batched_index,
+        # additional diagnostics for analysis
+        "dataset_id": batched_dataset_id,
+        "local_index": batched_local_index,
     }
     return batched
 
@@ -637,10 +654,6 @@ def make_train_functions(
         initial_params, initial_opt_state, data_weights, batch_data = non_donated_args
         train_state = (initial_params, initial_opt_state)
 
-        _debug_weight_sharding("vjp_update/initial_params", initial_params)
-        _debug_weight_sharding("vjp_update/initial_opt_state", initial_opt_state)
-        #import pdb; pdb.set_trace()
-
         # 1) Forward leg: state -> avg grads; respect parameter sharding layout if provided
         def train_state_to_grads_with_sharding(state):
             with jax.named_scope("train_state_to_grads_with_fsdp_sharding"):
@@ -653,21 +666,21 @@ def make_train_functions(
                 return grad_buffer, loss
         (grad_buffer, loss), vjp_grad_state_fun = eqx.filter_vjp(train_state_to_grads_with_sharding, train_state)
         # Debug: sharding of avg grad buffer produced by state→grads leg
-        _debug_weight_sharding("vjp_update/grad_buffer_post_state_to_grads", grad_buffer)
+        #_debug_weight_sharding("vjp_update/grad_buffer_post_state_to_grads", grad_buffer)
 
         # 2) Forward leg: (avg grads, state) -> new state; apply grad sharding if provided
         if grad_sharding is not None:
             grad_buffer = hax.shard(grad_buffer, parameter_axis_mapping)
             # Debug: sharding after applying grad_sharding constraint
-            _debug_weight_sharding("vjp_update/grad_buffer_post_grad_sharding", grad_buffer)
+            #_debug_weight_sharding("vjp_update/grad_buffer_post_grad_sharding", grad_buffer)
         _, vjp_update_fun = eqx.filter_vjp(update_with_grads, grad_buffer, train_state)
         avg_grad_grad, train_state_grad = vjp_update_fun((params_grad, opt_grad))
 
         # 3) Backward through grads path and sum contributions
         avg_grad_grad = hax.shard(avg_grad_grad, parameter_axis_mapping)
         # Debug: sharding of gradient wrt avg grads and wrt train_state from update leg
-        _debug_weight_sharding("vjp_update/avg_grad_grad_from_update", avg_grad_grad)
-        _debug_weight_sharding("vjp_update/train_state_grad_from_update", train_state_grad)
+        #_debug_weight_sharding("vjp_update/avg_grad_grad_from_update", avg_grad_grad)
+        #_debug_weight_sharding("vjp_update/train_state_grad_from_update", train_state_grad)
 
         train_state_grad_through_grads = vjp_grad_state_fun((avg_grad_grad, 0.0))[0]
         train_state_grad = jax.tree.map(
@@ -676,7 +689,7 @@ def make_train_functions(
             train_state_grad_through_grads,
         )
         # Debug: final sharding after summing both gradient paths
-        _debug_weight_sharding("vjp_update/train_state_grad_post_sum", train_state_grad)
+        #_debug_weight_sharding("vjp_update/train_state_grad_post_sum", train_state_grad)
         return avg_grad_grad, train_state_grad, loss
 
 
@@ -685,7 +698,7 @@ def make_train_functions(
         this is the second part that propagates gradients at the batch level to each example and uses a hand computed VJP """
         train_state = (initial_model, initial_opt_state)
         # Debug: inspect sharding of the incoming avg_grad_grad tree
-        _debug_weight_sharding("vjp_grad_manual/avg_grad_grad_input", avg_grad_grad)
+        #_debug_weight_sharding("vjp_grad_manual/avg_grad_grad_input", avg_grad_grad)
 
         manual_vjp_grad_fun = jax.tree_util.Partial(
             microbatch_vjp_grad_fun,
@@ -714,7 +727,7 @@ def make_train_functions(
         this is the second part that propagates gradients at the batch level to each example. this is a slower, jax computed version to be used for a reference in tests"""
         train_state = (initial_model, initial_opt_state)
         # Debug: inspect sharding of the incoming avg_grad_grad tree
-        _debug_weight_sharding("vjp_grad_jax/avg_grad_grad_input", avg_grad_grad)
+        #_debug_weight_sharding("vjp_grad_jax/avg_grad_grad_input", avg_grad_grad)
 
         if parameter_axis_mapping is not None:
             with hax.axis_mapping(parameter_axis_mapping):
@@ -780,6 +793,12 @@ class Trainer:
 
         self._cmanagers = []
         self.profiler_running = False
+        # When set, only allow saving checkpoints at these steps during forward train.
+        # None means use default checkpointer policy (no gating).
+        self._checkpoint_allowed_steps: Optional[set[int]] = None
+        # Keep a handle to the checkpointer used by default hooks so we can invoke
+        # it manually (e.g., during segment retraining).
+        self._checkpointer = None
 
         if add_default_hooks:
             self._add_default_hooks()
@@ -972,6 +991,15 @@ class Trainer:
             allow_partial=self.config.allow_partial_checkpoint,
         )(model_init, training_key)
 
+        # If resuming from a checkpoint at startup, log the forward checkpoint step
+        #if load_checkpoint:
+        try:
+            resumed_step = int(state.step)
+        except Exception:
+            # Fallback in case state.step is a device array type
+            resumed_step = int(jax.device_get(state.step))
+        logger.info(f"> Resuming forward checkpoint: step-{resumed_step} from {checkpoint_path}")
+
                 # --- Force FSDP sharding on state once, pre-JIT ---
         with hax.axis_mapping(self.parameter_axis_mapping):
             mesh = self.device_mesh
@@ -1054,6 +1082,7 @@ class Trainer:
             with capture_time() as loading_time:
                 try:
                     example = next(iter_data)
+                    print(f'> step: {state.step} | example tokens: {example.tokens.array} | example index: {example.index} | example dataset_id: {example.dataset_id}')
                     self.consumed_tokens += example.tokens.size
                 except StopIteration:
                     logger.info("Reached end of training data loader")
@@ -1071,49 +1100,61 @@ class Trainer:
 
             yield info
 
-    def train(self, state: S, train_loader: Iterable[X], data_weight_vector: Optional[jnp.ndarray] = None) -> StepInfo[S]:
+
+    def train(
+        self,
+        state: S,
+        train_loader: Iterable[X],
+        data_weight_vector: Optional[jnp.ndarray] = None,
+        *,
+        checkpoint_steps: Optional[Iterable[int]] = None,
+    ) -> StepInfo[S]:
         """
         Performs training until the number of steps is reached.
         """
         info: Optional[StepInfo[S]] = None
         self.data_weight_vector = data_weight_vector
 
-        # initialize consumed_tokens
-        if int(state.step) > 0:
-            # TODO: this is not exactly correct if the batch size has changed during training
-            # a better way would be to save this in the checkpoint
-            loader = getattr(train_loader, "dl", train_loader)
-            if hasattr(loader.data_store, "seq_len"):
-                seq_len = loader.data_store.seq_len
-                batch_size = self.config.batch_schedule.value_at_step(state.step)
-                self.consumed_tokens = int(state.step) * batch_size * seq_len
-        else:
-            self.consumed_tokens = 0
-
-        # force hooks to run at the beginning
-        if state.step == 0:
-            self.run_hooks(StepInfo(state, jnp.array(0.0), 0.0), force=True)
-
-        last_info: Optional[StepInfo[S]] = None
-        for info in self.training_steps(state, train_loader):
-            last_info = info
-
-        # if we didn't train, info is None, so we should use the initial state
-        if last_info is None:
-            print('No training steps were taken (WAIT 10 seconds)')
-            time.sleep(10)
-            last_info = StepInfo(state, jnp.array(float("nan")), 0.0)
-
-        if info is None:
-            raise RuntimeError(
-                "No training steps were executed. The dataset may be empty or there are no steps left to run."
+        # Gate checkpoint saving to specified steps if provided
+        prev_allowed = self._checkpoint_allowed_steps
+        try:
+            self._checkpoint_allowed_steps = (
+                set(int(s) for s in checkpoint_steps) if checkpoint_steps is not None else None
             )
 
-        # force hooks to run at the end
-        self.run_hooks(last_info, force=True)
+            # initialize consumed_tokens
+            if int(state.step) > 0:
+                # TODO: this is not exactly correct if the batch size has changed during training
+                # a better way would be to save this in the checkpoint
+                loader = getattr(train_loader, "dl", train_loader)
+                if hasattr(loader.data_store, "seq_len"):
+                    seq_len = loader.data_store.seq_len
+                    batch_size = self.config.batch_schedule.value_at_step(state.step)
+                    self.consumed_tokens = int(state.step) * batch_size * seq_len
+            else:
+                self.consumed_tokens = 0
 
-        return last_info
+            # force hooks to run at the beginning
+            if state.step == 0:
+                self.run_hooks(StepInfo(state, jnp.array(0.0), 0.0), force=True)
 
+            last_info: Optional[StepInfo[S]] = None
+            for info in self.training_steps(state, train_loader):
+                last_info = info
+
+            # if we didn't train, info is None, so we should use the initial state
+            if last_info is None:
+                print("No training steps were executed. The dataset may be empty or there are no steps left to run.")
+                time.sleep(10)
+                last_info = StepInfo(state, jnp.array(float("nan")), 0.0)
+
+            # force hooks to run at the end
+            self.run_hooks(last_info, force=True)
+
+            return last_info
+        finally:
+            # Restore checkpoint gating
+            self._checkpoint_allowed_steps = prev_allowed
 
     def construct_metagrad_helpers(self, use_manual_vjp=True):
         pad_token_id = -100
@@ -1147,141 +1188,144 @@ class Trainer:
     def train_and_replay(self, state: S, train_loader: Iterable[X], reversed_train_loader: Iterable[X],
                          val_loader: Iterable[X],
                          data_weight_vector: jnp.ndarray,
+                         segment_starts,
                          train_only=False) -> StepInfo[S]:
-        init_state = state
+        init_state = self._duplicate_pytree_arrays(state) # TODO: check this
+        forward_ckpt_steps = set(int(s) - 1 for s in segment_starts if int(s) > 0)
+        metagrad_ckpt_dir = fsspec_utils.join_path(self.checkpoint_path, "metagrad_checkpoints")
+        print(f"[DBG] Metagrad checkpoint directory: {metagrad_ckpt_dir}", flush=True)
+        # Determine resume only if at least one valid step-* checkpoint exists
+        resumed_from_metagrad = False
+        if fsspec_utils.exists(metagrad_ckpt_dir):
+            try:
+                fs, _, paths = fsspec.get_fs_token_paths(metagrad_ckpt_dir)
+                files = fs.ls(paths[0])
+                for entry in files:
+                    name = entry["name"] if isinstance(entry, dict) else str(entry)
+                    base = os.path.basename(name)
+                    if base.startswith("step-"):
+                        meta_path = fsspec_utils.join_path(metagrad_ckpt_dir, base)
+                        meta_json = fsspec_utils.join_path(meta_path, "metadata.json")
+                        if fsspec_utils.exists(meta_json):
+                            resumed_from_metagrad = True
+                            break
+            except (FileNotFoundError, IndexError):
+                resumed_from_metagrad = False
+        if resumed_from_metagrad:
+            logger.info(f"[DBG] Resumed from backward; skipping forward training and reward eval")
+        # Always preserve the very last forward checkpoint (step-(num_train_steps - 1)) during backward cleanup.
+        # This ensures the final checkpoint is retained regardless of which steps were saved by policy.
+        self._last_forward_ckpt_to_keep = self.config.num_train_steps - 1
 
-        info = self.train(state, train_loader, data_weight_vector)
-        final_model, final_opt_state = info.state.model, info.state.opt_state
-        final_model = inference_mode(final_model, True)
-        final_model = self.mp.cast_to_compute(final_model)
-
-        '''
-        @eqx.filter_jit
-        def single_batch_reward(model, batch):
-            with hax.axis_mapping(self.compute_axis_mapping):
-                losses = compute_next_token_loss(model, batch, reduction=None, reduction_axis=())
-                mask = batch.loss_mask  # [Batch, Pos]
-                return -hax.einsum("->", losses, mask).scalar() / losses.axes[1].size # to scalar
-
-        # get gradient wrt final reward by accumulating gradients per batch
-        def value_and_grad_fn(model, batch):
-            reward_fn = lambda m: single_batch_reward(m, batch)
-            return eqx.filter_value_and_grad(reward_fn)(model)
-
-        value_and_grad_fn = eqx.filter_jit(value_and_grad_fn)
-
-        # Get zero-like gradients for accumulation
-        differentiable_final_model, _ = eqx.partition(final_model, eqx.is_inexact_array)
-        params_grad = jax.tree_util.tree_map(jnp.zeros_like, differentiable_final_model)
-
-        total_loss = 0.0
-        total_weights = 0.0
-
-        for i, val_batch in tqdm(enumerate(val_loader), desc="Computing reward"):
-            #print('\n\n\nREWARD val_batch.tokens.array:', val_batch.tokens.array, flush=True)
-            with hax.axis_mapping(self.compute_axis_mapping):
-                loss, p_grad = value_and_grad_fn(final_model, val_batch)
-                params_grad = jax.tree_util.tree_map(jnp.add, params_grad, p_grad)
-            total_loss += loss
-            total_weights += val_batch.tokens.array.shape[0]
-            # TODO: put this in config
-            if i == 1:
-                break
-            #break
-
-        if total_weights > 0:
-            reward = (total_loss / total_weights)
-            params_grad = jax.tree_util.tree_map(lambda g: g / total_weights, params_grad)
-        else:
-            reward = jnp.array(0.0)
-            # params_grad is already zeros
-        '''
-
-        # 1) Define a scalar reward loss (same as you already do, just as a callable)
-        def reward_loss_fn(model, batch):
-            with hax.axis_mapping(self.compute_axis_mapping):
-                losses = compute_next_token_loss(model, batch, reduction=None, reduction_axis=())
-                mask = batch.loss_mask
-                return (-hax.einsum("->", losses, mask) / losses.axes[1].size).scalar()
-
-        # JIT a plain two-arg function that calls your microbatched gradient helper
-        def _reward_grad_step_impl(model, batch):
-            return self._compute_gradients_microbatched(reward_loss_fn, model, batch)
-
-        reward_grad_step = eqx.filter_jit(_reward_grad_step_impl)
-
-        # 2) Init a device-resident, sharded accumulator that matches param sharding
-        differentiable_final_model, _ = eqx.partition(final_model, eqx.is_inexact_array)
-        differentiable_final_model = hax.shard(differentiable_final_model, self.parameter_axis_mapping)
-        #with hax.axis_mapping(self.parameter_axis_mapping):
-
-        @eqx.filter_jit
-        def zeros_like(m):
-            return hax.shard(hax.tree_util.tree_map(hax.zeros_like, m), self.parameter_axis_mapping)
-
-        params_grad = zeros_like(differentiable_final_model)
-        #params_grad = hax.tree_util.tree_map(hax.zeros_like, differentiable_final_model)
-        #params_grad = hax.shard(params_grad, self.parameter_axis_mapping)
-
-        # (optional but recommended) constrain to best-effort FSDP sharding
-        _debug_weight_sharding("reward_grad_init/params_grad", params_grad)
-        '''
-        params_grad = jax.tree_util.tree_map(
-            lambda x: jax.lax.with_sharding_constraint(
-                x, best_effort_sharding(x, mesh=self.device_mesh)
-            ),
-            params_grad,
-        )
-        '''
-
-        print('parameter_axis_mapping:', self.parameter_axis_mapping, flush=True)
-        #import pdb; pdb.set_trace()
-
-        total_weights = 0.0
-
-        # 3) Use the SAME microbatched machinery you use for training to compute reward grads
+        # Ensure reward is defined even if we skip reward evaluation
         reward = 0.0
-        for i, val_batch in tqdm(enumerate(val_loader), desc="Computing reward"):
-            loss, p_grad = reward_grad_step(  # <- microbatched + checkpointed
-                final_model, val_batch
+        metagrads = jnp.zeros_like(data_weight_vector)
+        # Global accumulators for dataset id and local (per-dataset) index, aligned to train-order indices
+        dataset_ids_global = jnp.full(metagrads.shape, -1, dtype=jnp.int32)
+        local_indices_global = jnp.full(metagrads.shape, -1, dtype=jnp.int32)
+
+        if not resumed_from_metagrad:
+            info = self.train(state, train_loader, data_weight_vector, checkpoint_steps=forward_ckpt_steps)
+            final_model, final_opt_state = info.state.model, info.state.opt_state
+            final_model = inference_mode(final_model, True)
+            final_model = self.mp.cast_to_compute(final_model)
+
+
+            # 1) Define a scalar reward loss (same as you already do, just as a callable)
+            def reward_loss_fn(model, batch):
+                with hax.axis_mapping(self.compute_axis_mapping):
+                    losses = compute_next_token_loss(model, batch, reduction=None, reduction_axis=())
+                    mask = batch.loss_mask
+                    return (-hax.einsum("->", losses, mask) / losses.axes[1].size).scalar()
+
+            # JIT a plain two-arg function that calls your microbatched gradient helper
+            def _reward_grad_step_impl(model, batch):
+                return self._compute_gradients_microbatched(reward_loss_fn, model, batch)
+
+            reward_grad_step = eqx.filter_jit(_reward_grad_step_impl)
+
+            # 2) Init a device-resident, sharded accumulator that matches param sharding
+            differentiable_final_model, _ = eqx.partition(final_model, eqx.is_inexact_array)
+            differentiable_final_model = hax.shard(differentiable_final_model, self.parameter_axis_mapping)
+            #with hax.axis_mapping(self.parameter_axis_mapping):
+
+            @eqx.filter_jit
+            def zeros_like(m):
+                return hax.shard(hax.tree_util.tree_map(hax.zeros_like, m), self.parameter_axis_mapping)
+
+            params_grad = zeros_like(differentiable_final_model)
+            #params_grad = hax.tree_util.tree_map(hax.zeros_like, differentiable_final_model)
+            #params_grad = hax.shard(params_grad, self.parameter_axis_mapping)
+
+            # (optional but recommended) constrain to best-effort FSDP sharding
+            #_debug_weight_sharding("reward_grad_init/params_grad", params_grad)
+
+            total_weights = 0.0
+
+            # 3) Use the SAME microbatched machinery you use for training to compute reward grads
+            reward = 0.0
+            for i, val_batch in tqdm(enumerate(val_loader), desc="Computing reward"):
+                loss, p_grad = reward_grad_step(  # <- microbatched + checkpointed
+                    final_model, val_batch
+                )
+                # Accumulate on device (params_grad is sharded, so we don't replicate)
+                params_grad = jax.tree_util.tree_map(jnp.add, params_grad, p_grad)
+                total_weights += val_batch.tokens.array.shape[0]
+                reward += loss
+                if i == 1: # TODO: fix this
+                    break
+
+            # 4) Normalize once at the end
+            if total_weights > 0:
+                params_grad = jax.tree_util.tree_map(lambda g: g / total_weights, params_grad)
+
+            # The original code differentiated wrt (final_model, final_opt_state).
+            # final_opt_state isn't used in reward computation, so its gradient is zero.
+            differentiable_opt_state, _ = eqx.partition(final_opt_state, eqx.is_inexact_array)
+            opt_grad = jax.tree_util.tree_map(jnp.zeros_like, differentiable_opt_state)
+
+            #_debug_weight_sharding("reward_grad_init/params_grad", params_grad)
+            #_debug_weight_sharding("reward_grad_init/opt_grad", opt_grad)
+            #print(f"Final reward: {reward}")
+
+            if train_only:
+                return reward, None
+
+            print('***** COMPUTED FINAL STATE GRADIENTS *****\n\n\n', flush=True)
+
+            ckpt_dir = fsspec_utils.join_path(metagrad_ckpt_dir, f"step-{self.config.num_train_steps}")
+
+            # Save using TensorStore-based checkpointing to preserve sharding (TPU-safe, supports gs://)
+            save_tree = {
+                "params_grad": params_grad,
+                "opt_grad": opt_grad,
+                "metagrads": metagrads,
+            }
+            levanter.checkpoint.save_checkpoint(
+                save_tree,
+                step=self.config.num_train_steps,
+                checkpoint_path=ckpt_dir,
+                manager=None,
+                is_temporary=False,
             )
-            # Accumulate on device (params_grad is sharded, so we don't replicate)
-            params_grad = jax.tree_util.tree_map(jnp.add, params_grad, p_grad)
-            total_weights += val_batch.tokens.array.shape[0]
-            reward += loss
-            if i == 1:
-                break
 
-        # 4) Normalize once at the end
-        if total_weights > 0:
-            params_grad = jax.tree_util.tree_map(lambda g: g / total_weights, params_grad)
+        else:
+            # Initialize final state and gradient buffers when resuming from metagrad checkpoints
+            final_model, final_opt_state = state.model, state.opt_state
+            final_model = inference_mode(final_model, True)
+            final_model = self.mp.cast_to_compute(final_model)
 
+            differentiable_final_model, _ = eqx.partition(final_model, eqx.is_inexact_array)
+            differentiable_final_model = hax.shard(differentiable_final_model, self.parameter_axis_mapping)
 
-        # The original code differentiated wrt (final_model, final_opt_state).
-        # final_opt_state isn't used in reward computation, so its gradient is zero.
-        differentiable_opt_state, _ = eqx.partition(final_opt_state, eqx.is_inexact_array)
-        opt_grad = jax.tree_util.tree_map(jnp.zeros_like, differentiable_opt_state)
+            @eqx.filter_jit
+            def zeros_like(m):
+                return hax.shard(hax.tree_util.tree_map(hax.zeros_like, m), self.parameter_axis_mapping)
 
+            params_grad = zeros_like(differentiable_final_model)
 
-        _debug_weight_sharding("reward_grad_init/params_grad", params_grad)
-        _debug_weight_sharding("reward_grad_init/opt_grad", opt_grad)
-        #import pdb; pdb.set_trace()
-
-        #print(f"Final reward: {reward}")
-
-        if self.debug:
-            self.jax_debug_print("grad_buffer (embedding): {}", params_grad.embedding.weight.array)
-            self.jax_debug_print("grad_buffer (embedding[257]): {}", params_grad.embedding.weight.array[257])
-            self.jax_debug_print("grad_buffer (lm_head): {} {}", params_grad.lm_head.weight.array.T, params_grad.lm_head.weight.array.T.shape)
-
-        if self.debug:
-            DIR = Path('/juice5b/scr5b/sampark/debug_levanter/')
-            params_grad_embedding_pre_backward = np.load(DIR / 'params_grad_embedding_pre_backward.npy')
-            self.debug_print(f' agreement (params_grad_embedding_pre_backward): {np.all(params_grad.embedding.weight.array == params_grad_embedding_pre_backward)}')
-
-        print('***** COMPUTED FINAL STATE GRADIENTS *****\n\n\n', flush=True)
-        if train_only:
-            return reward, None
+            differentiable_opt_state, _ = eqx.partition(final_opt_state, eqx.is_inexact_array)
+            opt_grad = jax.tree_util.tree_map(jnp.zeros_like, differentiable_opt_state)
 
         self.construct_metagrad_helpers()
 
@@ -1296,9 +1340,6 @@ class Trainer:
         print('opt grad_sharding:', grad_sharding, flush=True)
         sharded_update = jax.tree_util.Partial(self.run_vjp_update, grad_sharding=grad_sharding)
 
-        metagrads = jnp.zeros_like(data_weight_vector)
-        iter_data = iter(reversed_train_loader)
-
         rev_it = self.config.num_train_steps - 1
 
         # Metagrad checkpointing setup
@@ -1307,9 +1348,9 @@ class Trainer:
             self.run_id, axis_mapping=self.parameter_axis_mapping, mesh=self.device_mesh
         )
         print("[DBG] Metagrad checkpointer created", flush=True)
-        metagrad_ckpt_dir = fsspec_utils.join_path(self.checkpoint_path, "metagrad_checkpoints")
-        print(f"[DBG] Metagrad checkpoint directory: {metagrad_ckpt_dir}", flush=True)
-        if self.config.metagrad_checkpoint_frequency > 0:
+        #metagrad_ckpt_dir = fsspec_utils.join_path(self.checkpoint_path, "metagrad_checkpoints")
+        #print(f"[DBG] Metagrad checkpoint directory: {metagrad_ckpt_dir}", flush=True)
+        if (not resumed_from_metagrad) and self.config.metagrad_checkpoint_frequency > 0:
             print("[DBG] Ensuring metagrad checkpoint directory exists...", flush=True)
             fsspec_utils.mkdirs(metagrad_ckpt_dir)
             print("[DBG] mkdirs completed", flush=True)
@@ -1331,6 +1372,9 @@ class Trainer:
                 num_steps = start_step + 1
 
         backward_profiler_started_by_us = False
+
+        # Cache of batches for the currently reconstructed segment, if any
+        data_batches_cache: Optional[dict[int, Any]] = None
 
         # Resume from metagrad checkpoint if available
         print(f"[DBG] Checking for existing metagrad checkpoints at {metagrad_ckpt_dir}...", flush=True)
@@ -1384,15 +1428,22 @@ class Trainer:
                 # Normalize metagrads to single-device array for consistent scatter updates
                 metagrads = jnp.asarray(jax.device_get(loaded["metagrads"]))
 
-                # Fast-forward reversed loader and set rev_it
+                # Set rev_it to resume point directly (no dataloader fast-forward)
                 steps_to_skip = (self.config.num_train_steps - 1) - (latest_step - 1) - 1
                 if steps_to_skip > 0:
-                    logger.info(f"Skipping {steps_to_skip} batches in reversed_train_loader to resume.")
-                    print(f"[DBG] Fast-forwarding dataloader by {steps_to_skip} steps...", flush=True)
-                    for _ in tqdm(range(steps_to_skip), desc="Fast-forwarding dataloader"):
-                        next(iter_data)
-                    print("[DBG] Dataloader fast-forward complete", flush=True)
+                    logger.info(f"Skipping {steps_to_skip} backward iterations to resume.")
                 rev_it = latest_step - 1
+
+                if rev_it == -1:
+                    # Already fully computed
+                    return 0., None
+
+                # prefetch data_batches_cache since lost on resume
+                segment_start = max([s for s in segment_starts if s <= rev_it])
+                segment_loader = reversed_train_loader.iter_segment(segment_start)
+                data_batches_cache = {}
+                for i, example in enumerate(segment_loader):
+                    data_batches_cache[segment_start + i] = example
                 print(f"[DBG] rev_it set to {rev_it} after resume", flush=True)
 
         global_idx_start = (rev_it) * self.config.train_batch_size
@@ -1402,12 +1453,12 @@ class Trainer:
         # Prefetch the first checkpoint
         if rev_it > 0:
             print(f"[DBG] Prefetching checkpoint for step {rev_it - 1}...", flush=True)
-            checkpointer.begin_checkpoint_loading(rev_it - 1, state)
+            checkpointer.begin_checkpoint_loading(rev_it - 1, init_state)
             print("[DBG] Prefetch request issued", flush=True)
 
         while rev_it >= 0:
             print(f'------------------------------- Backward it: {rev_it} -------------------------------', flush=True)
-
+            it_start_time = time.time()
             if self.config.backward_profiler:
                 if rev_it == start_step:
                     try:
@@ -1451,27 +1502,41 @@ class Trainer:
                         barrier_sync()
                         backward_profiler_started_by_us = False
 
-            data_load_start_time = time.time()
-            example = next(iter_data)
-            data_load_end_time = time.time()
-            data_load_duration = data_load_end_time - data_load_start_time
-            print(f"[Timing] Data loading for step {rev_it} took {data_load_duration:.3f}s", flush=True)
+            #  rev_it is the iteration (step) to rewind to; we need the state prior to it (rev_it-1)
+            # Ensure we have the segment's batches cached; if not, retrain the segment now.
+            segment_start = max([s for s in segment_starts if s <= rev_it])
 
-            #  rev_it is the *iteration* (step) you want to rewind to
             checkpoint_start_time = time.time()
-            state = self._restore_step(state, rev_it-1, checkpointer) # if rev_it > 0 else -1)
-            jax.block_until_ready(state)
+            state_pre = self._restore_step(init_state, rev_it - 1, checkpointer)
+            jax.block_until_ready(state_pre)
             checkpoint_end_time = time.time()
             checkpoint_duration = checkpoint_end_time - checkpoint_start_time
             print(f"[Timing] Checkpoint restoration for step {rev_it-1} took {checkpoint_duration:.3f}s", flush=True)
 
-            # Log sharding for restored state
-            try:
-                #_log_sharding("state.model (restored)", state.model)
-                #_log_sharding("state.opt_state (restored)", state.opt_state)
-                pass
-            except Exception:
-                pass
+            if state_pre is None or data_batches_cache is None or rev_it not in data_batches_cache:
+                logger.info(f"[REPLAY] segment missing---state_pre is None: {state_pre is None}, data_batches_cache is None: {data_batches_cache is None}, rev_it not in data_batches_cache: {rev_it not in data_batches_cache}")
+                print(f"[REPLAY] rev_it: {rev_it}, retraining segment from step {segment_start - 1}...", flush=True)
+                restored = self._restore_step(init_state, segment_start - 1, checkpointer)
+                if restored is None:
+                    raise RuntimeError(f"Missing checkpoint at segment start-1 ({segment_start - 1}); cannot retrain segment.")
+
+                state_pre, data_batches_cache = self.retrain_segment(restored, reversed_train_loader, segment_start, rev_it-1)
+                '''
+                if rev_it == segment_start:
+                    state_pre = restored
+                else:
+                    state_pre = self._restore_step(init_state, rev_it - 1, checkpointer)
+                if state_pre is None:
+                    raise RuntimeError(f"Checkpoint for step {rev_it - 1} still missing after retrain.")
+                '''
+                #jax.block_until_ready(state_pre)
+
+            # Use the restored pre-state for VJP computation
+            state = state_pre
+
+            # Retrieve the batch from cache for this step
+            example = data_batches_cache[rev_it]
+
 
             # Prefetch the next checkpoint while we compute the current one
             if rev_it > 1:
@@ -1491,7 +1556,7 @@ class Trainer:
             self.rev_it = rev_it
 
             with jax.profiler.StepTraceAnnotation("backward_step", step_num=rev_it):
-                params_grad, opt_grad, metagrads_for_batch_local, unique_indices = self._vjp_update_step(
+                params_grad, opt_grad, metagrads_for_batch_local, metagrads_indices, ds_ids_flat, local_idx_flat = self._vjp_update_step(
                     batch,
                     data_weight_vector,
                     inference_mode(state.model, True),
@@ -1500,10 +1565,13 @@ class Trainer:
                     opt_grad,
                     sharded_update,
                 )
-                jax.block_until_ready((params_grad, opt_grad, metagrads_for_batch_local, unique_indices))
+                jax.block_until_ready((params_grad, opt_grad, metagrads_for_batch_local, metagrads_indices, ds_ids_flat, local_idx_flat))
 
-            # Accumulate metagrads by scattering local grads into the global tensor
-            metagrads = metagrads.at[unique_indices].add(metagrads_for_batch_local)
+            # Accumulate metagrads by scattering in true train order using global indices
+            metagrads = metagrads.at[metagrads_indices].add(metagrads_for_batch_local)
+            # Record dataset id and local index aligned to global positions
+            dataset_ids_global = dataset_ids_global.at[metagrads_indices].set(ds_ids_flat)
+            local_indices_global = local_indices_global.at[metagrads_indices].set(local_idx_flat)
 
             if self.config.metagrad_checkpoint_frequency > 0 and (rev_it % self.config.metagrad_checkpoint_frequency == 0):
                 logger.info(f"Checkpointing metagrad computation at step {rev_it}")
@@ -1536,21 +1604,90 @@ class Trainer:
                     except Exception as e:
                         logger.warning(f"Failed to delete old metagrad checkpoint {prev_ckpt_path}: {e}")
 
+            # After finishing rev_it, optionally delete the forward training checkpoint for step-{rev_it}
+            # to save space as we move backward. Keep the last forward checkpoint (step-{num_train_steps-1}).
+            last_keep = getattr(self, "_last_forward_ckpt_to_keep", self.config.num_train_steps - 1)
+            if 0 <= rev_it and rev_it != last_keep:
+                try:
+                    checkpointer._rm_checkpoint(f"step-{rev_it}")
+                except Exception as e:
+                    logger.warning(f"Failed to schedule deletion for forward checkpoint step-{rev_it}: {e}")
+
             iter_end_time = time.time()
-            iter_duration = iter_end_time - data_load_start_time
+            iter_duration = iter_end_time - it_start_time
             print(f"[Timing] Iteration {rev_it} took {iter_duration:.3f}s", flush=True)
 
             #self.debug_print('> iter:', rev_it, 'global_idx_start:', global_idx_start, 'example.tokens:', example.tokens)
             rev_it -= 1
 
         print(f"metagrads: {metagrads[:100]}")
+        print(f"dataset_ids_global: {dataset_ids_global[:100]}")
+        print(f"local_indices_global: {local_indices_global[:100]}")
 
-        return reward, metagrads
+        return reward, metagrads, dataset_ids_global, local_indices_global
+
+
+    def retrain_segment(self, state, reversed_train_loader, segment_start, target_step):
+        """Retrain forward over a segment and save a checkpoint for each step.
+
+        Only checkpoint saving is performed (no other hooks). Also caches the
+        data batches for this segment for later reuse during backward VJP.
+        """
+        if self._checkpointer is None:
+            # Should be set in _add_default_hooks; fail loudly if missing.
+            raise RuntimeError("Internal error: checkpointer handle is not initialized.")
+
+        segment_loader = reversed_train_loader.iter_segment(segment_start)
+        data_batches_cache: dict[int, Any] = {}
+
+        # Iterate forward within the segment and reproduce training steps without running hooks.
+        current_step = int(segment_start) - 1
+
+        for segment_idx, example in enumerate(segment_loader):
+            '''
+            # Refresh the step scalar to avoid reusing a potentially donated int32[] from prior calls
+            try:
+                step_dtype = state.step.dtype  # type: ignore[attr-defined]
+            except Exception:
+                step_dtype = jnp.int32
+            state = dataclasses.replace(state, step=jnp.array(current_step, dtype=step_dtype))
+            # Run the JITed train step without hooks
+            example_for_train = self._duplicate_pytree_arrays(example)
+            loss, state, _metrics, _ = self._jit_train_step_fn_no_hook_nodonate(state, (example_for_train,), {})
+            # Ensure previous async saves are finished, then remove any existing checkpoint dir for this step
+            try:
+                self._checkpointer.wait_until_finished()
+                try:
+                    save_step = int(jax.device_get(state.step))  # type: ignore[attr-defined]
+                except Exception:
+                    save_step = current_step + 1
+                from levanter.checkpoint import _get_fs_and_plain_path  # local import to avoid cycles
+                fs, plain_base = _get_fs_and_plain_path(self._checkpointer.base_path)
+                ckpt_dir_plain = os.path.join(plain_base, f"step-{save_step}")
+                if fs.exists(ckpt_dir_plain):
+                    fs.rm(ckpt_dir_plain, recursive=True)
+            except Exception:
+                # Best-effort cleanup; proceed even if removal fails
+                pass
+            '''
+            data_batches_cache[segment_start + segment_idx] = self._duplicate_pytree_arrays(example)
+            if segment_start + segment_idx > target_step:
+                break
+            loss, state, _metrics, _ = self._jit_train_step_fn_no_hook(state, (example,), {})
+            print(' > retrained step:', segment_start + segment_idx, flush=True)
+            # Force-save a permanent checkpoint for this step only
+            info = StepInfo(state, float(loss), 0.0)
+            self._checkpointer.on_step(info, force=True)
+            # Cache the batch by its global step index
+            current_step += 1
+
+        return state, data_batches_cache
+
 
     def _reindex_interval_data(
         self,
         batch_data: Dict[str, hax.NamedArray]
-    ) -> Tuple[Dict[str, hax.NamedArray], jnp.ndarray]:
+    ) -> Tuple[Dict[str, hax.NamedArray], jnp.ndarray, jnp.ndarray]:
         """Re-indexes batch data for data weights"""
         original_indices = batch_data["index"]
         # Perform unique/inverse on-device to avoid fetching non-addressable shards to host
@@ -1563,7 +1700,7 @@ class Trainer:
 
         batch_data_local = batch_data.copy()
         batch_data_local["index"] = local_indices
-        return batch_data_local, unique_indices
+        return batch_data_local, unique_indices, inverse_indices
 
 
     def _vjp_update_step(
@@ -1576,7 +1713,7 @@ class Trainer:
         opt_grad: Any,
         sharded_update: Any,
         use_wandb: bool = True,
-    ) -> Tuple[Any, Any, jnp.ndarray, jnp.ndarray]:
+    ) -> Tuple[Any, Any, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Performs a single VJP update step, walking backwards from the final iteration to the first, passing partial derivatives backward and computing metagrads for the batch.
 
         Returns:
@@ -1584,29 +1721,28 @@ class Trainer:
         """
 
         # sanity: list what's matchable
-        if jax.process_index() == 0:
-            list_weight_paths(initial_params, limit=50)
+        #if jax.process_index() == 0:
+        #    list_weight_paths(initial_params, limit=50)
 
         data_processing_start = time.time()
-        batch_data_local, unique_indices = self._reindex_interval_data(batch_data)
-        interval_weights = data_weight_vector.at[unique_indices].get()
+        # Use global train-order indices (already in batch_data['index']) to align with data_weight_vector
+        batch_data_local = batch_data
+        flat_indices = jnp.ravel(batch_data_local["index"].array)
+        ds_ids_flat = jnp.ravel(batch_data_local.get("dataset_id").array) if "dataset_id" in batch_data_local else jnp.full_like(flat_indices, -1)
+        local_idx_flat = jnp.ravel(batch_data_local.get("local_index").array) if "local_index" in batch_data_local else jnp.full_like(flat_indices, -1)
+        # Gather weights in the exact (global) order, no unique/aggregation
+        interval_weights = data_weight_vector.at[flat_indices].get()
         #print(f"Prefetch and reindex took {time.time() - data_processing_start:.3f}s")
 
         vjp_start = time.time()
-
-        #try:
-        #    _log_sharding("vjp start params_grad", params_grad)
-        #    _log_sharding("vjp start opt_grad", opt_grad)
-        #except Exception:
-        #    pass
 
         # choose which layer to inspect
         LAYER = "embeddings.token_embeddings.weight" #"attn.c_attn.weight"   # or "attn.c_proj.weight", "mlp.c_fc.weight", "token_embeddings.weight"
 
         # --- BEFORE sharded_update ---
-        log_layer_sharding("pre/initial_params", initial_params, LAYER)
-        log_layer_sharding("pre/params_grad",    params_grad,     LAYER)
-        log_layer_sharding("pre/opt_grad",       opt_grad,        LAYER)
+        #log_layer_sharding("pre/initial_params", initial_params, LAYER)
+        #log_layer_sharding("pre/params_grad",    params_grad,     LAYER)
+        #log_layer_sharding("pre/opt_grad",       opt_grad,        LAYER)
 
         avg_grad_grad, train_state_grad, loss = eqx.filter_jit(sharded_update, donate='all-except-first')( # donate_argnums=(4, 5))(
             (initial_params, initial_opt_state, interval_weights,
@@ -1615,24 +1751,19 @@ class Trainer:
 
         params_grad_new, opt_grad_new = train_state_grad
 
-        # --- AFTER sharded_update ---
-        # after JIT boundary
-        log_layer_sharding("post/avg_grad_grad",   avg_grad_grad,   LAYER)
-        log_layer_sharding("post/params_grad_new", params_grad_new, LAYER)
-        log_layer_sharding("post/opt_grad_new",    opt_grad_new,    LAYER)
-
-        # Log sharding for VJP outputs
-        #try:
-        #    _log_sharding("post sharded_updateavg_grad_grad", avg_grad_grad)
-        #    _log_sharding("post sharded_update params_grad_new", params_grad_new)
-        #    _log_sharding("post sharded_update opt_grad_new", opt_grad_new)
-        #except Exception:
-        #    pass
-
         metagrads_for_batch_local, _, _ = eqx.filter_jit(self.run_vjp_grad)( #), donate_argnums=(0, 1, 4))(
             initial_params, initial_opt_state, interval_weights,
             batch_data_local, avg_grad_grad
         )
+
+        # We now have per-example metagrads in exact train order (flattened batch order).
+        # Scatter-add directly into the global metagrads vector using global indices.
+        if metagrads_for_batch_local.ndim == 1:
+            metagrads_indices = flat_indices
+        else:
+            # fallback: flatten any trailing dims
+            metagrads_for_batch_local = metagrads_for_batch_local.reshape((-1,))
+            metagrads_indices = flat_indices
 
         tree_statistics(params_grad_new, "params_grad")
 
@@ -1652,7 +1783,7 @@ class Trainer:
                 #"metagrads/tokens_per_second": (self.config.train_batch_size * self.config.grad_accum_size * batch_data_local["input_ids"].shape[-1]) / (time.time() - data_processing_start)
             }, commit=True)
 
-        return params_grad_new, opt_grad_new, metagrads_for_batch_local, unique_indices
+        return params_grad_new, opt_grad_new, metagrads_for_batch_local, metagrads_indices, ds_ids_flat, local_idx_flat
 
 
     def _add_default_hooks(self):
@@ -1664,7 +1795,25 @@ class Trainer:
         checkpointer = self.config.checkpointer.create(
             self.run_id, axis_mapping=self.parameter_axis_mapping, mesh=self.device_mesh
         )
-        self.add_hook(checkpointer.on_step, every=1)  # checkpointer manages its own frequency
+        # Save handle for manual invocation during segment retraining
+        self._checkpointer = checkpointer
+
+        # Gate checkpointer to only run at allowed steps if provided.
+        # Always honor force=True (e.g., initial step -1), regardless of gating.
+        from levanter.callbacks._core import Callback
+        class _GatedCheckpointerCallback(Callback):
+            def __init__(self, trainer, checkpointer):
+                self._trainer = trainer
+                self._checkpointer = checkpointer
+            def on_step(self, info: StepInfo, force: bool = False):
+                allowed = self._trainer._checkpoint_allowed_steps
+                step = int(info.step)
+                if force:
+                    self._checkpointer.on_step(info, force=True)
+                elif allowed is None or step in allowed:
+                    self._checkpointer.on_step(info, force=False)
+
+        self.add_hook(_GatedCheckpointerCallback(self, checkpointer), every=1)  # checkpointer manages its own frequency
 
         # Add watch callback if configured
         if self.config.watch.is_enabled:
@@ -1761,6 +1910,16 @@ class Trainer:
             axis_resources=self.parameter_axis_mapping,
             out_axis_resources=self.parameter_axis_mapping,
             donate_args=(True,),
+        )
+
+    @cached_property
+    def _jit_train_step_fn_no_hook_nodonate(self):
+        """Non-donating variant for segment retraining to avoid reusing donated arrays across calls."""
+        return named_jit(
+            functools.partial(self._train_step, _no_hooks=True),
+            axis_resources=self.parameter_axis_mapping,
+            out_axis_resources=self.parameter_axis_mapping,
+            donate_args=(),
         )
 
     def _train_step(
@@ -1873,19 +2032,58 @@ class Trainer:
 
         return fn(*args, **kwargs)
 
-    def _restore_step(self, exemplar_state, step_to_load: int, checkpointer: "Checkpointer"):
-        if step_to_load < 0:
-            return exemplar_state
+    def _duplicate_pytree_arrays(self, tree):
+        """Deep-copies JAX arrays within a pytree to ensure fresh device buffers.
 
-        restored_state = checkpointer.get_loaded_checkpoint()
+        This avoids reusing inputs that may have been previously donated across JIT calls.
+        """
+        def _copy_leaf(x):
+            # jax.Array supports .copy() which preserves sharding and device placement.
+            try:
+                import jax
+                import jax.numpy as jnp  # noqa: F401
+                import numpy as np  # noqa: F401
+                import haliax as hax  # local import to avoid cycle at module import time
+            except Exception:
+                # Should never happen here, but safeguard to avoid NameError during teardown.
+                return x
+
+            # NamedArray: copy underlying array and re-wrap to preserve axes
+            if isinstance(x, hax.NamedArray):
+                array_copied = x.array.copy() if isinstance(x.array, jax.Array) else jnp.array(x.array, copy=True)
+                return hax.named(array_copied, x.axes)
+
+            if isinstance(x, jax.Array):
+                return x.copy()
+            # Fall back to JAX array copy if it behaves like an ndarray
+            if isinstance(x, np.ndarray):
+                return jnp.array(x, copy=True)
+            return x
+
+        return jax.tree_util.tree_map(_copy_leaf, tree)
+
+    def _restore_step(self, exemplar_state, step_to_load: int, checkpointer: "Checkpointer"):
+        #if step_to_load < 0:
+        #    # Returning a deep copy avoids using potentially donated buffers from the exemplar state.
+        #    return self._duplicate_pytree_arrays(exemplar_state)
+
+        # Try to retrieve a prefetched checkpoint if available. If the prefetch failed because
+        # the checkpoint doesn't exist, treat it as a cache miss and fall back to direct load.
+        try:
+            restored_state = checkpointer.get_loaded_checkpoint()
+        except FileNotFoundError:
+            restored_state = None
 
         if restored_state is None:
-            # This can happen on the first step if we didn't prefetch.
-            return checkpointer.load_checkpoint(
-                exemplar_state,
-                path=os.path.join(checkpointer.base_path, f"step-{step_to_load}"),
-                discover_latest=False,
-            )
+            # Direct load of the specific step; if it doesn't exist, return None so caller can retrain.
+            try:
+                return checkpointer.load_checkpoint(
+                    exemplar_state,
+                    path=os.path.join(checkpointer.base_path, f"step-{step_to_load}"),
+                    discover_latest=False,
+                )
+            except FileNotFoundError:
+                return None
 
         return restored_state
 
@@ -1989,6 +2187,11 @@ class TrainerConfig:
 
     metagrad_checkpoint_frequency: int = 0
     """Frequency to checkpoint metagrad computation. 0 to disable."""
+
+    # Size of segments for metagrad replay. If > 0, reversed replay will
+    # treat training as segments starting at [0, S, 2*S, ...], up to
+    # num_train_steps. This is separate from checkpoint cadence.
+    metagrad_segment_size: int = 0
 
     jax_config: Mapping[str, JsonAtom] = field(
         default_factory=lambda: copy.deepcopy(DEFAULT_JAX_CONFIG)

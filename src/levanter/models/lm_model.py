@@ -26,6 +26,8 @@ class LmExample(eqx.Module):
     loss_mask: hax.NamedArray
     attn_mask: AttentionMask | NamedArray = AttentionMask.causal()
     index: Optional[jnp.ndarray] = None
+    # Optional dataset identity (e.g., in mixture datasets). Scalar per-example, batched later by the DataLoader.
+    dataset_id: Optional[jnp.ndarray] = None
 
     @staticmethod
     def causal(
@@ -37,6 +39,7 @@ class LmExample(eqx.Module):
         segment_ids: Optional[hax.NamedArray] = None,
         sliding_window: int | None = None,
         index: Optional[jnp.ndarray] = None,
+        dataset_id: Optional[jnp.ndarray] = None,
     ) -> "LmExample":
         if tokens.ndim != 1:
             raise ValueError("tokens must be a 1D array")
@@ -74,7 +77,7 @@ class LmExample(eqx.Module):
             attn_mask = attn_mask.with_segment_ids(segment_ids)
         '''
 
-        return LmExample(tokens=tokens, loss_mask=loss_mask, attn_mask=attn_mask, index=index)
+        return LmExample(tokens=tokens, loss_mask=loss_mask, attn_mask=attn_mask, index=index, dataset_id=dataset_id)
 
     @staticmethod
     def from_prompt_and_completion(

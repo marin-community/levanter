@@ -1,0 +1,59 @@
+data:
+  #train_urls:
+  #  - "/juice5/scr5/nlp/data/huggingface/lingua-data/fineweb_edu_10bt_shuffled/fineweb_edu_10bt.chunk.00.jsonl"
+  #validation_urls:
+  #  - "/juice5/scr5/nlp/data/huggingface/lingua-data/fineweb_edu_10bt_shuffled/fineweb_edu_10bt.val.jsonl"
+  #cache_dir: /juice5b/scr5b/sampark/data_cache/fineweb_edu_10bt_shuffled
+  id: dlwh/wikitext_103_detokenized
+  #id: Tristan/RedPajama-Data-V2-sample-100B-filtered-shuffled-tokenized-with-token-counts
+model:
+  type: gpt2
+  hidden_dim: 768
+  num_heads: 12
+  num_layers: 12
+  seq_len: 128
+  gradient_checkpointing: false
+  layer_norm_epsilon: 1e-2
+  qk_norm: true
+trainer:
+  mp: p=f32,c=f32
+  model_axis_size: 1
+  fsdp_axis: "embed"
+  per_device_parallelism: 1
+  per_device_eval_parallelism: 1
+
+  profiler: false
+  profiler_start_step: 7
+  profiler_num_steps: 2
+  backward_profiler: false
+  backward_profiler_start_step: 3
+  backward_profiler_num_steps: 2
+  log_dir: "jax_profile_traces"
+
+  train_batch_size: 64
+  num_train_steps: 5
+  max_eval_batches: 1
+
+  ray:
+    auto_start_cluster: false
+
+  tracker:
+    type: noop
+
+  checkpointer:
+    keep:
+      - every: 1
+    save_interval: 5m
+    base_path: /juice5b/scr5b/sampark/levanter/checkpoints/
+
+  load_debug_weights: false
+
+  metagrad_checkpoint_frequency: 20
+
+
+out_dir: out_dir_test
+optimizer:
+  lr_schedule: linear
+  learning_rate: 1E-4
+  weight_decay: 0.1
+  warmup: 0.1

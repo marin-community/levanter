@@ -1,16 +1,25 @@
 data:
-  cache_dir: /scr-ssd/sampark/levanter/data_cache/wiki_mixed
+  cache_dir: /scr-ssd/sampark/levanter/data_cache/dolma_olmo_paloma
   configs:
-    wikiA:
-      id: dlwh/wikitext_103_detokenized
+    dolma-algebraic-stack:
+      train_urls:
+        - gs://marin-us-central2/raw/dolma/v1.7/algebraic-stack-train-{0000..0015}.json.gz
+    dolma-arxiv:
+      train_urls:
+        - gs://marin-us-central2/raw/dolma/v1.7/arxiv-{0000..0099}.json.gz
     dolma-stackexchange:
       train_urls:
-        - gs://marin-us-central2/raw/dolma/v1.7/stackexchange-{0000..0001}.json.gz
+        - gs://marin-us-central2/raw/dolma/v1.7/stackexchange-{0000..0025}.json.gz
+    # these are just for eval
+    "paloma/dolma_100_programing_languages":
+      validation_urls:
+        - gs://levanter-data/paloma/dolma_100_programing_languages/val/val*.jsonl.gz
   train_weights:
     # sampling proportion comes from https://huggingface.co/datasets/allenai/dolma
-    wikiA: 1.0 # 12.6 * 1.0
-    dolma-stackexchange: 1.0 # 28.0 * 1.0
-  shuffle: false
+    dolma-algebraic-stack: 1.0 # 12.6 * 1.0
+    dolma-arxiv: 1.0 # 28.0 * 1.0
+    dolma-stackexchange: 1.0 # 1.0
+    paloma/dolma_100_programing_languages: 0.0
 
 model:
   type: gpt2
@@ -25,8 +34,8 @@ trainer:
   mp: p=f32,c=f32
   model_axis_size: 1
   fsdp_axis: "embed"
-  per_device_parallelism: 1
-  per_device_eval_parallelism: 1
+  per_device_parallelism: 64
+  per_device_eval_parallelism: 64
 
   profiler: false
   profiler_start_step: 2
@@ -36,28 +45,30 @@ trainer:
   backward_profiler_num_steps: 2
   log_dir: "jax_profile_traces"
 
-  train_batch_size: 4
-  num_train_steps: 4
+  train_batch_size: 128
+  num_train_steps: 12
   max_eval_batches: 1
 
   ray:
     auto_start_cluster: false
 
   tracker:
-    - type: noop
+    - type: wandb
+      project: "levanter"
+      save_xla_dumps: true
 
   checkpointer:
     keep:
       - every: 1
     save_interval: 5m
-    base_path: /juice5b/scr5b/sampark/levanter/checkpoints/gpu_debug
+    base_path: /juice5b/scr5b/sampark/levanter/checkpoints
 
-  #id: gpu_debug_conda
+  id: test_sqrt_segment_replay_v2
 
   load_debug_weights: false
 
   metagrad_checkpoint_frequency: 1
-  metagrad_segment_size: 2
+  metagrad_segment_size: 4
 
   # Enable logging of gradients, parameters, and Adam optimizer state (mu and nu)
   watch:

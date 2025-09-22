@@ -41,7 +41,7 @@ train_config:
     log_dir: "jax_profile_traces"
 
     train_batch_size: 4096
-    num_train_steps: 4
+    num_train_steps: 50
     max_eval_batches: 1
 
     ray:
@@ -62,10 +62,11 @@ train_config:
 
     load_debug_weights: false
 
-    #id: llama_1k_yolo
+    id: segment_replay
     #load_checkpoint_path: "/scr-ssd/sampark/levanter/checkpoints/gpt2_1k_yolo_ln_before"
 
     metagrad_checkpoint_frequency: 20
+    metagrad_segment_size: 10
 
     # Enable logging of gradients, parameters, and Adam optimizer state (mu and nu)
     watch:
