@@ -1,9 +1,25 @@
 data:
-  train_urls:
-    - "gs://data-values/fineweb_edu_10bt_shuffled/fineweb_edu_10bt.chunk.00.jsonl"
-  validation_urls:
-    - "gs://data-values/fineweb_edu_10bt_shuffled/fineweb_edu_10bt.val.jsonl"
-  cache_dir: "gs://data-values/fineweb_edu_10bt_shuffled/cache"
+  cache_dir: gs://data-values/data_cache/dolma_olmo_paloma
+  configs:
+    dolma-algebraic-stack:
+      train_urls:
+        - gs://marin-us-central2/raw/dolma/v1.7/algebraic-stack-train-{0000..0015}.json.gz
+    dolma-arxiv:
+      train_urls:
+        - gs://marin-us-central2/raw/dolma/v1.7/arxiv-{0000..0099}.json.gz
+    dolma-stackexchange:
+      train_urls:
+        - gs://marin-us-central2/raw/dolma/v1.7/stackexchange-{0000..0025}.json.gz
+    # these are just for eval
+    "paloma/dolma_100_programing_languages":
+      validation_urls:
+        - gs://levanter-data/paloma/dolma_100_programing_languages/val/val*.jsonl.gz
+  train_weights:
+    # sampling proportion comes from https://huggingface.co/datasets/allenai/dolma
+    dolma-algebraic-stack: 1.0 # 12.6 * 1.0
+    dolma-arxiv: 1.0 # 28.0 * 1.0
+    dolma-stackexchange: 1.0 # 1.0
+    paloma/dolma_100_programing_languages: 0.0
   #id: dlwh/wikitext_103_detokenized
   #id: Tristan/RedPajama-Data-V2-sample-100B-filtered-shuffled-tokenized-with-token-counts
 model:
@@ -56,6 +72,7 @@ trainer:
   #load_checkpoint_path: "/scr-ssd/sampark/levanter/checkpoints/gpt2_1k_yolo_ln_before"
 
   metagrad_checkpoint_frequency: 20
+  metagrad_segment_size: 6
 
   # Enable logging of gradients, parameters, and Adam optimizer state (mu and nu)
   watch:
