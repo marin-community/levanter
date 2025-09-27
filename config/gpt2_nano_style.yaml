@@ -1,0 +1,33 @@
+model:
+  type: gpt2
+  seq_len: 256
+  hidden_dim: 256
+  num_layers: 4
+  num_heads: 4
+  vocab_size: 50257
+
+trainer:
+  num_train_steps: 20
+  log_frequency: 1
+  eval_frequency: 0
+  per_device_parallelism: 1
+  train_batch_size: 2
+
+optimizer:
+  type: adam
+  learning_rate: 1e-4
+
+data:
+  cache_dir: ./data/style_demo/cache
+  tokenizer: gpt2
+  format:
+    type: chat
+    chat_template: null
+    mask_user_turns: true
+    style_prefix:
+      prefix_token: "<style>"
+      suffix_token: "</style>"
+      style_field: "style"
+  train_urls:
+    - file://$PWD/data/style_demo/train.jsonl
+  validation_urls: []
