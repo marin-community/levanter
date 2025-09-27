@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from levanter.data.text import ChatLmDatasetFormat, StylePrefixConfig, preprocessor_for_format
-from levanter.utils.hf_utils import load_tokenizer
+from levanter.compat.hf_checkpoints import load_tokenizer
 
 
 def main():
