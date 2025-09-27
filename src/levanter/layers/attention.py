@@ -481,6 +481,9 @@ def _te_flash_attention(
         fused_attn,  # noqa: F401
     )
 
+    if isinstance(mask, AttentionMask) and mask.prefix_mask is not None:
+        raise NotImplementedError("prefix_mask not supported for NVTE fused attention")
+
     if logits_soft_cap is not None:
         raise NotImplementedError(
             "logits_soft_cap is not supported for NVTE fused attention. "
@@ -787,6 +790,7 @@ class AttentionMask(eqx.Module):
     causal_offset: None | NamedArray = None
     explicit_mask: Optional[NamedArray] = None
     segment_ids: tuple[NamedArray, NamedArray] | None = None
+    prefix_mask: Optional[NamedArray] = None
     sliding_window: Optional[int] = eqx.field(default=None, static=True)
     # CF https://github.com/jax-ml/jax/blob/47858c4ac2fd4757a3b6fc5bb2981b71a71f00c2/jax/experimental/pallas/ops/tpu/flash_attention.py#L34
     # TODO: add prefixlm
@@ -843,6 +847,10 @@ class AttentionMask(eqx.Module):
             segment_mask = _materialize_segment_mask(self.segment_ids, QPos, KPos, q_slice, k_slice)
             mask = combine_masks_and(mask, segment_mask)
 
+        if self.prefix_mask is not None:
+            prefix_sliced = self.prefix_mask[QPos, q_slice, KPos, k_slice]
+            mask = combine_masks_or(mask, prefix_sliced)
+
         return mask
 
     # Static constructors --------------------------------------------------
@@ -893,6 +901,7 @@ class AttentionMask(eqx.Module):
             causal_offset=self.causal_offset,
             explicit_mask=self.explicit_mask,
             segment_ids=seg_field,
+            prefix_mask=self.prefix_mask,
             sliding_window=self.sliding_window,
         )
 
@@ -903,7 +912,20 @@ class AttentionMask(eqx.Module):
             causal_offset=self.causal_offset,
             explicit_mask=self.explicit_mask,
             segment_ids=self.segment_ids,
+            prefix_mask=self.prefix_mask,
             sliding_window=sliding_window,
+        )
+
+    def with_prefix_mask(self, prefix_mask: Optional[NamedArray]) -> "AttentionMask":
+        """Return a copy of this mask with a new prefix mask."""
+
+        return AttentionMask(
+            is_causal=self.is_causal,
+            causal_offset=self.causal_offset,
+            explicit_mask=self.explicit_mask,
+            segment_ids=self.segment_ids,
+            prefix_mask=prefix_mask,
+            sliding_window=self.sliding_window,
         )
 
     def __and__(self, other) -> "AttentionMask":
@@ -929,6 +951,7 @@ class AttentionMask(eqx.Module):
             causal_offset = None
             is_causal = False
         explicit_mask = combine_masks_and(self.explicit_mask, other.explicit_mask)
+        prefix_mask = combine_masks_and(self.prefix_mask, other.prefix_mask)
         segment_ids = self._check_for_same_segment_ids(other)
         if self.sliding_window is None:
             sliding_window = other.sliding_window
@@ -942,6 +965,7 @@ class AttentionMask(eqx.Module):
             causal_offset=causal_offset,
             explicit_mask=explicit_mask,
             segment_ids=segment_ids,
+            prefix_mask=prefix_mask,
             sliding_window=sliding_window,
         )
 
@@ -961,6 +985,7 @@ class AttentionMask(eqx.Module):
             is_causal = False
             causal_offset = None
         explicit_mask = combine_masks_or(self.explicit_mask, other.explicit_mask)
+        prefix_mask = combine_masks_or(self.prefix_mask, other.prefix_mask)
         segment_ids = self._check_for_same_segment_ids(other)
         if self.sliding_window is None or other.sliding_window is None:
             sliding_window = None
@@ -971,6 +996,7 @@ class AttentionMask(eqx.Module):
             causal_offset=causal_offset,
             explicit_mask=explicit_mask,
             segment_ids=segment_ids,
+            prefix_mask=prefix_mask,
             sliding_window=sliding_window,
         )
 
@@ -1147,6 +1173,9 @@ def _tpu_splash_attention(
         splash_attention_kernel,
         splash_attention_mask,
     )
+
+    if isinstance(mask, AttentionMask) and mask.prefix_mask is not None:
+        raise NotImplementedError("Splash attention does not support prefix_mask")
 
     # Splash attention requires BHSD format
     # We need to reshape the input to match this format

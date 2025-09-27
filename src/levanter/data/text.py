@@ -4,6 +4,7 @@
 import abc
 import asyncio
 import dataclasses
+import copy
 import functools
 import json
 import logging
@@ -66,6 +67,7 @@ from transformers import BatchEncoding, PreTrainedTokenizer, PreTrainedTokenizer
 
 from levanter.compat.hf_checkpoints import load_tokenizer  # noqa
 from levanter.data._preprocessor import BatchProcessor, IdentityProcessor, U, dict_from_record_batch  # noqa
+from levanter.data.style_prefix import STYLE_PREFIX_TOKEN, STYLE_SUFFIX_TOKEN, ensure_style_tokens
 from levanter.data.metrics_monitor import LoggerMetricsMonitor, LoggingMetricsMonitor, MetricsMonitor  # noqa
 from levanter.data.sharded_datasource import (  # noqa
     JsonlDataSource,
@@ -419,6 +421,16 @@ class TextLmDatasetFormat(LmDatasetFormatBase):
     text_key: str = "text"  # key for the text field in the jsonl file
 
 
+@dataclass(frozen=True)
+class StylePrefixConfig:
+    """Configuration for adding a style/source prefix to each example."""
+
+    prefix_token: str = STYLE_PREFIX_TOKEN
+    suffix_token: Optional[str] = STYLE_SUFFIX_TOKEN
+    style_field: Optional[str] = None
+    default_style: Optional[str] = None
+
+
 @LmDatasetFormatBase.register_subclass("chat")
 @dataclass(frozen=True)
 class ChatLmDatasetFormat(LmDatasetFormatBase):
@@ -427,6 +439,7 @@ class ChatLmDatasetFormat(LmDatasetFormatBase):
     chat_template: str | None = None
     pack: bool = True
     mask_user_turns: bool = True
+    style_prefix: Optional[StylePrefixConfig] = None
 
 
 @LmDatasetFormatBase.register_subclass("supervised")
@@ -608,13 +621,24 @@ def preprocessor_for_format(
     match format:
         case TextLmDatasetFormat(text_key=key):
             return BatchTokenizer(tokenizer, enforce_bos=enforce_bos, enforce_eos=enforce_eos, text_field=key)
-        case ChatLmDatasetFormat(messages_field=m, single_turn=s_turn, chat_template=ct, mask_user_turns=mt):
+        case ChatLmDatasetFormat(
+            messages_field=m,
+            single_turn=s_turn,
+            chat_template=ct,
+            mask_user_turns=mt,
+            style_prefix=sp,
+        ):
             if s_turn:
+                if sp is not None:
+                    raise NotImplementedError("Style prefixes are not currently supported for single-turn chat data")
                 if ct is not None:
                     raise NotImplementedError("Don't currently support chat templates for single turn chat")
                 return SingleTurnChatProcessor(tokenizer, messages_field=m)  # type: ignore
             else:
-                return ChatProcessor(tokenizer, messages_field=m, chat_template=ct, mask_user_turns=mt)  # type: ignore
+                base_processor = ChatProcessor(tokenizer, messages_field=m, chat_template=ct, mask_user_turns=mt)
+                if sp is not None:
+                    return StylePrefixProcessor(tokenizer, base_processor, config=sp)
+                return base_processor
         case SupervisedLmDatasetFormat(input_field=i, output_field=o, separate_with=s):
             return SupervisedProcessor(tokenizer, input_field=i, output_field=o, separate_with=s)  # type: ignore
         case _:
@@ -1520,6 +1544,139 @@ class ChatProcessor(BatchProcessor[dict, ProcessedChatDict]):
             "messages_field": self.messages_field,
         }
 
+
+class StylePrefixProcessor(BatchProcessor[dict, ProcessedChatDict]):
+    """Wraps a chat processor to prepend style/source tokens and mask them from the loss."""
+
+    def __init__(
+        self,
+        tokenizer: HfTokenizer,
+        base_processor: BatchProcessor[dict, ProcessedChatDict],
+        *,
+        config: StylePrefixConfig,
+    ):
+        self.tokenizer = tokenizer
+        self.base_processor = base_processor
+        self.config = config
+
+        required_tokens = [config.prefix_token]
+        if config.suffix_token is not None:
+            required_tokens.append(config.suffix_token)
+        ensure_style_tokens(tokenizer, required_tokens=required_tokens)
+
+        self._prefix_token_id = self._lookup_token_id(config.prefix_token)
+        self._suffix_token_id = (
+            self._lookup_token_id(config.suffix_token) if config.suffix_token is not None else None
+        )
+
+    def _lookup_token_id(self, token: Optional[str]) -> Optional[int]:
+        if token is None:
+            return None
+
+        token_id = self.tokenizer.convert_tokens_to_ids(token)
+        if token_id is None:
+            raise ValueError(f"Token {token!r} could not be converted to an id by the tokenizer")
+
+        # If the tokenizer returned the unk token id, ensure this is intentional.
+        if (
+            self.tokenizer.unk_token is not None
+            and token_id == self.tokenizer.unk_token_id
+            and token != self.tokenizer.unk_token
+        ):
+            raise ValueError(f"Token {token!r} was mapped to unk_token_id; ensure it was added to the tokenizer")
+
+        return int(token_id)
+
+    def _style_prefix_ids(self, style_label: Optional[str]) -> list[int]:
+        ids: list[int] = [self._prefix_token_id]
+
+        if style_label:
+            label_tokens = self.tokenizer(style_label, add_special_tokens=False)["input_ids"]
+            ids.extend(int(tok) for tok in label_tokens)
+
+        if self._suffix_token_id is not None:
+            ids.append(self._suffix_token_id)
+
+        return ids
+
+    def __call__(self, batch: Sequence[dict]) -> Sequence[ProcessedChatDict]:
+        style_values: list[Optional[str]] = []
+        for example in batch:
+            style_value: Optional[str]
+            if self.config.style_field is not None:
+                if self.config.style_field in example:
+                    style_value = example[self.config.style_field]
+                else:
+                    style_value = self.config.default_style
+                if style_value is None:
+                    raise ValueError(
+                        f"Example is missing style field '{self.config.style_field}' and no default_style was provided"
+                    )
+            else:
+                style_value = self.config.default_style
+
+            if style_value is not None and not isinstance(style_value, str):
+                raise TypeError(
+                    f"Style label must be a string when provided. Got {type(style_value).__name__!r} instead."
+                )
+
+            style_values.append(style_value)
+
+        processed = self.base_processor(batch)
+        processed_list = list(processed)
+
+        if len(processed_list) != len(style_values):
+            raise ValueError("Base processor returned a different number of items than expected")
+
+        augmented: list[ProcessedChatDict] = []
+        for item, style_value in zip(processed_list, style_values):
+            prefix_ids = self._style_prefix_ids(style_value)
+
+            base_ids = np.asarray(item["input_ids"], dtype=np.int32)
+            base_masks = np.asarray(item["assistant_masks"], dtype=np.int32)
+
+            if prefix_ids:
+                prefix_arr = np.asarray(prefix_ids, dtype=np.int32)
+                new_input_ids = np.concatenate((prefix_arr, base_ids), axis=0)
+                prefix_mask = np.zeros(prefix_arr.shape[0], dtype=base_masks.dtype)
+                new_masks = np.concatenate((prefix_mask, base_masks), axis=0)
+            else:
+                new_input_ids = base_ids
+                new_masks = base_masks
+
+            new_item: ProcessedChatDict = {
+                "input_ids": new_input_ids,
+                "assistant_masks": new_masks,
+            }
+            augmented.append(new_item)
+
+        return augmented
+
+    @property
+    def output_exemplar(self) -> ProcessedChatDict:
+        exemplar = copy.deepcopy(self.base_processor.output_exemplar)
+        exemplar["input_ids"] = np.zeros((0,), dtype=np.int32)
+        exemplar["assistant_masks"] = np.zeros((0,), dtype=np.int32)
+        return exemplar
+
+    @property
+    def num_cpus(self) -> int:
+        return self.base_processor.num_cpus
+
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        metadata = dict(self.base_processor.metadata)
+        metadata.update(
+            {
+                "style_prefix": {
+                    "prefix_token": self.config.prefix_token,
+                    "suffix_token": self.config.suffix_token,
+                    "style_field": self.config.style_field,
+                    "default_style": self.config.default_style,
+                }
+            }
+        )
+        return metadata
 
 class MultiturnChatDataset(MappedAsyncDataset[tuple[ProcessedChatDict, ProcessedChatDict], LmExample]):
     """
