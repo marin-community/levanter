@@ -22,6 +22,7 @@ data:
   tokenizer: gpt2
   format:
     type: chat
+    single_turn: true
     chat_template: null
     mask_user_turns: true
     style_prefix:

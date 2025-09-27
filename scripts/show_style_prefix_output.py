@@ -12,7 +12,7 @@ def main():
 
     format_cfg = ChatLmDatasetFormat(
         messages_field="messages",
-        single_turn=False,
+        single_turn=True,
         chat_template=None,
         pack=True,
         mask_user_turns=True,
