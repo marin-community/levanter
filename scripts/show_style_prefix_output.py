@@ -10,12 +10,19 @@ def main():
     entries = [json.loads(line) for line in dataset_path.open()]
     tokenizer = load_tokenizer("gpt2")
 
+    chat_template = (
+        "{%- for message in messages -%}\n"
+        "{{ message['role'] }}: {{ message['content'] }}\n"
+        "{%- endfor -%}\n"
+        "{%- if add_generation_prompt %}assistant:{% endif %}"
+    )
+
     format_cfg = ChatLmDatasetFormat(
         messages_field="messages",
-        single_turn=True,
-        chat_template=None,
+        single_turn=False,
+        chat_template=chat_template,
         pack=True,
-        mask_user_turns=True,
+        mask_user_turns=False,
         style_prefix=StylePrefixConfig(
             prefix_token="<style>",
             suffix_token="</style>",
