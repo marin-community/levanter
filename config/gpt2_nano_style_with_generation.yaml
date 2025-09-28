@@ -25,9 +25,21 @@ data:
     single_turn: false
     chat_template: |
       {%- for message in messages -%}
+      {%- if message['role'] == 'assistant' -%}
+      {% generation %}assistant: {{ message['content'] }}
+      {% endgeneration %}
+      {%- elif message['role'] == 'user' -%}
+      user: {{ message['content'] }}
+      {%- elif message['role'] == 'system' -%}
+      system: {{ message['content'] }}
+      {%- else -%}
       {{ message['role'] }}: {{ message['content'] }}
+      {%- endif -%}
       {%- endfor -%}
-      {%- if add_generation_prompt %}assistant:{% endif %}
+      {%- if add_generation_prompt %}
+      {% generation %}assistant:
+      {% endgeneration %}
+      {%- endif %}
     mask_user_turns: false
     style_prefix:
       prefix_token: "<style>"
