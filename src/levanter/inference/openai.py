@@ -601,23 +601,21 @@ async def _create_chat_completion(ctx: InferenceContext, request: ChatCompletion
             # Format logprobs if available
             logprobs = None
             if request.logprobs:
-                # Convert logprobs to API format
-                prompt_len = generation.prompt_tokens
-                generated_tokens = generation.tokens[prompt_len:]
+                generated_tokens = generation.tokens
 
                 # Create content logprobs in OpenAI format
                 content_logprobs = []
-                if generation.logprobs:
-                    for token_id, lp in zip(generated_tokens, generation.logprobs):
-                        token_str = ctx.tokenizer.decode([token_id], skip_special_tokens=False)
-                        content_logprobs.append(
-                            ChatCompletionTokenLogprob(
-                                token=token_str,
-                                logprob=float(lp),
-                                bytes=list(token_str.encode("utf-8")),
-                                top_logprobs=[],
-                            )
+                assert generation.logprobs is not None, "Logprobs requested but missing in generation result"
+                for token_id, lp in zip(generated_tokens, generation.logprobs, strict=True):
+                    token_str = ctx.tokenizer.decode([token_id], skip_special_tokens=False)
+                    content_logprobs.append(
+                        ChatCompletionTokenLogprob(
+                            token=token_str,
+                            logprob=float(lp),
+                            bytes=list(token_str.encode("utf-8")),
+                            top_logprobs=[],
                         )
+                    )
 
                 logprobs = ChoiceLogprobs(content=content_logprobs)
 
@@ -631,7 +629,7 @@ async def _create_chat_completion(ctx: InferenceContext, request: ChatCompletion
             )
             total_completion_tokens += generation.completion_tokens
 
-        return ChatCompletion(
+        response = ChatCompletion(
             id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
             object="chat.completion",
             created=int(time.time()),
@@ -643,6 +641,7 @@ async def _create_chat_completion(ctx: InferenceContext, request: ChatCompletion
                 total_tokens=len(prompt_tokens) + total_completion_tokens,
             ),
         )
+        return response
 
     except Exception as e:
         logger.error(f"Error in chat completion: {e}", exc_info=True)
@@ -677,11 +676,8 @@ class InferenceServer:
         inference_context = InferenceContext(model, tokenizer, service, config)
         inference_context.start()
 
-        logger.info("Inference service initialized and ready")
-
         # Create FastAPI app with initialized context
         app = InferenceServer._create_app(inference_context)
-
         return InferenceServer(config, inference_context, app)
 
     @staticmethod
@@ -694,13 +690,13 @@ class InferenceServer:
         async def health_check():
             return _health_check()
 
-        @app.post("/v1/completions", response_model=Completion)
-        async def create_completion(request: CompletionRequest) -> Completion:
-            return await _create_completion(inference_context, request)
-
         @app.post("/v1/chat/completions", response_model=ChatCompletion)
         async def create_chat_completion(request: ChatCompletionRequest) -> ChatCompletion:
             return await _create_chat_completion(inference_context, request)
+
+        @app.post("/v1/completions", response_model=Completion)
+        async def create_completion(request: CompletionRequest) -> Completion:
+            return await _create_completion(inference_context, request)
 
         return app
 
