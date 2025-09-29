@@ -4,8 +4,10 @@
 import dataclasses
 import functools
 import logging
+import threading
 import time
 from collections import deque
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
@@ -684,6 +686,21 @@ class InferenceEngine:
         self.request_queue: deque[Request] = deque()
         # Results by request id -> choice -> DecodeResult
         self.results: dict[int, dict[int, DecodeResult]] = {}
+        self._futures: dict[int, dict[int, Future[DecodeResult]]] = {}
+        self._lock = threading.RLock()
+        self._cond = threading.Condition(self._lock)
+        self._background_thread: threading.Thread | None = None
+        self._shutdown = False
+
+    # ------------------------------- Thread helpers -------------------------------
+    def _ensure_background_thread_locked(self) -> None:
+        if self._background_thread is None or not self._background_thread.is_alive():
+            self._shutdown = False
+            self._background_thread = threading.Thread(target=self._background_worker, daemon=True)
+            self._background_thread.start()
+
+    def _has_pending_work_locked(self) -> bool:
+        return bool(self.request_queue) or bool(self.sequences)
 
     def _verify_free_slot_view(self, *, context: str) -> None:
         """Ensure host free-list matches the device page-table used mask."""
@@ -804,11 +821,7 @@ class InferenceEngine:
         for r in requests:
             self.request_queue.append(r)
 
-    def _admit_from_queue(self) -> _DecodeOutputs | None:
-        """Admit a batch from the head of the queue that fits in free slots/pages.
-
-        Returns the decode outputs for the admitted prefill batch, or None if no work was admitted.
-        """
+    def _collect_prefill_work_locked(self) -> PrefillWork | None:
         if not self.request_queue:
             return None
 
@@ -824,7 +837,6 @@ class InferenceEngine:
             nxt = self.request_queue[0]
             need_slots = int(nxt.n_generations)
             need_pages = self._pages_needed_for_prompt(len(nxt.prompt_tokens))
-            # Check capacity constraints: slots (including clones), pages, token buffer, prefill batch size
             if (
                 sim_slots < need_slots
                 or sim_pages < need_pages
@@ -841,16 +853,20 @@ class InferenceEngine:
         if not batch:
             return None
 
-        # Build a single PrefillWork description and run prefill exactly once
-        prefill_work = self._prefill_prompts(batch)
-        if prefill_work is None:
-            return None
-        new_state = _run_prefill(
-            self.gen_state, self.model, self.sampler, prefill_work, self.config.max_seqs_in_prefill
-        )
+        return self._prefill_prompts(batch)
 
-        # _run_prefill returns (GenState, _DecodeOutputs)
-        self.gen_state, outputs = new_state
+    def _admit_from_queue(self) -> _DecodeOutputs | None:
+        with self._lock:
+            work = self._collect_prefill_work_locked()
+            if work is None:
+                return None
+            gen_state = self.gen_state
+
+        new_state = _run_prefill(gen_state, self.model, self.sampler, work, self.config.max_seqs_in_prefill)
+
+        with self._lock:
+            self.gen_state, outputs = new_state
+
         return outputs
 
     def _free_page_count(self) -> int:
@@ -1022,180 +1038,31 @@ class InferenceEngine:
         Each Request provides prompt_tokens, decode_params, and n_generations (clones).
         Returns (outputs_per_sequence, total_generated_tokens).
         """
-        # validate we don't have any sequences with n_generations exceeding max_seqs
-        max_needed = max(int(r.n_generations) for r in requests)
-        if max_needed > int(self.gen_state.decode_state.page_table.max_seqs):
-            raise ValueError(
-                f"Total sequences needed ({max_needed}) exceeds max_seqs ({self.gen_state.decode_state.page_table.max_seqs})."
-                "Decompose your request into smaller batches or increase max_seqs when building the service."
-            )
-
-        needs_logprobs = any(r.enable_logprobs for r in requests)
-        # if we need logprobs but decode state doesn't have logprobs enabled, re-init
-        if needs_logprobs and self.gen_state.decode_state.logprobs is None:
-            logger.info("Re-initializing decode state with logprobs enabled.")
-            max_seqs = int(self.gen_state.decode_state.max_seqs)
-            max_seq_len = int(self.gen_state.decode_state.page_table.max_len_per_seq)
-            new_decode_state = dataclasses.replace(
-                self.gen_state.decode_state,
-                logprobs=hax.full({"seq": max_seqs, "position": max_seq_len}, jnp.nan, dtype=jnp.float32),
-            )
-            self.gen_state = dataclasses.replace(self.gen_state, decode_state=new_decode_state)
-
-        # Enqueue incoming requests to internal queue
-        self.enqueue_requests(requests)
-        # Track outputs and finished flags using self.results for only this call's requests
-        call_rids = [int(r.request_id) for r in requests]
-        expected_children: dict[int, int] = {rid: int(r.n_generations) for rid, r in zip(call_rids, requests)}
-        # Initialize fresh result buckets for this call
-        for rid in call_rids:
-            self.results[rid] = {
-                k: DecodeResult(id=rid, choice=k, token_list=[]) for k in range(expected_children[rid])
-            }
-
-        # Validate requested stop-token shapes against configured capacity; do not resize dynamically
-        ds = self.gen_state.decode_state
-        cur_stop_seqs = 0 if ds.stop_tokens is None else ds.stop_tokens.axis_size("stop_seq")
-        cur_stop_len = 0 if ds.stop_tokens is None else ds.stop_tokens.axis_size("position")
-        req_stop_seqs = 0
-        req_stop_len = 0
-        for req in requests:
-            st = req.decode_params.stop_tokens
-            if st is None:
-                continue
-            req_stop_seqs = max(req_stop_seqs, int(st.axis_size("stop_seq")))
-            req_stop_len = max(req_stop_len, int(st.axis_size("position")))
-        if req_stop_seqs > 0 or req_stop_len > 0:
-            if ds.stop_tokens is None:
-                raise ValueError(
-                    f"Requested stop tokens (seqs={req_stop_seqs}, len={req_stop_len}) but service was initialized "
-                    f"without stop-token capacity. Recreate service with nonzero max_stop_seqs/max_stop_tokens."
-                )
-            if req_stop_seqs > cur_stop_seqs or req_stop_len > cur_stop_len:
-                raise ValueError(
-                    "Requested stop-token configuration exceeds service capacity: "
-                    f"required (seqs={req_stop_seqs}, len={req_stop_len}) > "
-                    f"configured (seqs={cur_stop_seqs}, len={cur_stop_len}). "
-                    "Increase max_stop_seqs/max_stop_tokens when constructing the service."
-                )
+        if not requests:
+            return GenerationResult(tokens=[], logprobs=[], total_generated=0)
 
         time_in = time.time()
-        # Try initial admission from queue and extract prompt tokens
-        decode_outputs = self._admit_from_queue()
-        if decode_outputs:
-            _ = self._ingest_outputs(decode_outputs)
-        initial_prefill_out = time.time()
-        logger.info(f"Initial prefill and extraction took {initial_prefill_out - time_in:.3f}s")
 
-        # Autoregressive generation loop with periodic extraction
-        def _all_done() -> bool:
-            for rid, n_kids in expected_children.items():
-                kid_map = self.results.get(rid, {})
-                for cid in range(n_kids):
-                    dr = kid_map.get(cid)
-                    if dr is None or not dr.done:
-                        return False
-            return True
+        with self._cond:
+            self._prepare_requests_locked(requests)
+            futures_per_request = self._register_requests_locked(requests)
+            self.enqueue_requests(requests)
+            self._ensure_background_thread_locked()
+            self._cond.notify_all()
 
-        stagnant_iters = 0
-        while not _all_done():
-            iter_start = time.time()
-
-            fake_submit_start = time.time()
-            # future_state, decode_outputs = _run_generation_loop(
-            jax.tree.flatten(
-                (
-                    self.gen_state,
-                    self.model,
-                    self.sampler,
-                    1,
-                    0,
-                )
-            )
-            fake_submit_done = time.time()
-
-            submit_start = iter_start
-            future_state, decode_outputs = _run_generation_loop(
-                self.gen_state,
-                self.model,
-                self.sampler,
-                # TODO: tune max_tokens_per_round
-                self.config.max_tokens_per_round or self.config.max_seqs,
-                self.config.max_rounds,
-            )
-            submit_done = time.time()
-            # Time spent with device executing (and the host thread waiting)
-            self.gen_state = future_state
-            device_time = time.time() - submit_done
-
-            extract_start = time.time()
-            new_tokens = self._ingest_outputs(decode_outputs)
-            extract_time = time.time() - extract_start
-
-            # Release any sequences that finished in this step
-            release_start = time.time()
-            # Admit more if capacity allows
-            admit_outputs = self._admit_from_queue()
-            if admit_outputs is not None:
-                mid_tokens = self._ingest_outputs(admit_outputs)
-            else:
-                mid_tokens = 0
-            new_tokens += mid_tokens
-            release_time = time.time() - release_start
-
-            iter_end = time.time()
-            iter_time = iter_end - iter_start
-            # Host time is everything except the device execution wait
-            host_time = max(iter_time - device_time, 0.0)
-            submit_time = submit_done - submit_start
-            if iter_time > 0:
-                tps_total = new_tokens / iter_time
-                logger.info(
-                    f"Decode iter: total {iter_time:.3f}s (device {device_time:.3f}s, host {host_time:.3f}s, "
-                    f"submit {submit_time:.3f}s), "
-                    f"fake_submit {fake_submit_done - fake_submit_start:.3f}s, "
-                    f"{tps_total:.2f} tok/s, {new_tokens} new"
-                    f" (extract {extract_time:.3f}s, release {release_time:.3f}s)"
-                )
-            # Safety: if nothing new was produced and queue is empty, avoid infinite loop
-            if (
-                new_tokens == 0
-                and int(jax.device_get(self.gen_state.decode_state.num_queued_tokens)) == 0
-                and not self.request_queue
-            ):
-                stagnant_iters += 1
-            else:
-                stagnant_iters = 0
-            if stagnant_iters >= 2:
-                logger.warning("No progress in decoding for 2 consecutive iterations; breaking to avoid hang.")
-                break
-
-        # Assemble outputs in the order of the requests for this call
         outputs_list: list[list[int]] = []
         logprobs_list: list[list[float]] = []
-        total_prompt_tokens = 0
-        for r in requests:
-            rid = int(r.request_id)
-            total_prompt_tokens += len(r.prompt_tokens) * int(r.n_generations)
-            # Initialize result buckets for this rid if not present
-            kid_map = self.results.get(rid, {})
-            for k in range(int(r.n_generations)):
-                dr = kid_map.get(k)
-                if dr is None:
-                    # Ensure a placeholder exists to avoid KeyErrors
-                    kid_map[k] = DecodeResult(id=rid, choice=k, token_list=[])
-                    dr = kid_map[k]
-                outputs_list.append(dr.token_list)
-                logprobs_list.append(dr.logprobs if dr.logprobs is not None else [])
-            self.results[rid] = kid_map
+        for future_group in futures_per_request:
+            for fut in future_group:
+                dr = fut.result()
+                outputs_list.append(list(dr.token_list))
+                logprobs_list.append(list(dr.logprobs))
+
         total_generated = sum(len(seq_outputs) for seq_outputs in outputs_list)
         total_time = time.time() - time_in
         tps_overall = (total_generated / total_time) if total_time > 0 else 0.0
         logger.info(f"Batch generated in {total_time:.2f}s, {total_generated} tokens, {tps_overall:.2f} tok/s")
-        # Clear results for these requests now that we've assembled outputs
-        for rid in call_rids:
-            if rid in self.results:
-                self.results.pop(rid, None)
+
         return GenerationResult(tokens=outputs_list, logprobs=logprobs_list, total_generated=total_generated)
 
     def _extract_outputs(self, pending_outputs) -> int:
@@ -1256,3 +1123,170 @@ class InferenceEngine:
         appended = self._extract_outputs(outputs)
         self._release_finished_sequences(outputs)
         return appended
+
+    def _finalize_finished_results_locked(self) -> None:
+        for rid, child_map in list(self.results.items()):
+            future_map = self._futures.get(rid, {})
+            for cid, dr in list(child_map.items()):
+                future = future_map.get(cid)
+                if dr.done and future is not None and not future.done():
+                    result = DecodeResult(
+                        id=dr.id,
+                        choice=dr.choice,
+                        token_list=list(dr.token_list),
+                        tokens_decoded=dr.tokens_decoded,
+                        done=True,
+                        logprobs=list(dr.logprobs),
+                    )
+                    future.set_result(result)
+                if dr.done and (future is None or (future is not None and future.done())):
+                    child_map.pop(cid, None)
+                    if future is not None:
+                        future_map.pop(cid, None)
+            if not child_map:
+                self.results.pop(rid, None)
+            if not future_map:
+                self._futures.pop(rid, None)
+
+    def _generation_iteration(self) -> bool:
+        progress = False
+
+        with self._lock:
+            prefill_work = self._collect_prefill_work_locked()
+            gen_state = self.gen_state
+
+        if prefill_work is not None:
+            new_state, outputs = _run_prefill(
+                gen_state,
+                self.model,
+                self.sampler,
+                prefill_work,
+                self.config.max_seqs_in_prefill,
+            )
+            with self._lock:
+                self.gen_state = new_state
+                progress |= self._ingest_outputs(outputs) > 0
+                self._finalize_finished_results_locked()
+
+        with self._lock:
+            has_active = bool(self.sequences)
+            gen_state = self.gen_state
+
+        if has_active:
+            future_state, decode_outputs = _run_generation_loop(
+                gen_state,
+                self.model,
+                self.sampler,
+                self.config.max_tokens_per_round or self.config.max_seqs,
+                self.config.max_rounds,
+            )
+            with self._lock:
+                self.gen_state = future_state
+                progress |= self._ingest_outputs(decode_outputs) > 0
+                self._finalize_finished_results_locked()
+
+        return progress or prefill_work is not None or has_active
+
+    def _validate_request_stop_tokens(self, request: Request) -> None:
+        ds = self.gen_state.decode_state
+        st = request.decode_params.stop_tokens
+        if st is None:
+            return
+        if ds.stop_tokens is None:
+            raise ValueError(
+                "Requested stop tokens but service was initialized without stop-token capacity."
+                " Recreate service with nonzero max_stop_seqs/max_stop_tokens."
+            )
+        req_stop_seqs = int(st.axis_size("stop_seq"))
+        req_stop_len = int(st.axis_size("position"))
+        cur_stop_seqs = int(ds.stop_tokens.axis_size("stop_seq"))
+        cur_stop_len = int(ds.stop_tokens.axis_size("position"))
+        if req_stop_seqs > cur_stop_seqs or req_stop_len > cur_stop_len:
+            raise ValueError(
+                "Requested stop-token configuration exceeds service capacity: "
+                f"required (seqs={req_stop_seqs}, len={req_stop_len}) > "
+                f"configured (seqs={cur_stop_seqs}, len={cur_stop_len})."
+            )
+
+    def _prepare_requests_locked(self, requests: Sequence[Request]) -> None:
+        if not requests:
+            return
+
+        max_needed = max(int(r.n_generations) for r in requests)
+        if max_needed > int(self.gen_state.decode_state.page_table.max_seqs):
+            raise ValueError(
+                "Total sequences needed exceeds configured max_seqs. "
+                "Decrease n_generations or increase max_seqs when constructing the engine."
+            )
+
+        needs_logprobs = any(r.enable_logprobs for r in requests)
+        if needs_logprobs and self.gen_state.decode_state.logprobs is None:
+            if self.sequences:
+                raise RuntimeError(
+                    "Cannot enable logprobs while sequences are active; wait for current work to finish."
+                )
+            logger.info("Re-initializing decode state with logprobs enabled.")
+            max_seqs = int(self.gen_state.decode_state.max_seqs)
+            max_seq_len = int(self.gen_state.decode_state.page_table.max_len_per_seq)
+            new_decode_state = dataclasses.replace(
+                self.gen_state.decode_state,
+                logprobs=hax.full({"seq": max_seqs, "position": max_seq_len}, jnp.nan, dtype=jnp.float32),
+            )
+            self.gen_state = dataclasses.replace(self.gen_state, decode_state=new_decode_state)
+
+        for request in requests:
+            self._validate_request_stop_tokens(request)
+
+    def _register_requests_locked(self, requests: Sequence[Request]) -> list[list[Future[DecodeResult]]]:
+        futures_per_request: list[list[Future[DecodeResult]]] = []
+        for request in requests:
+            rid = int(request.request_id)
+            if rid in self.results or rid in self._futures:
+                raise ValueError(f"Request id {rid} is already in progress.")
+            child_map: dict[int, DecodeResult] = {}
+            future_map: dict[int, Future[DecodeResult]] = {}
+            per_request_futures: list[Future[DecodeResult]] = []
+            for cid in range(int(request.n_generations)):
+                dr = DecodeResult(id=rid, choice=cid, token_list=[])
+                child_map[cid] = dr
+                future: Future[DecodeResult] = Future()
+                future_map[cid] = future
+                per_request_futures.append(future)
+            self.results[rid] = child_map
+            self._futures[rid] = future_map
+            futures_per_request.append(per_request_futures)
+        return futures_per_request
+
+    def _background_worker(self) -> None:
+        while True:
+            with self._cond:
+                while not self._shutdown and not self._has_pending_work_locked():
+                    self._cond.wait()
+                if self._shutdown:
+                    return
+            try:
+                progress = self._generation_iteration()
+            except Exception:  # pragma: no cover - defensive logging path
+                logger.exception("Background generation loop crashed; shutting down background worker.")
+                with self._cond:
+                    self._shutdown = True
+                    self._cond.notify_all()
+                return
+            if not progress:
+                time.sleep(0.001)
+
+    def submit_request(self, request: Request) -> list[Future[DecodeResult]]:
+        with self._cond:
+            self._prepare_requests_locked([request])
+            futures = self._register_requests_locked([request])[0]
+            self.enqueue_requests([request])
+            self._ensure_background_thread_locked()
+            self._cond.notify_all()
+        return futures
+
+    def shutdown(self) -> None:
+        with self._cond:
+            self._shutdown = True
+            self._cond.notify_all()
+        if self._background_thread is not None:
+            self._background_thread.join()
