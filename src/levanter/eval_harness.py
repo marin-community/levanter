@@ -383,7 +383,7 @@ class LevanterHarnessLM(TemplateLM):
 
         packed = _pack_requests(requests, self.tokenizer, self.EvalPos, self.leader.max_packed_segments)
         packed_iterator = stack_batches(iter(packed), self.EvalPos, self.EvalBatch)
-        packed_iterator = BackgroundIterator(packed_iterator, max_capacity=1024)
+        packed_iterator = BackgroundIterator(packed_iterator, max_capacity=256)  # Reduced from 1024 to save memory
 
         result_probs = np.zeros(len(requests))
         result_greedy = np.zeros(len(requests))
@@ -598,17 +598,18 @@ class LevanterHarnessLM(TemplateLM):
                 max_stop_seqs = max(max_stop_seqs, num_stop_seqs)
                 max_stop_tokens = max(max_stop_tokens, num_stop_tokens)
 
-        # Taken from: config/sampler/sample_llama8b.yaml
+        # Memory-optimized configuration for HBM constraints
+        # Reduced from original values to fit within 31.25G HBM limit
         engine_cfg = InferenceEngineConfig(
             max_stop_seqs=max_stop_seqs,
             max_stop_tokens=max_stop_tokens,
-            max_pages=16384,
-            max_seqs=256,
+            max_pages=2048,  # Reduced from 16384 (8x reduction)
+            max_seqs=32,     # Reduced from 256 (8x reduction)
             page_size=8,
-            max_pages_per_seq=512,
+            max_pages_per_seq=64,  # Reduced from 512 (8x reduction)
             compute_dtype=jnp.bfloat16,
-            max_queued_tokens=256,
-            max_seqs_in_prefill=16,
+            max_queued_tokens=128,  # Reduced from 256 (2x reduction)
+            max_seqs_in_prefill=8,  # Reduced from 16 (2x reduction)
             max_prefill_size=max_length,
         )
 
@@ -1009,7 +1010,7 @@ def _actually_run_eval_harness(
         axis_resources,
         tokenizer,
         mp,
-        max_packed_segments=64,
+        max_packed_segments=32,  # Reduced from 64 to save memory
         generation_kwargs=config.generation_kwargs,
     )
 
