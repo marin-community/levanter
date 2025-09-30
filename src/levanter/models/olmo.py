@@ -294,7 +294,7 @@ class Olmo2Attention(ModuleWithStateDictSerialization, Attention):
     attention_dropout: float = eqx.field(static=True, default=0.0)
 
     @staticmethod
-    def init(config: Olmo2Config, *, key) -> "Olmo2Attention":  # type: ignore
+    def init(config: Olmo2Config, *, key) -> "Olmo2Attention":  # type: ignore[override]
         attn_config = config.attention_config()
         use_bias = attn_config.use_bias
         use_output_bias = attn_config.use_output_bias if attn_config.use_output_bias is not None else use_bias
