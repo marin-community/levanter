@@ -383,7 +383,7 @@ class LevanterHarnessLM(TemplateLM):
 
         packed = _pack_requests(requests, self.tokenizer, self.EvalPos, self.leader.max_packed_segments)
         packed_iterator = stack_batches(iter(packed), self.EvalPos, self.EvalBatch)
-        packed_iterator = BackgroundIterator(packed_iterator, max_capacity=8)  # Reduced from 1024
+        packed_iterator = BackgroundIterator(packed_iterator, max_capacity=1024)  # Reduced from 1024
 
         result_probs = np.zeros(len(requests))
         result_greedy = np.zeros(len(requests))
@@ -603,13 +603,13 @@ class LevanterHarnessLM(TemplateLM):
         engine_cfg = InferenceEngineConfig(
             max_stop_seqs=max_stop_seqs,
             max_stop_tokens=max_stop_tokens,
-            max_pages=512,  # Reduced from 16384
-            max_seqs=32,     # Reduced from 256
+            max_pages=16384,  # Reduced from 16384
+            max_seqs=256,     # Reduced from 256
             page_size=8,
-            max_pages_per_seq=64,  # Reduced from 512
+            max_pages_per_seq=512,  # Reduced from 512
             compute_dtype=jnp.bfloat16,
-            max_queued_tokens=64,  # Reduced from 256
-            max_seqs_in_prefill=8,  # Reduced from 16
+            max_queued_tokens=256,  # Reduced from 256
+            max_seqs_in_prefill=16,  # Reduced from 16
             max_prefill_size=max_length,
         )
 
@@ -1010,7 +1010,7 @@ def _actually_run_eval_harness(
         axis_resources,
         tokenizer,
         mp,
-        max_packed_segments=8,  # Reduced from 64
+        max_packed_segments=64,  # Reduced from 64
         generation_kwargs=config.generation_kwargs,
     )
 
