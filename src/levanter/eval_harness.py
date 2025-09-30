@@ -603,7 +603,7 @@ class LevanterHarnessLM(TemplateLM):
         engine_cfg = InferenceEngineConfig(
             max_stop_seqs=max_stop_seqs,
             max_stop_tokens=max_stop_tokens,
-            max_pages=16384,  # Reduced from 16384
+            max_pages=131072,  # Must be equals to max_seqs * max_pages_per_seq
             max_seqs=256,     # Reduced from 256
             page_size=8,
             max_pages_per_seq=512,  # Reduced from 512
@@ -612,7 +612,6 @@ class LevanterHarnessLM(TemplateLM):
             max_seqs_in_prefill=16,  # Reduced from 16
             max_prefill_size=max_length,
         )
-
         engine = InferenceEngine.from_model_with_config(
             model=self.leader.model, tokenizer=self.tokenizer, config=engine_cfg
         )
