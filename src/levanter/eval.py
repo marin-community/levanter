@@ -5,8 +5,9 @@ import asyncio
 import dataclasses
 import logging
 import warnings
+from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import Callable, Mapping, Optional, Sequence, TypeVar
+from typing import Any, Callable, Mapping, Optional, Sequence, TypeVar
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -479,3 +480,22 @@ class _EvalRunningMeans(eqx.Module):
         z = RunningMean.zeros_like(total)
         per_tag = RunningMean.zeros_like(per_tag)
         return _EvalRunningMeans(z, per_tag, z, per_tag)
+
+
+class EvalPlugin(ABC):
+    """Abstract base class for evaluation plugins."""
+    
+    @abstractmethod
+    def create_callback(self, **kwargs) -> Callable[[StepInfo], None]:
+        """Create evaluation callback that will be called during training."""
+        ...
+
+
+def load_eval_plugin(plugin_path: str, config: Any) -> EvalPlugin:
+    """Load evaluation plugin from module path."""
+    import importlib
+    
+    module_path, class_name = plugin_path.rsplit(".", 1)
+    module = importlib.import_module(module_path)
+    plugin_class = getattr(module, class_name)
+    return plugin_class(config)
