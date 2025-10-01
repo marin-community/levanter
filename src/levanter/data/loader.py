@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Generic, TypeVar
 
+import haliax.partitioning
 import jax
 from jax import Array
 from jax import numpy as jnp
@@ -117,7 +118,7 @@ class DataLoader(Iterable[Ex]):
             self.scheduler = BatchSchedule(batch_size)
 
         self._batch_sharding = hax.partitioning.sharding_for_axis(self.batch_axis_name, axis_resources, mesh)
-        with mesh:
+        with haliax.partitioning.set_mesh(mesh):
             self._data_axis_size = hax.partitioning.physical_axis_size(self.batch_axis_name, axis_resources)
 
         assert self._data_axis_size is not None, "Data axis size must be known. Make sure you're passing in a mesh"

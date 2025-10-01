@@ -681,12 +681,9 @@ class HFCheckpointConverter(Generic[LevConfig]):
             return lev_model
 
         if just_use_cpu:
-            cpu_device = jax.local_devices(backend="cpu")[0]
             with local_cpu_mesh():
                 lev_model = eqx.filter_eval_shape(lm_model_cls.init, Vocab, config, key=PRNGKey(0))
-                lev_model = eqx.filter_jit(load_from_state_dict, donate="all", device=cpu_device)(
-                    lev_model, state_dict
-                )
+                lev_model = eqx.filter_jit(load_from_state_dict, donate="all")(lev_model, state_dict)
 
             del state_dict
             # gotta move it to the accelerator now (assuming there is one!)
@@ -889,8 +886,6 @@ class HFCheckpointConverter(Generic[LevConfig]):
                     subset_arg = subset_keys
 
                 shard_weights = _to_state_dict_with_dtype(model, dtype, subset_arg)
-                for k, v in shard_weights.items():
-                    print(v.is_fully_addressable)
                 shard_numpy = {k: np.asarray(v) for k, v in shard_weights.items()}
                 bytes_this_time = sum(v.nbytes for v in shard_numpy.values())
                 logger.info(
