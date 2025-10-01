@@ -641,7 +641,7 @@ class HFCheckpointConverter(Generic[LevConfig]):
         just_use_cpu = _should_use_cpu_for_checkpoint_loading()
         if just_use_cpu:
             # if we only have 1 device, use CPU ram
-            contexts.enter_context(use_cpu_device())
+            contexts.enter_context(local_cpu_mesh())
 
         with contexts:
             # TODO: in an ideal world, we would only load the part of the array we needed, but
