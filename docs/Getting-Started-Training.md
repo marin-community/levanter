@@ -176,3 +176,44 @@ start training from scratch.
 2. Resume from a WandB run: if you set `--trainer.wandb.resume`, it will resume the corresponding WandB run with the ID `asdf1234`. You can
 find the WandB run ID in the URL of your WandB run page. For more information, please refer to the
 [WandB documentation](https://docs.wandb.ai/guides/runs/resuming).
+
+## Custom Evaluation Plugins
+
+Levanter supports custom evaluation plugins that run during training to track specialized metrics. Here is an example of a simple perplexity plugin:
+
+```python
+# my_eval_plugin.py
+import jax.numpy as jnp
+import levanter
+from levanter.utils.hf_utils import HfTokenizer
+from levanter.eval import EvalPlugin
+
+class PerplexityPlugin(EvalPlugin):
+    def __init__(self):
+        # Plugin handles its own configuration internally
+        self.sample_text = "The quick brown fox jumps over the lazy dog."
+
+    def create_callback(self, *, tokenizer: HfTokenizer, **kwargs):
+        tokens = tokenizer(self.sample_text)["input_ids"]
+
+        def callback(step_info):
+            # Simple perplexity calculation on sample text
+            eval_model = step_info.eval_model
+            logits = eval_model(jnp.array(tokens[:-1]))
+            loss = jnp.mean(-jnp.log(jnp.softmax(logits)[tokens[1:]]))
+            perplexity = jnp.exp(loss)
+            levanter.tracker.log(
+                {"custom/perplexity": float(perplexity)},
+                step=step_info.step
+            )
+
+        return callback
+```
+
+Add the plugin to your training configuration, which will run every 100 steps and log metrics to WandB:
+
+```bash
+python src/levanter/main/train_lm.py \
+    --config_path config/llama_small_fast.yaml \
+    --eval_plugins '[{"plugin_class": "my_eval_plugin.PerplexityPlugin", "steps": 100}]'
+```

@@ -7,7 +7,7 @@ import gc
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 import jax.numpy as jnp
 import jax.random as jrandom
@@ -24,7 +24,7 @@ from levanter import callbacks
 from levanter.checkpoint import load_checkpoint
 from levanter.compat.hf_checkpoints import HFCompatConfig, save_hf_checkpoint_callback
 from levanter.data.text import LMMixtureDatasetConfig, SingleDatasetLMConfig, UrlSingleDatasetLMConfig
-from levanter.eval import load_eval_plugin
+from levanter.eval import EvalPluginConfig, load_eval_plugin
 from levanter.eval_harness import LmEvalHarnessConfig
 from levanter.models.llama import LlamaConfig
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, compute_next_token_loss
@@ -70,10 +70,10 @@ class TrainLmConfig:
 
     # TODO: really need to add callback framework
     log_entropy: bool = False
-    
+
     # Custom evaluation plugins
-    eval_plugins: Optional[list[dict[str, Any]]] = None
-    """List of evaluation plugin configs. Each should have 'plugin' (module.class) and 'config' keys."""
+    eval_plugins: Optional[list[EvalPluginConfig]] = None
+    """List of evaluation plugin configurations."""
 
 
 def main(config: TrainLmConfig):
@@ -261,23 +261,24 @@ def main(config: TrainLmConfig):
                     ),
                     every=config.trainer.steps_per_eval,
                 )
-        
+
         # Load and register evaluation plugins
         if config.eval_plugins:
             for plugin_config in config.eval_plugins:
                 try:
-                    plugin = load_eval_plugin(plugin_config["plugin"], plugin_config["config"])
+                    plugin = load_eval_plugin(plugin_config)
                     callback = plugin.create_callback(
                         tokenizer=tokenizer,
                         device_mesh=trainer.device_mesh,
                         compute_axis_mapping=compute_axis_mapping,
-                        mp=trainer.mp
+                        parameter_axis_mapping=parameter_axis_mapping,
+                        batch_size=EvalBatch.size,
                     )
-                    steps = plugin_config.get("steps", config.trainer.steps_per_eval)
+                    steps = plugin_config.steps if plugin_config.steps is not None else config.trainer.steps_per_eval
                     trainer.add_hook(callback, every=steps)
-                    logger.info(f"Registered evaluation plugin: {plugin_config['plugin']}")
+                    logger.info(f"Registered evaluation plugin: {plugin_config.plugin_class}")
                 except Exception as e:
-                    logger.warning(f"Failed to load evaluation plugin {plugin_config.get('plugin')}: {e}")
+                    logger.warning(f"Failed to load evaluation plugin {plugin_config.plugin_class}: {e}")
 
         train_loader = trainer.data_loader(train_dataset)
         if state.step > 0:
