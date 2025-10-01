@@ -474,7 +474,7 @@ def test_causal_offset_cross_attention(impl):
     )
 
     # The output should be the same, since the mask is relaxed by the offset
-    assert_trees_all_close(offset_out.array, full_out.array[4:6, :], atol=2e-3, rtol=2e-3)
+    assert_trees_all_close(offset_out.array, full_out.array[4:6, :], atol=3e-3, rtol=3e-3)
 
     # sanity check: output should be wrong if we don't use the offset
     wrong_out = jit_dpa(

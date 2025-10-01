@@ -283,7 +283,7 @@ def best_effort_sharding(shape, *, devices=None, mesh=None):
 
     if mesh is None:
         mesh = hax.partitioning._get_mesh()
-        if mesh.devices.shape == ():
+        if mesh is not None and mesh.devices.shape == ():
             mesh = None
 
     if mesh is None:
