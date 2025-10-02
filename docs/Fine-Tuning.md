@@ -116,8 +116,8 @@ You'll also want to log into [WANDB](https://wandb.ai/).
 wandb login
 ```
 
-To use Llama 2, you'll need to request access to the model from [Llama 2's Hugging Face page](https://huggingface.co/meta-llama/Llama-2-7b-hf).
-Then, you'll need to log into the Hugging Face CLI:
+To use Llama 2 we recommend the open checkpoint [`NousResearch/Llama-2-7b-hf`](https://huggingface.co/NousResearch/Llama-2-7b-hf).
+Log into the Hugging Face CLI:
 
 ```bash
 huggingface-cli login
@@ -144,7 +144,7 @@ python examples/alpaca/alpaca.py --config_path levanter/examples/alpaca/alpaca-l
 Alternatively:
 
 ```bash
-python examples/alpaca/alpaca.py --config_path levanter/examples/alpaca/alpaca-llama2.yaml --model_name_or_path meta-llama/Llama-2-7b-hf
+python examples/alpaca/alpaca.py --config_path levanter/examples/alpaca/alpaca-llama2.yaml --model_name_or_path NousResearch/Llama-2-7b-hf
 ```
 
 !!! warning
@@ -266,10 +266,7 @@ to use a learning rate of 2e-5 and no weight decay. `trainer.per_device_parallel
 ### Llama 2 Config
 
 The [Llama 2 config](https://github.com/stanford-crfm/levanter/blob/main/examples/alpaca/alpaca-llama2.yaml) is identical, except for the model id.
-If you haven't already, go to [Llama 2's Hugging Face page](https://huggingface.co/meta-llama/Llama-2-7b-hf) and request access to the model.
-
-Once you have access, go to [Hugging Face's Tokens page](https://huggingface.co/settings/tokens) to get an API token. You'll need to provide this
-to the TPU VM as an environment variable. (We'll show you how to do this later.)
+`NousResearch/Llama-2-7b-hf` is freely accessible on the Hub so no additional token is required.
 
 ### Custom Datasets
 

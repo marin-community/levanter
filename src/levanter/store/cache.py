@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import concurrent
 import copy
@@ -421,7 +424,7 @@ class TreeCache(AsyncDataset[T_co]):
             metrics = _ledger_to_metrics(ledger)
             if metrics.rows_finished == 0 and metrics.is_finished:
                 # this means we built an empty cache. go with it
-                store = TreeStore.open(self._exemplar, f"memory://{self.cache_dir}", mode="a")
+                store = TreeStore.open(self._exemplar, self.cache_dir, mode="a")
             else:
                 raise
         try:

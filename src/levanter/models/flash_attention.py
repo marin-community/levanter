@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 # cf https://github.com/lucidrains/flash-attention-jax
 # cf https://tridao.me/publications/flash2/flash2.pdf
 # cf https://arxiv.org/pdf/2205.14135.pdf
@@ -11,7 +14,7 @@ from jaxtyping import PRNGKeyArray
 
 import haliax as hax
 import haliax.nn as hnn
-from haliax import ds
+from haliax import AxisSelection, AxisSpec, ds
 from haliax.jax_utils import named_call
 from haliax.types import PrecisionLike
 
@@ -175,6 +178,11 @@ def _flash_attention_forward(
     ell = hax.auto_sharded(ell)
 
     is_causal = isinstance(mask, AttentionMask) and mask.is_causal
+    # Non-zero offsets (dynamic or otherwise) are not supported in this implementation
+    if isinstance(mask, AttentionMask) and mask.is_causal and mask.causal_offset is not None:
+        raise NotImplementedError("Non-zero causal offsets are not implemented for flash attention")
+
+    # i refers to the block index in Q, j refers to the block index in K.
 
     @named_call
     def do_o_block(state):
@@ -237,6 +245,7 @@ def _flash_attention_forward(
 
             return (i, j + 1, o_i, q_i, sumexp_i, max_i)
 
+        # For causal (offset==0), limit key blocks up to the diagonal
         j_end = jnp.minimum(i + 1, Tc) if is_causal else Tc
 
         _, _, o_i, _, sumexp_i, max_i = jax.lax.while_loop(
@@ -347,7 +356,7 @@ def _flash_attention_backward(
             dK_ji = hax.dot(dAttn_ij, q_i, axis=QPos.name).astype(dK_j.dtype)
 
             # GQA-specific: eliminate unnecessary axes (e.g. 'q_heads_per_group')
-            unnecessary_axes = hax.eliminate_axes(dV_ji.axes, v.axes)
+            unnecessary_axes = hax.eliminate_axes(dV_ji.axes, _strip_sizes(v.axes))
             dV_ji = hax.sum(dV_ji, unnecessary_axes)
             dK_ji = hax.sum(dK_ji, unnecessary_axes)
 
@@ -387,3 +396,10 @@ def _infer_attention_output_block_shape(QPos, KPos, Key, q_i, k, v):
 
 def _materialize_mask_slice(mask, i, j, QPos, KPos, block_size):
     return materialize_mask(mask, QPos, KPos, q_slice=hax.ds.block(i, block_size), k_slice=hax.ds.block(j, block_size))
+
+
+def _strip_sizes(axes: AxisSpec) -> AxisSelection:
+    """Strip sizes from axes, returning only the names."""
+    if isinstance(axes, hax.Axis):
+        return axes.name
+    return tuple(axis.name for axis in axes)

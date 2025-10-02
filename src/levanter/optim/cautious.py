@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Optional
 
@@ -11,7 +14,7 @@ from levanter.optim.config import OptimizerConfig
 
 
 @OptimizerConfig.register_subclass("cautious")
-@dataclass
+@dataclass(frozen=True)
 class CautiousConfig(OptimizerConfig):
     """
     Cautious optimizer configuration
@@ -24,6 +27,14 @@ class CautiousConfig(OptimizerConfig):
     gamma: float = 0.025
     epsilon: float = 1e-8
     max_grad_norm: Optional[float] = 1.0
+    adamc_weight_decay: bool = False
+    """
+    If set, use the AdamC corrected weight decay, which keeps
+    ``weight_decay / lr`` constant across training.
+
+    This follows Defazio, *On the Correct Treatment of Weight Decay in Adam*
+    (2025, https://arxiv.org/abs/2506.02285v2).
+    """
 
     def build(self, num_train_steps):
         """Creates the optimizer"""
@@ -38,7 +49,12 @@ class CautiousConfig(OptimizerConfig):
             components.append(scale_by_cautious(self.beta1, self.beta2, self.epsilon))
 
             if self.weight_decay > 0:
-                components.append(optax.add_decayed_weights(self.weight_decay, self.build_weight_decay_mask()))
+                if self.adamc_weight_decay:
+                    max_lr = self.learning_rate
+                    weight_decay = self.weight_decay * (learning_rate / max_lr)
+                else:
+                    weight_decay = self.weight_decay
+                components.append(optax.add_decayed_weights(weight_decay, self.build_weight_decay_mask()))
 
             # - learning rate for descent
             components.append(optax.scale(-learning_rate))

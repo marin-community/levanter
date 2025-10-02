@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import tempfile
 
@@ -9,9 +12,9 @@ import haliax
 import levanter.main.eval_lm as eval_lm
 import tiny_test_corpus
 from levanter.checkpoint import save_checkpoint
-from levanter.distributed import RayConfig
-from levanter.models.gpt2 import Gpt2LMHeadModel
-from levanter.tracker.wandb import WandbConfig
+from levanter.distributed import DistributedConfig, RayConfig
+from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
+from levanter.tracker import NoopConfig
 from levanter.trainer_state import TrainerState
 from test_utils import skip_if_no_torch
 
@@ -20,12 +23,12 @@ from test_utils import skip_if_no_torch
 def test_eval_lm():
     # just testing if eval_lm has a pulse
     # save a checkpoint
-    model_config = eval_lm.Gpt2Config(
+    model_config = LlamaConfig(
         num_layers=2,
         num_heads=2,
+        num_kv_heads=2,
         seq_len=64,
         hidden_dim=32,
-        use_flash_attention=True,
     )
 
     with tempfile.TemporaryDirectory() as f:
@@ -33,7 +36,7 @@ def test_eval_lm():
             data_config, _ = tiny_test_corpus.construct_small_data_cache(f)
             tok = data_config.the_tokenizer
             Vocab = haliax.Axis("vocab", len(tok))
-            model = Gpt2LMHeadModel.init(Vocab, model_config, key=jax.random.PRNGKey(0))
+            model = LlamaLMHeadModel.init(Vocab, model_config, key=jax.random.PRNGKey(0))
 
             state = TrainerState(0, model, model, jax.random.PRNGKey(0), None, True, None, None)
 
@@ -45,8 +48,9 @@ def test_eval_lm():
                 trainer=eval_lm.TrainerConfig(
                     per_device_eval_parallelism=len(jax.devices()),
                     max_eval_batches=1,
-                    wandb=WandbConfig(mode="disabled"),
+                    tracker=NoopConfig(),
                     require_accelerator=False,
+                    distributed=DistributedConfig(initialize_jax_distributed=False),
                     ray=RayConfig(auto_start_cluster=False),
                 ),
                 checkpoint_path=f"{f}/ckpt",
@@ -64,12 +68,12 @@ def test_eval_lm():
 def test_eval_lm_from_hf():
     # just testing if eval_lm has a pulse
     # save a checkpoint
-    model_config = eval_lm.Gpt2Config(
+    model_config = LlamaConfig(
         num_layers=2,
         num_heads=2,
+        num_kv_heads=2,
         seq_len=1024,
         hidden_dim=32,
-        use_flash_attention=True,
     )
 
     with tempfile.TemporaryDirectory() as f:
@@ -77,7 +81,7 @@ def test_eval_lm_from_hf():
             data_config, _ = tiny_test_corpus.construct_small_data_cache(f)
             tok = data_config.the_tokenizer
             Vocab = haliax.Axis("vocab", len(tok))
-            model = Gpt2LMHeadModel.init(Vocab, model_config, key=jax.random.PRNGKey(0))
+            model = LlamaLMHeadModel.init(Vocab, model_config, key=jax.random.PRNGKey(0))
 
             state = TrainerState(0, model, model, jax.random.PRNGKey(0), None, True, None, None)
 
@@ -89,8 +93,9 @@ def test_eval_lm_from_hf():
                 trainer=eval_lm.TrainerConfig(
                     per_device_eval_parallelism=len(jax.devices()),
                     max_eval_batches=1,
-                    wandb=WandbConfig(mode="disabled"),
+                    tracker=NoopConfig(),
                     require_accelerator=False,
+                    distributed=DistributedConfig(initialize_jax_distributed=False),
                     ray=RayConfig(auto_start_cluster=False),
                 ),
                 checkpoint_path=f"{f}/ckpt",

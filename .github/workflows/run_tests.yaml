@@ -3,26 +3,28 @@ name: Run tests
 on: [push, pull_request]
 
 jobs:
-  build:
+  unit_tests:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
 
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10"]
-        jax-version: ["0.5"]
+        python-version: ["3.11"]
+        jax-version: ["0.5.2", "0.6.2"]
 
     steps:
-      - uses: actions/checkout@v3
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v6
         with:
+          version: "0.7.20"
           python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install .[test] "jax[cpu]==${{ matrix.jax-version }}" "jaxlib==${{ matrix.jax-version }}"
-          pip install -r ./tests/requirements.txt
+        run: uv sync --dev
       - name: Test with pytest
         run: |
-          PYTHONPATH=tests:src:. pytest tests -m "not entry and not slow and not ray"
+          # check we are using the right jax version
+          PYTHONPATH=tests:src:. uv run --with "jax[cpu]==${{ matrix.jax-version }}" pytest tests -m "not entry and not slow and not ray" --durations=20

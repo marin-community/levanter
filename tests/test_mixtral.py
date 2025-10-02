@@ -1,4 +1,10 @@
-# import tempfile
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
+import tempfile
+
+import jax
+import numpy as np
 
 # import equinox as eqx
 # import jax
@@ -17,6 +23,7 @@ from test_utils import (  # , check_model_works_with_seqlen
     check_load_config,
     parameterize_with_configs,
     skip_if_no_torch,
+    use_test_mesh,
 )
 
 
@@ -242,67 +249,65 @@ def test_mixtral_config():
 #         assert np.isclose(jax_g, torch_g, rtol=1e-2, atol=1e-2).all(), f"{jax_key}: {jax_g} != {torch_g}"
 
 
-# @skip_if_no_torch
-# def test_mixtral_roundtrip():
-#     import torch
-#     from transformers import AutoModelForCausalLM, MixtralForCausalLM
+@skip_if_no_torch
+def test_mixtral_roundtrip():
+    import torch
+    from transformers import AutoModelForCausalLM, MixtralForCausalLM
 
-#     converter = MixtralConfig().hf_checkpoint_converter()
+    converter = MixtralConfig().hf_checkpoint_converter()
 
-#     config = MixtralConfig(
-#         seq_len=128,
-#         hidden_dim=16,
-#         intermediate_dim=64,
-#         num_heads=4,
-#         num_kv_heads=2,
-#         gradient_checkpointing=False,
-#     )
-#     Vocab = hax.Axis("vocab", 1000)
-#     hf_config = config.to_hf_config(Vocab.size)
+    config = MixtralConfig(
+        seq_len=128,
+        hidden_dim=16,
+        intermediate_dim=64,
+        num_heads=4,
+        num_kv_heads=2,
+        gradient_checkpointing=False,
+    )
+    Vocab = hax.Axis("vocab", 1000)
+    hf_config = config.to_hf_config(Vocab.size)
 
-#     # Make input and attn_mask
-#     input = hax.random.randint(random.PRNGKey(0), config.Pos, 0, Vocab.size)
-#     attn_mask = hax.nn.attention.causal_mask(config.Pos, config.KeyPos)
-#     input_torch = torch.from_numpy(np.array(input.array)).to(torch.int32).unsqueeze(0)
+    # Make input and attn_mask
+    input = hax.random.randint(random.PRNGKey(0), config.Pos, 0, Vocab.size)
+    attn_mask = hax.nn.attention.causal_mask(config.Pos, config.KeyPos)
+    input_torch = torch.from_numpy(np.array(input.array)).to(torch.int32).unsqueeze(0)
 
-#     torch.random.manual_seed(0)
+    torch.random.manual_seed(0)
 
-#     torch_model = MixtralForCausalLM(hf_config)
-#     torch_model.eval()
+    torch_model = MixtralForCausalLM(hf_config)
+    torch_model.eval()
 
-#     torch_out = torch_model(input_torch)
-#     torch_out = torch_out.logits[0].detach().cpu().numpy()
-#     torch_out = jax.nn.softmax(torch_out, axis=-1)
+    torch_out = torch_model(input_torch)
+    torch_out = torch_out.logits[0].detach().cpu().numpy()
+    torch_out = jax.nn.softmax(torch_out, axis=-1)
 
-#     with tempfile.TemporaryDirectory() as tmpdir:
-#         torch_model.save_pretrained(f"{tmpdir}/torch_model")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        torch_model.save_pretrained(f"{tmpdir}/torch_model")
 
-#         model = converter.load_pretrained(
-#             MixtralLMHeadModel, f"{tmpdir}/torch_model", resize_vocab_to_match_tokenizer=False
-#         )
+        model = converter.load_pretrained(
+            MixtralLMHeadModel, f"{tmpdir}/torch_model", resize_vocab_to_match_tokenizer=False
+        )
 
-#         def compute(input):
-#             model_output = model(input, attn_mask=attn_mask)
-#             return hax.nn.softmax(model_output, axis=model.Vocab)
+        def compute(input):
+            model_output = model(input, attn_mask=attn_mask)
+            return hax.nn.softmax(model_output, axis=model.Vocab)
 
-#         compute = jax.jit(compute)
-#         with Mesh(
-#             np.array(jax.devices()).reshape(1, -1, 1), (ResourceAxis.REPLICA, ResourceAxis.DATA, ResourceAxis.MODEL)
-#         ):
-#             jax_out = compute(input).array
+        compute = jax.jit(compute)
+        with use_test_mesh():
+            jax_out = compute(input).array
 
-#         assert torch_out.shape == jax_out.shape, f"{torch_out.shape} != {jax_out.shape}"
-#         assert np.isclose(torch_out, np.array(jax_out), rtol=1e-2, atol=1e-2).all(), f"{torch_out} != {jax_out}"
+        assert torch_out.shape == jax_out.shape, f"{torch_out.shape} != {jax_out.shape}"
+        assert np.isclose(torch_out, np.array(jax_out), rtol=1e-4, atol=1e-4).all(), f"{torch_out} != {jax_out}"
 
-#         converter.save_pretrained(model, f"{tmpdir}/lev_model", save_reference_code=False)
-#         torch_model2 = AutoModelForCausalLM.from_pretrained(f"{tmpdir}/lev_model")
-#         torch_model2.eval()
+        converter.save_pretrained(model, f"{tmpdir}/lev_model", save_reference_code=False)
+        torch_model2 = AutoModelForCausalLM.from_pretrained(f"{tmpdir}/lev_model")
+        torch_model2.eval()
 
-#         torch_out2 = torch_model2(input_torch)
-#         torch_out2 = torch_out2.logits[0].detach().cpu().numpy()
-#         torch_out2 = jax.nn.softmax(torch_out2, axis=-1)
-#         assert torch_out2.shape == jax_out.shape, f"{torch_out2.shape} != {jax_out.shape}"
-#         assert np.isclose(torch_out2, np.array(jax_out), rtol=1e-2, atol=1e-2).all(), f"{torch_out2} != {jax_out}"
+        torch_out2 = torch_model2(input_torch)
+        torch_out2 = torch_out2.logits[0].detach().cpu().numpy()
+        torch_out2 = jax.nn.softmax(torch_out2, axis=-1)
+        assert torch_out2.shape == jax_out.shape, f"{torch_out2.shape} != {jax_out.shape}"
+        assert np.isclose(torch_out2, np.array(jax_out), rtol=1e-4, atol=1e-4).all(), f"{torch_out2} != {jax_out}"
 
 
 def _get_mixtral_config(use_flash=False, num_kv_heads=4, seq_len=128) -> MixtralConfig:

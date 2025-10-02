@@ -554,10 +554,10 @@ python -m levanter.main.train_lm --config_path gpt2_nano
 If your dataset is a [Hugging Face dataset](https://huggingface.co/docs/datasets/loading_datasets.html), you can use the `data.id` field to specify it:
 
 ```bash
-python -m levanter.main.train_lm --config_path config/gpt2_small.yaml --data.id openwebtext
+python -m levanter.main.train_lm --config_path config/llama_small_fast.yaml --data.id openwebtext
 
 # optionally, you may specify a tokenizer and/or a cache directory, which may be local or on gcs
-python -m levanter.main.train_lm --config_path config/gpt2_small.yaml --data.id openwebtext --data.tokenizer "EleutherAI/gpt-neox-20b" --data.cache_dir "gs://path/to/cache/dir"
+python -m levanter.main.train_lm --config_path config/llama_small_fast.yaml --data.id openwebtext --data.tokenizer "NousResearch/Llama-2-7b-hf" --data.cache_dir "gs://path/to/cache/dir"
 ```
 
 If instead your data is a list of URLs, you can use the `data.train_urls` and `data.validation_urls` fields to specify them.
@@ -565,7 +565,7 @@ Data URLS can be local files, gcs files, or http(s) URLs, or anything that [fssp
 Levanter (really, fsspec) will automatically uncompress `.gz` and `.zstd` files, and probably other formats too.
 
 ```bash
-python -m levanter.main.train_lm --config_path config/gpt2_small.yaml --data.train_urls ["https://path/to/train/data_*.jsonl.gz"] --data.validation_urls ["https://path/to/val/data_*.jsonl.gz"]
+python -m levanter.main.train_lm --config_path config/llama_small_fast.yaml --data.train_urls ["https://path/to/train/data_*.jsonl.gz"] --data.validation_urls ["https://path/to/val/data_*.jsonl.gz"]
 ```
 
 You can also change the dataset by changing the `dataset` field in the config file.

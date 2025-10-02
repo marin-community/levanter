@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import os.path
 import tempfile
 
@@ -26,10 +29,10 @@ from levanter.lora import (
     save_merged_hf_model,
     save_peft_pretrained,
 )
-from levanter.models.gpt2 import Gpt2Config, Gpt2LMHeadModel
+from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
 from levanter.trainer_state import TrainerState
 from levanter.utils.tree_utils import inference_mode
-from test_utils import skip_if_no_torch
+from test_utils import skip_if_module_missing, skip_if_no_torch
 
 
 In = hax.Axis("In", 10)
@@ -96,6 +99,7 @@ def test_lora_scan_layers():
     assert not hax.all(hax.isclose(module.fold(input), loraized.fold(input)))
 
 
+@skip_if_module_missing("peft")
 @skip_if_no_torch
 def test_lora_peft_integration():
     import peft
@@ -112,7 +116,7 @@ def test_lora_peft_integration():
 
     hf_dict = get_peft_model_state_dict(model)
 
-    converter = Gpt2Config().hf_checkpoint_converter()
+    converter = LlamaConfig().hf_checkpoint_converter()
 
     lev_model = converter.load_pretrained(converter.default_config.model_type, "stanford-crfm/expanse-gpt2-small-x777")
 
@@ -176,15 +180,16 @@ def test_merge_lora():
     assert_trees_all_close(merged.fold(input), loraized.fold(input), rtol=1e-3, atol=3e-3)
 
 
+@skip_if_module_missing("peft")
 @skip_if_no_torch
 def test_lora_load_in_peft():
     import torch
 
-    converter: HFCheckpointConverter = Gpt2Config().hf_checkpoint_converter()
-    config = Gpt2Config(seq_len=128, num_layers=2, num_heads=2)
+    converter: HFCheckpointConverter = LlamaConfig().hf_checkpoint_converter()
+    config = LlamaConfig(seq_len=128, intermediate_dim=512, num_layers=2, num_heads=2, num_kv_heads=2)
     Vocab = converter.Vocab
 
-    model = Gpt2LMHeadModel.init(Vocab, config=config, key=jax.random.PRNGKey(0))
+    model = LlamaLMHeadModel.init(Vocab, config=config, key=jax.random.PRNGKey(0))
     model = inference_mode(model, True)
 
     input = hax.random.randint(jax.random.PRNGKey(0), config.Pos, 0, Vocab.size)
@@ -225,15 +230,16 @@ def test_lora_load_in_peft():
         assert not np.allclose(lev_lora_out, hf_out, atol=1e-4)
 
 
+@skip_if_module_missing("peft")
 @skip_if_no_torch
 def test_lora_merged_load_in_hf():
     import torch
 
-    converter: HFCheckpointConverter = Gpt2Config().hf_checkpoint_converter()
-    config = Gpt2Config(seq_len=128, num_layers=2, num_heads=2)
+    converter: HFCheckpointConverter = LlamaConfig().hf_checkpoint_converter()
+    config = LlamaConfig(seq_len=128, intermediate_dim=512, num_layers=2, num_heads=2, num_kv_heads=2)
     Vocab = converter.Vocab
 
-    model = Gpt2LMHeadModel.init(Vocab, config=config, key=jax.random.PRNGKey(0))
+    model = LlamaLMHeadModel.init(Vocab, config=config, key=jax.random.PRNGKey(0))
     model = inference_mode(model, True)
 
     input = hax.random.randint(jax.random.PRNGKey(0), config.Pos, 0, Vocab.size)
@@ -241,7 +247,7 @@ def test_lora_merged_load_in_hf():
 
     causal_mask = AttentionMask.causal()
 
-    with (tempfile.TemporaryDirectory() as tmpdir):
+    with tempfile.TemporaryDirectory() as tmpdir:
         converter.save_pretrained(model, f"{tmpdir}/model")
 
         lora_config = LoraConfig(r=8, target_modules=["c_attn"])

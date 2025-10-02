@@ -75,7 +75,7 @@ if ! grep -q TENSORSTORE_CURL_LOW_SPEED_LIMIT_BYTES /etc/environment; then
   echo "TENSORSTORE_CURL_LOW_SPEED_LIMIT_BYTES=1024" | sudo tee -a /etc/environment > /dev/null
 fi
 
-# install python 3.10, latest git
+# install python 3.11, latest git
 sudo systemctl stop unattended-upgrades  # this frequently holds the apt lock
 sudo systemctl disable unattended-upgrades
 sudo apt remove -y unattended-upgrades
@@ -89,35 +89,34 @@ retry sudo apt-get install -y software-properties-common
 retry sudo add-apt-repository -y ppa:deadsnakes/ppa
 retry sudo add-apt-repository -y ppa:git-core/ppa
 retry sudo apt-get -qq update
-retry sudo apt-get -qq install -y python3.10-full python3.10-dev git
+retry sudo apt-get -qq install -y python3.11-full python3.11-dev git
 
-VENV=~/venv310
-# if the venv doesn't exist, make it
-if [ ! -d "$VENV" ]; then
-    echo "Creating virtualenv at $VENV"
-    python3.10 -m venv $VENV
-fi
+# make absolutely sure we're installing into Python 3.11
+python3.11 -m pip install --upgrade pip wheel uv || exit 1
 
-source $VENV/bin/activate
-
-pip install -U pip
-pip install -U wheel
-
-# jax and jaxlib
-retry pip install -U "jax[tpu]==0.5.3" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+# ensure the script-directory is on PATH
+# on Ubuntu, that is usually ~/.local/bin
+export PATH="$(python3.11 -m site --user-base)/bin:$PATH"
 
 # clone levanter
-git clone $REPO levanter
-echo $VENV > levanter/infra/venv_path.txt
-
-cd levanter
+if [ -d levanter ]; then
+  echo "Levanter directory already exists, Assuming git repo and fetching latest changes"
+  cd levanter || exit 1
+  git fetch origin || exit 1
+  if git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+    git reset --hard "origin/$BRANCH" || exit 1
+  else
+    git reset --hard "$BRANCH" || exit 1
+  fi
+else
+  git clone $REPO levanter || exit 1
+  cd levanter || exit 1
+  git checkout $BRANCH || exit 1
+fi
 
 # checkout the branch we want
-
 echo "Checking out branch $BRANCH"
 
-git checkout $BRANCH
-
 # install levanter
-
-pip install -e .
+uv venv
+uv sync --extra tpu

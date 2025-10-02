@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import atexit
 import copy
 import functools
@@ -9,7 +12,21 @@ import warnings
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple, TypeVar, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    TypeVar,
+    Union,
+    ContextManager,
+)
 
 import equinox as eqx
 import fsspec
@@ -36,7 +53,7 @@ import levanter.tracker
 import levanter.tracker.wandb
 import levanter.utils.logging
 from levanter import tracker
-from levanter.callbacks import Callback, CBInfo, JitCallback, LambdaCallback, M, S, StepInfo
+from levanter.callbacks import Callback, CBInfo, JitCallback, LambdaCallback, StepInfo
 from levanter.callbacks.watch import WatchConfig
 from levanter.checkpoint import CheckpointerConfig, is_checkpoint_path, load_checkpoint_or_initialize
 from levanter.config import JsonAtom
@@ -57,6 +74,8 @@ from levanter.utils.types import ComputeLossFunction, FilterSpec
 logger = pylogging.getLogger(__name__)
 
 X = TypeVar("X")  # Input
+M = TypeVar("M")  # Model
+S = TypeVar("S", bound=TrainerState)  # State
 
 DEFAULT_JAX_CONFIG: Dict[str, JsonAtom] = {
     "jax_threefry_partitionable": True,
@@ -202,7 +221,7 @@ class Trainer:
         def fn(model, *batch, **batch_kwargs):
             with hax.axis_mapping(self.compute_axis_mapping):
                 model = self.mp.cast_to_compute(model)
-                return _ensure_scalar(self._raw_loss_function(model, *batch, **batch_kwargs))
+                return _ensure_scalar(self._raw_loss_function(model, *batch, **batch_kwargs).mean())
 
         return fn
 
@@ -222,20 +241,16 @@ class Trainer:
         return self.config.num_train_steps
 
     @typing.overload
-    def add_hook(self, fn: Callable[[StepInfo], Any], *, every: int = 1):
-        ...
+    def add_hook(self, fn: Callable[[StepInfo], Any], *, every: int = 1): ...
 
     @typing.overload
-    def add_hook(self, fn: JitCallback, *, every: int = 1):
-        ...
+    def add_hook(self, fn: JitCallback, *, every: int = 1): ...
 
     @typing.overload
-    def add_hook(self, fn: Callback, *, every: int = 1):
-        ...
+    def add_hook(self, fn: Callback, *, every: int = 1): ...
 
     @typing.overload
-    def add_hook(self, *, every: int = 1):
-        ...
+    def add_hook(self, *, every: int = 1): ...
 
     def add_hook(self, fn: Optional[Callable[[StepInfo], Any] | Callback | JitCallback] = None, *, every: int = 1):
         return self.hooks.add_hook(fn, every=every)
@@ -269,7 +284,7 @@ class Trainer:
 
         self._cmanagers = [
             levanter.current_tracker(self.tracker),
-            self.device_mesh,
+            haliax.partitioning.set_mesh(self.device_mesh),
             hax.axis_mapping(self.parameter_axis_mapping),
         ]
 
@@ -435,8 +450,14 @@ class Trainer:
         """
         Performs training until the number of steps is reached.
         """
+        info: Optional[StepInfo[S]] = None
         for info in self.training_steps(state, train_loader):
             pass
+
+        if info is None:
+            raise RuntimeError(
+                "No training steps were executed. The dataset may be empty or there are no steps left to run."
+            )
 
         # force hooks to run at the end
         self.run_hooks(info, force=True)
@@ -567,9 +588,10 @@ class Trainer:
                     hook_infos = self.hooks.run_jit_hooks(state, jit_info, force=False)
 
         if _no_hooks:
-            return loss, new_state, metrics, None
+            return hax.shard_with_axis_mapping((loss, new_state, metrics, None), self.parameter_axis_mapping)
         else:
-            return loss, new_state, metrics, hook_infos
+            # return loss, new_state, metrics, hook_infos
+            return hax.shard_with_axis_mapping((loss, new_state, metrics, hook_infos), self.parameter_axis_mapping)
 
     def _compute_gradients_microbatched(self, loss_fn, model: M, *batch, **batch_kwargs) -> tuple[Scalar, M]:
         Batch = _resolve_axis_in_tree((batch, batch_kwargs), self.config.batch_axis)
@@ -796,6 +818,9 @@ class TrainerConfig:
             self.replica_dcn_axis_size,
             self.data_dcn_axis_size,
         )
+
+    def use_mesh(self) -> ContextManager[None]:
+        return haliax.partitioning.set_mesh(self.device_mesh)
 
     @property
     def eval_batch_size(self):

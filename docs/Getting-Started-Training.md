@@ -20,11 +20,11 @@ Please see the [Installation Guide](Installation.md) for more information on how
 
 To launch the training of a GPT2 model, run the following command:
 ```bash
-python src/levanter/main/train_lm.py --config_path config/gpt2_small.yaml
+python src/levanter/main/train_lm.py --config_path config/llama_small_fast.yaml
 ```
 
 This will execute the training pipeline pre-defined in the [train_lm.py](https://github.com/stanford-crfm/levanter/tree/main/src/levanter/main/train_lm.py) and set model and training configuration
-set in [gpt2_small.yaml](https://github.com/stanford-crfm/levanter/tree/main/config/gpt2_small.yaml). You can find more template configurations in the [config](https://github.com/stanford-crfm/levanter/tree/main/config/) directory.
+set in [llama_small_fast.yaml](https://github.com/stanford-crfm/levanter/tree/main/config/llama_small_fast.yaml). You can find more template configurations in the [config](https://github.com/stanford-crfm/levanter/tree/main/config/) directory.
 
 Configuration files are processed using [Draccus](https://github.com/dlwh/draccus). Draccus is yet-another yaml-to-dataclass library.
 It should mostly work like you would expect. Arguments may be passed in via the command line using arg-parse style
@@ -39,7 +39,7 @@ To change the dimensions of your GPT2 model and increase the number of training 
 
 ```
 python src/levanter/main/train_lm.py \
-    --config_path config/gpt2_small.yaml \
+    --config_path config/llama_small_fast.yaml \
     --model.num_heads 20 \
     --model.num_layers 36 \
     --model.hidden_dim 1280 \
@@ -61,7 +61,7 @@ To change the frequency of saving checkpoints, you can use the following command
 
 ```
 python src/levanter/main/train_lm.py \
-    --config_path config/gpt2_small.yaml \
+    --config_path config/llama_small_fast.yaml \
     --trainer.checkpointer.base_path checkpoints/gpt2/ \
     --trainer.checkpointer.save_interval 20m
 ```
@@ -83,7 +83,7 @@ To change how often the model is evaluated during training, you can use the foll
 
 ```
 python src/levanter/main/train_lm.py \
-    --config_path config/gpt2_small.yaml \
+    --config_path config/llama_small_fast.yaml \
     --trainer.steps_per_eval 500
 ```
 
@@ -95,7 +95,7 @@ To set explicit number of examples to process on each device during training and
 
 ```
 python src/levanter/main/train_lm.py \
-    --config_path config/gpt2_small.yaml \
+    --config_path config/llama_small_fast.yaml \
     --trainer.batch_size 256 \
     --trainer.per_device_parallelism 64 \
     --trainer.eval_per_device_parallelism 64
@@ -115,7 +115,7 @@ Suppose you want to set more control on your WandB logging, you can use the foll
 
 ```
 python src/levanter/main/train_lm.py \
-    --config_path config/gpt2_small.yaml \
+    --config_path config/llama_small_fast.yaml \
     --trainer.wandb.project my_project \
     --trainer.wandb.name my_run \
     --trainer.wandb.group my_new_exp_group
@@ -125,13 +125,46 @@ This will overwrite the default WandB configuration from the `TrainerConfig` in 
 We pass all these arguments to the `wandb.init()` function at the same verbatim.
 For more information on the WandB configuration, please refer to the [WandB documentation](https://docs.wandb.ai/ref/python/init).
 
+#### Automated Wandb Workspace Setup
+Levanter logs many metrics, and the default WandB workspace layout can sometimes be unhelpful for navigating them. We provide a script to automatically configure a WandB workspace with a preferred layout, including specific plots and grouping settings.
+
+To run the script:
+- Script location: `scripts/setup_wandb_workspace.py`
+- Command-line arguments:
+    - `--entity` (optional): Your WandB entity (username or team name). If not provided, it defaults to the current logged-in WandB user's default entity.
+    - `--project` (optional): The WandB project name for your Levanter runs. Defaults to `"levanter"` if not provided.
+    - `--workspace` (optional): The desired name for the workspace. Defaults to `"levanter-default"` if not provided.
+    - `--base_url` (optional): If you are using a self-hosted WandB instance, specify its base URL here.
+- Example commands:
+  ```bash
+  # Example: Setup a workspace with default project ("levanter") and workspace name ("levanter-default")
+  # using your default WandB entity.
+  python scripts/setup_wandb_workspace.py
+
+  # Example: Setup a specific workspace in a specific project, using your default entity.
+  python scripts/setup_wandb_workspace.py --project my-levanter-experiments --workspace my-custom-view
+
+  # Example: Full specification (e.g., for a different entity or self-hosted instance).
+  python scripts/setup_wandb_workspace.py --entity <your-wandb-entity> --project <your-wandb-project> --workspace <your-desired-workspace-name> --base_url <your-wandb-instance-url>
+  ```
+
+The script applies the following configuration:
+- Sets run grouping to `group_by_prefix="first"`.
+- Creates a "main" section with the following plots:
+    - `log(train/loss)` vs `log(tokens)`
+    - `log(train/loss)` vs `log(steps)`
+    - `log(eval/bpb)` vs `log(tokens)`
+    - A bar chart for `max(throughput/mfu)` (titled "Max MFU").
+
+The script will update the workspace if it already exists or create it if it doesn't.
+
 ### Resume Training Runs
 When you resume a training run, you may like to restart from a previously saved checking and resume the corresponding WandB run, as well.
 To do so, you can use the following command. The `trainer.wandb.resume true` is optional, but will make WandB error out if the run ID does not exist.
 
 ```
 python src/levanter/main/train_lm.py \
-    --config_path config/gpt2_small.yaml \
+    --config_path config/llama_small_fast.yaml \
     --trainer.wandb.resume true \
     --trainer.id asdf1234
 ```

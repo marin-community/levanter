@@ -1,5 +1,10 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
+import contextlib
 import dataclasses
 import tempfile
+import uuid
 from typing import Optional, cast
 
 import equinox
@@ -22,7 +27,7 @@ from levanter.models.gpt2 import Gpt2Config, Gpt2LMHeadModel
 from levanter.models.lm_model import LmExample, LmHeadModel, compute_next_token_loss
 from levanter.optim import AdamConfig
 from levanter.utils.tree_utils import inference_mode
-from test_utils import arrays_only, skip_if_no_torch
+from test_utils import arrays_only, skip_if_no_torch, maybe_mesh
 
 
 @skip_if_no_torch
@@ -195,10 +200,10 @@ def test_hf_save_to_fs_spec():
     converter = HFCheckpointConverter(Gpt2Config, "gpt2", HfGpt2Config, ignore_prefix="transformer")
     simple_model = Gpt2LMHeadModel.init(converter.Vocab, config, key=PRNGKey(0))
 
-    converter.save_pretrained(simple_model, "memory://model")
+    with maybe_mesh():
+        converter.save_pretrained(simple_model, "memory://model")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-
         # now copy the model to tmp because loading from memory doesn't work
         fs: AbstractFileSystem = fsspec.filesystem("memory")
         fs.get("model/", f"{tmpdir}/test", recursive=True)
@@ -213,6 +218,46 @@ def test_hf_save_to_fs_spec():
         for key, simple_p in simple_dict.items():
             loaded_p = loaded_dict[key]
             assert onp.allclose(simple_p, loaded_p), f"{key}: {onp.linalg.norm(simple_p - loaded_p, ord=onp.inf)}"
+
+
+def test_hf_save_to_gcs_roundtrip():
+    pytest.importorskip("gcsfs")
+
+    config = Gpt2Config(hidden_dim=32, num_heads=2, num_layers=2)
+    converter = HFCheckpointConverter(Gpt2Config, "gpt2", HfGpt2Config, ignore_prefix="transformer")
+    simple_model = Gpt2LMHeadModel.init(converter.Vocab, config, key=PRNGKey(0))
+
+    prefix = "gs://levanter-data/unit-test-data/models"
+    unique_path = f"{prefix.rstrip('/')}/roundtrip-{uuid.uuid4().hex}"
+
+    try:
+        fs, remote_path = fsspec.core.url_to_fs(unique_path)
+    except Exception as exc:
+        pytest.skip(f"GCS filesystem unavailable: {exc}")
+
+    try:
+        fs.mkdirs(remote_path, exist_ok=True)
+    except Exception as exc:
+        pytest.skip(f"GCS unavailable: {exc}")
+
+    try:
+        with maybe_mesh():
+            converter.save_pretrained(simple_model, unique_path)
+            loaded_model = converter.load_pretrained(Gpt2LMHeadModel, ref=unique_path)
+
+        simple_dict = hax.state_dict.to_torch_compatible_state_dict(simple_model)
+        loaded_dict = hax.state_dict.to_torch_compatible_state_dict(loaded_model)
+
+        assert simple_dict.keys() == loaded_dict.keys()
+
+        for key, simple_param in simple_dict.items():
+            loaded_param = loaded_dict[key]
+            assert onp.allclose(
+                simple_param, loaded_param
+            ), f"{key}: {onp.linalg.norm(simple_param - loaded_param, ord=onp.inf)}"
+    finally:
+        with contextlib.suppress(Exception):
+            fs.rm(remote_path, recursive=True)
 
 
 # TODO: would be nice to have a test that tests hf upload?

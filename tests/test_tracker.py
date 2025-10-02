@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 # NOTE: Do not explicitly import wandb/other trackers here, as this will cause the tests to trivially pass.
 import dataclasses
 from typing import Tuple
@@ -69,7 +72,7 @@ def test_get_tracker_by_name():
 
     from levanter.tracker import NoopTracker
 
-    wandb1 = wandb_config(mode="disabled").init(None)
+    wandb1 = wandb_config(mode="offline").init(None)
     tracker = CompositeTracker([wandb1, NoopTracker()])
 
     with tracker:

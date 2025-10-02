@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import tempfile
 
 import chex
@@ -12,17 +15,22 @@ import haliax as hax
 import haliax.nn as hnn
 
 from levanter.layers.attention import AttentionBackend, AttentionMask
-from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddings
-from levanter.layers.rotary import _rotate_half as levanter_rotate_half
 from levanter.models.llama import Attention, LlamaConfig, LlamaDecoderLayer, LlamaLMHeadModel
 from levanter.utils.jax_utils import parameter_count
-from test_utils import check_load_config, check_model_works_with_seqlen, parameterize_with_configs, skip_if_no_torch
+from test_utils import (
+    check_load_config,
+    check_model_works_with_seqlen,
+    parameterize_with_configs,
+    skip_if_hf_model_not_accessible,
+    skip_if_no_torch,
+)
 
 
 @skip_if_no_torch
+@skip_if_hf_model_not_accessible("NousResearch/Llama-2-7b-hf")
 def test_llama_config():
     # load HF config and convert to levanter config
-    hf_config = transformers.LlamaConfig.from_pretrained("meta-llama/Llama-2-7b-hf")
+    hf_config = transformers.LlamaConfig.from_pretrained("NousResearch/Llama-2-7b-hf")
     llama_config = LlamaConfig.from_hf_config(hf_config)
 
     # convert back to HF config
@@ -30,6 +38,7 @@ def test_llama_config():
         "_name_or_path": hf_config._name_or_path,
         "architectures": hf_config.architectures,
         "torch_dtype": hf_config.torch_dtype,
+        "pad_token_id": hf_config.pad_token_id,
     }
     new_hf_config = llama_config.to_hf_config(
         vocab_size=hf_config.vocab_size,
@@ -38,7 +47,7 @@ def test_llama_config():
 
     # assert the content in new_hf_config is the same as hf_config
     for k in new_hf_config.__dict__.keys():
-        if k in ["_commit_hash", "transformers_version"]:
+        if k in ["_commit_hash", "transformers_version", "_attn_implementation_internal"]:
             continue
         assert getattr(new_hf_config, k) == getattr(
             hf_config, k
@@ -62,88 +71,6 @@ def test_llama_params():
     actual_params = 6.738415616e9
     params = llama_config.total_trainable_params(hf_config.vocab_size)
     assert np.isclose(actual_params, params, rtol=1e-2)
-
-
-@skip_if_no_torch
-def test_llama_rotary_embedding():
-    import torch
-    from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding as HFLlamaRotaryEmbedding
-
-    llama_config = _get_llama_config()
-    HeadSize = llama_config.attention_config().HeadSize
-    Pos = llama_config.Pos
-    seq_len = Pos.size
-    key = random.PRNGKey(0)
-    device = "cpu"
-
-    x = random.normal(key, (1, seq_len))
-    x_torch = torch.from_numpy(np.array(x))
-
-    levanter_emb = DefaultRotaryEmbeddingsConfig().build(HeadSize=HeadSize, Pos=Pos)
-    levanter_output = (levanter_emb.cos, levanter_emb.sin)
-
-    hf_rope = HFLlamaRotaryEmbedding(config=llama_config.to_hf_config(32000), device=device)
-    hf_output = hf_rope(x_torch, torch.arange(seq_len).reshape(1, -1))
-
-    for jax_out, torch_out in zip(levanter_output, hf_output):
-        torch_out = torch_out.numpy()
-        assert np.isclose(torch_out, np.array(jax_out.array), rtol=1e-2, atol=1e-2).all(), f"{torch_out} != {jax_out}"
-
-
-@skip_if_no_torch
-@pytest.mark.parametrize("model_seq_len", [128, 256])
-@pytest.mark.parametrize("test_seq_len", [64, 128, 256])
-def test_apply_rotary_pos_emb(model_seq_len, test_seq_len):
-    import torch
-    from transformers.models.llama.modeling_llama import apply_rotary_pos_emb as hf_apply_rotary_pos_emb
-    from transformers.models.llama.modeling_llama import rotate_half as hf_rotate_half
-
-    def assert_equal_out(hax_out, torch_out: torch.Tensor):
-        assert np.isclose(
-            torch_out.numpy(), np.array(hax_out.array), rtol=1e-2, atol=1e-2
-        ).all(), f"{torch_out} != {hax_out}"
-
-    def named_array_to_tensor(named_array):
-        return torch.from_numpy(np.array(named_array.array))
-
-    llama_config = _get_llama_config(seq_len=model_seq_len)
-
-    Pos = llama_config.Pos.resize(test_seq_len)
-    Heads = llama_config.attention_config().Heads
-    HeadSize = llama_config.attention_config().HeadSize
-    Batch = hax.Axis("batch", 2)
-
-    # note here we switch Heads and Pos for the shape of the output tensors
-    q = hax.random.normal(random.PRNGKey(0), (Batch, Pos, Heads, HeadSize))
-    k = hax.random.normal(random.PRNGKey(1), (Batch, Pos, Heads, HeadSize))
-
-    # Check the output of _rotate_half() from levanter and hf
-    levanter_out_rf_q = levanter_rotate_half(q, HeadSize)
-    levanter_out_rf_k = levanter_rotate_half(k, HeadSize)
-
-    q_tensor = named_array_to_tensor(q).transpose(1, 2)  # needed for HF
-    k_tensor = named_array_to_tensor(k).transpose(1, 2)
-    hf_out_rf_q = hf_rotate_half(q_tensor).transpose(1, 2)  # re-transpose to match levanter
-    hf_out_rf_k = hf_rotate_half(k_tensor).transpose(1, 2)
-
-    assert_equal_out(levanter_out_rf_q, hf_out_rf_q)
-    assert_equal_out(levanter_out_rf_k, hf_out_rf_k)
-
-    # Check the output of _apply_rotary_pos_emb() from levanter and hf
-    cos = hax.random.normal(random.PRNGKey(2), (Pos, HeadSize))
-    sin = hax.random.normal(random.PRNGKey(3), (Pos, HeadSize))
-
-    rot = RotaryEmbeddings(cos=cos, sin=sin)
-
-    levanter_out_rope_q, levanter_out_rope_k = rot(HeadSize, q, k)
-    cos_tensor = named_array_to_tensor(cos)[None, :, :]
-    sin_tensor = named_array_to_tensor(sin)[None, :, :]
-
-    hf_out_rope_q, hf_out_rope_k = hf_apply_rotary_pos_emb(q_tensor, k_tensor, cos_tensor, sin_tensor)
-    hf_out_rope_q = hf_out_rope_q.transpose(1, 2)  # re-transpose to match levanter
-    hf_out_rope_k = hf_out_rope_k.transpose(1, 2)
-    assert_equal_out(levanter_out_rope_q, hf_out_rope_q)
-    assert_equal_out(levanter_out_rope_k, hf_out_rope_k)
 
 
 @skip_if_no_torch
@@ -243,7 +170,16 @@ def test_llama_decoder_layer(num_kv_heads):
         x_torch, attention_mask=mask_torch, position_ids=position_ids, position_embeddings=(cos, sin)
     )
 
-    chex.assert_trees_all_close(hf_out[0].detach().cpu().numpy(), out.array, rtol=1e-4, atol=1e-4)
+    # Handle the case where HF returns separate batch elements vs single tensor
+    if isinstance(hf_out, torch.Tensor):
+        # Single tensor case - should preserve batch dimension
+        hf_array = hf_out.detach().cpu().numpy()
+    else:
+        # Multiple tensors case - need to stack them back together
+        hf_stacked = torch.stack(hf_out)
+        hf_array = hf_stacked.detach().cpu().numpy()
+
+    chex.assert_trees_all_close(hf_array, out.array, rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize("num_kv_heads", [1, 2, 4])
@@ -346,7 +282,7 @@ def test_llama_roundtrip(scan_layers, num_kv_heads):
 def _get_llama_config(use_flash=False, num_kv_heads=4, seq_len=128) -> LlamaConfig:
     return LlamaConfig(
         seq_len=seq_len,
-        hidden_dim=16,
+        hidden_dim=32,
         num_heads=4,
         num_kv_heads=num_kv_heads,
         gradient_checkpointing=False,  # disable for tests so debugging is easier

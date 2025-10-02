@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 from dataclasses import dataclass
 
 import jax
@@ -9,7 +12,7 @@ import levanter.tracker
 
 
 @register_dataclass
-@dataclass
+@dataclass(frozen=True)
 class ClipUpdateNormState:
     """State for the ClipUpdateNorm gradient transformation."""
 
@@ -19,7 +22,7 @@ class ClipUpdateNormState:
     count: jax.Array  # Number of valid entries currently in the buffer (up to buffer_size)
 
 
-@dataclass
+@dataclass(frozen=True)
 class ClipUpdateNormConfig:
     """Configuration for the ClipUpdateNorm gradient transformation."""
 

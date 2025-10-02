@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import atexit
 import itertools
 import logging
@@ -39,7 +42,7 @@ class LevanterSlurmCluster(clusters.SlurmCluster):
 
     # this is mostly copy paste, but it looks at range of different env variables that slurm sometimes sets
     @classmethod
-    def get_coordinator_address(cls) -> str:
+    def get_coordinator_address(cls, timeout_secs: int | None = None) -> str:
         # Pick port in ephemeral range [(65535 - 2^12 + 1), 65535]
         id = os.environ[_JOBID_PARAM]
         port = _choose_port(id)
@@ -67,6 +70,22 @@ class LevanterSlurmCluster(clusters.SlurmCluster):
     @classmethod
     def _node_list(cls):
         return next((os.environ[o] for o in _NODE_LIST_CHOICES if o in os.environ), None)
+
+    @classmethod
+    def get_process_count(cls) -> int:  # type: ignore[override]
+        if _PROCESS_COUNT in os.environ:
+            return int(os.environ[_PROCESS_COUNT])
+
+        if cls.is_env_present():
+            num_nodes = next(
+                (os.environ[o] for o in ["SLURM_JOB_NUM_NODES", _NUM_NODES, "SLURM_NNODES"] if o in os.environ),
+                None,
+            )
+            if num_nodes == "1":
+                logger.info("%s not set; assuming single-process job", _PROCESS_COUNT)
+                return 1
+
+        return super().get_process_count()
 
     @classmethod
     def get_local_device_ids_for_process(cls) -> Optional[List[int]]:
@@ -121,6 +140,10 @@ class LevanterSlurmCluster(clusters.SlurmCluster):
         # So we have to do some parsing to figure out how many tasks are on each node
         # and then figure out which node we are on
         # first replace the repeated values with the number of times they are repeated
+        if _TASKS_PER_NODE not in os.environ:
+            logger.warning("%s not set in environment, assuming a single task per node", _TASKS_PER_NODE)
+            return 1
+
         unrolled_tasks_per_node = []
         multi_match = re.compile(r"(\d+)\(x(\d+)\)")
         for x in os.environ[_TASKS_PER_NODE].split(","):
@@ -295,6 +318,7 @@ class DistributedConfig:
     num_processes: Optional[int] = None
     process_id: Optional[int] = None
     local_device_ids: Optional[Union[int, List[int]]] = None
+    initialize_jax_distributed: bool = True
 
     def _is_distributed(self):
         if (
@@ -313,6 +337,10 @@ class DistributedConfig:
         return False
 
     def initialize(self):
+        if not self.initialize_jax_distributed:
+            logger.info("Skipping jax.distributed.initialize because initialize_jax_distributed=False.")
+            return
+
         if self._is_distributed():
             device_ids = self.local_device_ids
             coordinator_address = self.coordinator_address
@@ -322,10 +350,21 @@ class DistributedConfig:
                     device_ids = LevanterSlurmCluster.get_local_device_ids_for_process()
 
                 if coordinator_address is None:
-                    coordinator_address = LevanterSlurmCluster.get_coordinator_address()
+                    coordinator_address = LevanterSlurmCluster.get_coordinator_address(300.0)
+
+                if self.num_processes is None:
+                    self_num_processes = LevanterSlurmCluster.get_process_count()
+                else:
+                    self_num_processes = self.num_processes
+            else:
+                self_num_processes = self.num_processes
 
             jax.distributed.initialize(
-                coordinator_address, self.num_processes, self.process_id, device_ids, initialization_timeout=30 * 60
+                coordinator_address,
+                self_num_processes,
+                self.process_id,
+                device_ids,
+                initialization_timeout=30 * 60,
             )
             logger.info(
                 f"Initialized jax.distributed with {jax.device_count()} devices, {jax.process_count()} processes,"
@@ -339,7 +378,7 @@ class DistributedConfig:
             )
 
 
-@dataclass
+@dataclass(frozen=True)
 class RayConfig:
     address: Optional[str] = None
     start_workers: bool = True

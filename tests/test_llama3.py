@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import tempfile
 
@@ -127,25 +130,35 @@ def test_llama3_roundtrip(test_seq_len):
 def test_llama3_rotary_embedding():
     import torch
     from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding as HFLlamaRotaryEmbedding
+    from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
     llama_config = get_config()
-    key = random.PRNGKey(0)
     device = "cpu"
 
     lev_config = LlamaConfig.from_hf_config(llama_config)
-    HeadSize = lev_config.attention_config().HeadSize
+
     Pos = lev_config.Pos
+    Heads = lev_config.attention_config().Heads
+    HeadSize = lev_config.attention_config().HeadSize
+    Batch = hax.Axis("batch", 3)
+
     seq_len = Pos.size
 
-    x = random.normal(key, (1, seq_len))
-    x_torch = torch.from_numpy(np.array(x))
+    # note here we switch Heads and Pos for the shape of the output tensors
+    q = hax.random.normal(random.PRNGKey(0), (Batch, Pos, Heads, HeadSize))
+    q_torch = torch.from_numpy(np.array(q.array)).to(torch.float32).transpose(1, 2)
 
-    levanter_emb = lev_config.rope.build(HeadSize, Pos)
-    levanter_output = (levanter_emb.cos, levanter_emb.sin)
-
+    rope = lev_config.rope.build(HeadSize)
     hf_rope = HFLlamaRotaryEmbedding(config=llama_config, device=device)
-    hf_output = hf_rope(x_torch, torch.arange(seq_len).reshape(1, -1))
 
-    for jax_out, torch_out in zip(levanter_output, hf_output):
-        torch_out = torch_out.numpy()
-        assert np.isclose(torch_out, np.array(jax_out.array), rtol=1e-4, atol=1e-4).all(), f"{torch_out} != {jax_out}"
+    position_ids = hax.arange(Pos)
+    lev_rot_q = rope(q, position_ids)
+
+    hf_cos, hf_sin = hf_rope(q_torch, torch.arange(seq_len).reshape(1, -1))
+
+    hf_rot_q, hf_rot_k = apply_rotary_pos_emb(q_torch, q_torch, hf_cos, hf_sin)
+
+    hf_rot_q = hf_rot_q.transpose(1, 2).numpy()  # re-transpose to match levanter
+
+    assert hf_rot_q.shape == lev_rot_q.array.shape, f"{hf_rot_q.shape} != {lev_rot_q.shape}"
+    np.testing.assert_allclose(hf_rot_q, lev_rot_q.array, rtol=1e-5, atol=1e-5)

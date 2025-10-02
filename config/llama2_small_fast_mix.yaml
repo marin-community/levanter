@@ -1,5 +1,5 @@
 data:
-  tokenizer: "meta-llama/Llama-2-7b-hf"
+  tokenizer: "NousResearch/Llama-2-7b-hf"
   cache_dir: "gs://levanter-data/new-tokenized/pile_mix/"
   shuffle: 10000
   configs:

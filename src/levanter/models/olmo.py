@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Type, Union
@@ -17,7 +20,7 @@ from haliax.state_dict import ModuleWithStateDictSerialization
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, HFCompatConfig
 from levanter.layers import RmsNormConfig
 from levanter.layers.attention import AttentionBackend, AttentionConfig, AttentionMask, dot_product_attention
-from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
+from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddings, RotaryEmbeddingsConfig
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.utils.activation import ActivationFunctionEnum
 from levanter.utils.flop_utils import lm_flops_per_token
@@ -154,6 +157,7 @@ class Olmo2Config(HFCompatConfig):
             rope_scaling=rope_scaling,
             vocab_size=vocab_size,
             pad_token_id=None,
+            _attn_implementation="eager",
             **config_overrides,
         )
 
@@ -287,6 +291,7 @@ class Olmo2Attention(ModuleWithStateDictSerialization, eqx.Module):
     o_proj: hnn.Linear  # projection from Heads to output
     q_norm: hnn.RmsNorm  # normalization for query
     k_norm: hnn.RmsNorm  # normalization for key
+    rot_embs: Optional[RotaryEmbeddings] = eqx.field(default=None)
 
     @staticmethod
     def init(config: Olmo2Config, *, key) -> "Olmo2Attention":
@@ -308,10 +313,15 @@ class Olmo2Attention(ModuleWithStateDictSerialization, eqx.Module):
         q_norm = config.mk_LayerNorm((config.KVHeads, QHeadsPerGroup, HeadSize))
         k_norm = config.mk_LayerNorm((config.KVHeads, HeadSize))
 
-        return Olmo2Attention(config, q_proj, k_proj, v_proj, o_proj, q_norm, k_norm)
+        # Build rotary embeddings once during initialization if configured
+        rot_embs = config.rope.build(config.HeadSize) if config.rope is not None else None
+
+        return Olmo2Attention(config, q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rot_embs)
 
     @named_call
-    def __call__(self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None) -> NamedArray:
+    def __call__(
+        self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None, pos_ids: NamedArray | None = None
+    ) -> NamedArray:
         key_q, key_k, key_v, key_o = maybe_rng_split(key, 4)
 
         # OLMo2 project for q and k and then normalizes
@@ -330,9 +340,12 @@ class Olmo2Attention(ModuleWithStateDictSerialization, eqx.Module):
         k = k.rearrange((..., "kv_heads", "position", "head_size"))
         v = v.rearrange((..., "kv_heads", "position", "head_size"))
 
-        # Apply rotary position embeddings
-        rot_embs = self.config.rope.build(self.config.HeadSize, q.resolve_axis("position"))
-        q, k = rot_embs(self.config.HeadSize, q, k)
+        # Apply rotary position embeddings if configured
+        if self.rot_embs is not None:
+            if pos_ids is None:
+                pos_ids = hax.arange(x.resolve_axis("position"))
+            q = self.rot_embs(q, pos_ids)
+            k = self.rot_embs(k, pos_ids)
 
         # Rename position axis for attention
         k = k.rename({"position": "key_position"})
@@ -391,11 +404,13 @@ class Olmo2DecoderLayer(ModuleWithStateDictSerialization, eqx.Module):
         return Olmo2DecoderLayer(config, attn, mlp, post_attention_ln, post_feedforward_ln)
 
     @named_call
-    def __call__(self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None) -> NamedArray:
+    def __call__(
+        self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None, pos_ids: NamedArray | None = None
+    ) -> NamedArray:
         k_attn, k_mlp = maybe_rng_split(key, 2)
 
         # Self attention with norm before residual
-        attn_output = self.self_attn(x=x, mask=mask, key=k_attn)
+        attn_output = self.self_attn(x=x, mask=mask, key=k_attn, pos_ids=pos_ids)
         attn_output = self.post_attention_layernorm(attn_output)
         h = x + attn_output
 
@@ -429,9 +444,11 @@ class Olmo2Transformer(ModuleWithStateDictSerialization, eqx.Module):
         return Olmo2Transformer(config, layers, ln_f)
 
     @named_call
-    def __call__(self, x: NamedArray, attn_mask: Optional[NamedArray | AttentionMask], *, key) -> NamedArray:
+    def __call__(
+        self, x: NamedArray, attn_mask: Optional[NamedArray | AttentionMask], *, key, pos_ids: NamedArray | None = None
+    ) -> NamedArray:
         keys = maybe_rng_split(key, self.config.num_layers) if key is not None else None
-        x = self.layers.fold(x, mask=attn_mask, key=keys)
+        x = self.layers.fold(x, mask=attn_mask, key=keys, pos_ids=pos_ids)
         x = self.norm(x)
         return x
 
@@ -503,6 +520,7 @@ class Olmo2LMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Olmo2Config
         self,
         input_ids: NamedArray,
         attn_mask: Optional[Union[NamedArray, AttentionMask]] = None,
+        pos_ids: NamedArray | None = None,
         *,
         key=None,
     ) -> NamedArray:
@@ -519,7 +537,7 @@ class Olmo2LMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Olmo2Config
         x = self.embeddings.embed(input_ids)
 
         # Pass through transformer
-        x = self.transformer(x, attn_mask=attn_mask, key=k_t)
+        x = self.transformer(x, attn_mask=attn_mask, key=k_t, pos_ids=pos_ids)
 
         # Apply language modeling head
         if self.lm_head is not None:
@@ -530,7 +548,12 @@ class Olmo2LMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Olmo2Config
         return lm_logits
 
     def activations(
-        self, input_ids: NamedArray, attn_mask: Optional[AttentionMask | NamedArray] = None, *, key=None
+        self,
+        input_ids: NamedArray,
+        attn_mask: Optional[AttentionMask | NamedArray] = None,
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
     ) -> NamedArray:
         """
         Compute the activations for the next token in a sequence.
@@ -546,7 +569,7 @@ class Olmo2LMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[Olmo2Config
         x = self.embeddings.embed(input_ids)
 
         # Pass through transformer
-        x = self.transformer(x, attn_mask=attn_mask, key=key)
+        x = self.transformer(x, attn_mask=attn_mask, key=key, pos_ids=pos_ids)
 
         return x
 

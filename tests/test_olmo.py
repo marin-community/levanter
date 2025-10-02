@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import tempfile
 
 import chex
@@ -181,7 +184,14 @@ def test_olmo2_decoder_layer_vs_hf(num_kv_heads):
         x_torch, attention_mask=mask_torch, position_ids=position_ids, position_embeddings=(cos, sin)
     )
 
-    chex.assert_trees_all_close(hf_out[0].detach().cpu().numpy(), out.array, rtol=1e-5, atol=1e-5)
+    # Handle the case where HF returns separate batch elements vs single tensor
+    if isinstance(hf_out, torch.Tensor):
+        hf_array = hf_out.detach().cpu().numpy()
+    else:
+        hf_stacked = torch.stack(hf_out)
+        hf_array = hf_stacked.detach().cpu().numpy()
+
+    chex.assert_trees_all_close(hf_array, out.array, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("use_flash", [True, False])

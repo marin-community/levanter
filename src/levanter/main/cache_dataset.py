@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import logging
 import os
 from dataclasses import dataclass, field
@@ -14,7 +17,7 @@ from levanter.utils.logging import init_logging
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True)
 class RayCachedLMDatasetConfig(SingleDatasetLMConfigBase, RayConfig):
     tracker: TrackerConfig = field(default_factory=NoopConfig)
 

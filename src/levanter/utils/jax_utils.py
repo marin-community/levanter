@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import functools
 import json
@@ -6,11 +9,12 @@ from dataclasses import fields
 from typing import Any, Callable, Optional, TypeVar
 
 import equinox as eqx
+import haliax.partitioning
 import jax
 import numpy as np
 from jax import numpy as jnp
 from jax.experimental import mesh_utils
-from jax.sharding import Mesh, NamedSharding, PartitionSpec, PositionalSharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jaxtyping import PRNGKeyArray, PyTree
 
 import haliax as hax
@@ -48,10 +52,8 @@ def use_cpu_device():
 def local_cpu_mesh():
     """Temporarily sets the default device to CPU and creates a mesh with a single CPU device"""
     cpu = jax.local_devices(backend="cpu")[0]
-    mesh = jax.sharding.Mesh(
-        np.array([cpu]).reshape(1, 1, 1), (ResourceAxis.REPLICA, ResourceAxis.DATA, ResourceAxis.MODEL)
-    )
-    with use_cpu_device(), mesh:
+    mesh = jax.make_mesh((1, 1, 1), (ResourceAxis.REPLICA, ResourceAxis.DATA, ResourceAxis.MODEL), devices=[cpu])
+    with use_cpu_device(), haliax.partitioning.set_mesh(mesh):
         yield mesh
 
 
@@ -136,7 +138,7 @@ def barrier_sync(timeout: float = 200):
 def _isnamedtupleinstance(x):
     t = type(x)
     b = t.__bases__
-    if len(b) != 1 or b[0] != tuple:
+    if len(b) != 1 or b[0] is not tuple:
         return False
     f = getattr(t, "_fields", None)
     if not isinstance(f, tuple):
@@ -281,7 +283,7 @@ def best_effort_sharding(shape, *, devices=None, mesh=None):
 
     if mesh is None:
         mesh = hax.partitioning._get_mesh()
-        if mesh.devices.shape == ():
+        if mesh is not None and mesh.devices.shape == ():
             mesh = None
 
     if mesh is None:
@@ -296,8 +298,11 @@ def best_effort_sharding(shape, *, devices=None, mesh=None):
             gcd = np.gcd(shape_i, num_devices)
             num_devices //= gcd
             device_shape = (num_devices, gcd) + device_shape[1:]
-        sharding = PositionalSharding(devices).reshape(list(device_shape))
-        sharding = sharding.replicate(axis=0, keepdims=False)
+
+        device_mesh = np.array(devices).reshape(list(device_shape))
+        axis_names = [f"d{i}" for i in range(len(shape))]
+        mesh = Mesh(device_mesh, ["b"] + axis_names)
+        sharding = NamedSharding(mesh, PartitionSpec(*axis_names))
         return sharding
     else:
         # get the existing mesh and find the FSDP axis

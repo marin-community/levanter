@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import concurrent.futures
 import getpass
 import json
@@ -146,14 +149,17 @@ def start_tpu_vm_queued_resources(tpu_name, *, tpu_type, capacity_type, version,
         f"--zone={zone}",
         "--quiet",
     ]
+
     if version is not None:
         command.append(f"--runtime-version={version}")
-    if capacity_type in ["preemptible", "best-effort"]:
+    if capacity_type in ["best-effort", "preemptible"]:
         command.append("--best-effort")
+        command.extend(["--provisioning-model", "spot"])
     elif capacity_type == "reserved":
         command.append("--reserved")
     elif capacity_type == "spot":
         command.append("--spot")
+        command.append(["--provisioning-model", "spot"])
     elif capacity_type == "on-demand" or capacity_type is None:
         pass
     else:
@@ -240,9 +246,11 @@ def add_ssh_key(ssh_key_filename):
         )
         for key in existing_keys:
             if key_hash in key:
+                print("Existing key found in keychain, skipping ssh-add")
                 return
 
-            subprocess.check_call(["ssh-add", ssh_key_filename])
+        print("SSH key not in key-chain, adding.")
+        subprocess.check_call(["ssh-add", ssh_key_filename])
     except subprocess.CalledProcessError:
         raise
 

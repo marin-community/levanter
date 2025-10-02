@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Type, Union
@@ -14,15 +17,15 @@ from haliax.nn.scan import ScanCheckpointPolicy, Stacked
 from haliax.state_dict import ModuleWithStateDictSerialization
 
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, HFCompatConfig
+from levanter.inference.page_table import PageBatchInfo, PageTable
 from levanter.layers import LayerNormConfigBase, RmsNormConfig
-from levanter.layers.attention import Attention, AttentionBackend, AttentionConfig, AttentionMask
+from levanter.layers.attention import Attention, AttentionBackend, AttentionConfig, AttentionMask, KvPageCache
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.utils.activation import ActivationFunctionEnum
 from levanter.utils.flop_utils import lm_flops_per_token
 from levanter.utils.logging import silence_transformer_nag
 from levanter.utils.types import BlockFoldable
-
 
 silence_transformer_nag()
 from transformers import LlamaConfig as HfLlamaConfig  # noqa: E402
@@ -74,7 +77,7 @@ class LlamaConfig(HFCompatConfig):
     use_layer_norm_weight: bool = True
     rope: RotaryEmbeddingsConfig = dataclasses.field(default_factory=DefaultRotaryEmbeddingsConfig)
 
-    reference_checkpoint: str = "meta-llama/Llama-2-7b-hf"
+    reference_checkpoint: str = "NousResearch/Llama-2-7b-hf"
     tokenizer: Optional[str] = None
 
     # Axis
@@ -89,9 +92,7 @@ class LlamaConfig(HFCompatConfig):
             self.num_heads % self.num_kv_heads == 0
         ), f"num_heads={self.num_heads} not divisible by num_kv_heads={self.num_kv_heads}."
 
-    def hf_checkpoint_converter(
-        self, ref_checkpoint: Optional[str] = None
-    ) -> HFCheckpointConverter["LlamaConfig"]:  # type: ignore
+    def hf_checkpoint_converter(self, ref_checkpoint: Optional[str] = None) -> HFCheckpointConverter["LlamaConfig"]:  # type: ignore
         return HFCheckpointConverter(
             self.__class__,
             reference_checkpoint=self.reference_checkpoint if ref_checkpoint is None else ref_checkpoint,
@@ -103,7 +104,7 @@ class LlamaConfig(HFCompatConfig):
     @classmethod
     def from_hf_config(cls, hf_config: HfConfig):
         rope_theta = hf_config.rope_theta
-        rope_config = RotaryEmbeddingsConfig.from_hf_config(rope_theta, hf_config.rope_scaling)
+        rope_config = RotaryEmbeddingsConfig.from_hf_config(rope_theta, getattr(hf_config, "rope_scaling", None))
         return LlamaConfig(
             seq_len=hf_config.max_position_embeddings,
             hidden_dim=hf_config.hidden_size,
@@ -142,7 +143,11 @@ class LlamaConfig(HFCompatConfig):
         if config_overrides is None:
             config_overrides = {}
 
-        rope_theta, rope_scaling = self.rope.to_hf_config()
+        if self.rope:
+            rope_theta, rope_scaling = self.rope.to_hf_config()
+        else:
+            rope_theta = None
+            rope_scaling = None
 
         return HfLlamaConfig(
             max_position_embeddings=self.seq_len,
@@ -158,6 +163,9 @@ class LlamaConfig(HFCompatConfig):
             vocab_size=vocab_size,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
+            attention_bias=self.use_bias,
+            mlp_bias=self.use_bias,
+            _attn_implementation="eager",
             **config_overrides,
         )
 
@@ -191,7 +199,7 @@ class LlamaConfig(HFCompatConfig):
     def total_trainable_params(self, vocab_size):
         token_embedding = vocab_size * self.hidden_dim
 
-        head_size = self.hidden_dim // self.num_heads
+        head_size = self.actual_head_size
         q_proj = self.hidden_dim * head_size * self.num_heads
         kv_proj = 2 * self.hidden_dim * head_size * self.num_kv_heads
         o_proj = head_size * self.num_heads * self.hidden_dim
@@ -207,7 +215,8 @@ class LlamaConfig(HFCompatConfig):
         if self.input_embedding_norm:
             transformer += self.hidden_dim
 
-        return transformer + token_embedding * 2  # plus embedding and lm head
+        lm_head = 0 if self.tie_word_embeddings else token_embedding
+        return transformer + token_embedding + lm_head
 
     def attention_config(self) -> AttentionConfig:
         """Convert this LlamaConfig to an AttentionConfig for use with Attention."""
@@ -222,6 +231,13 @@ class LlamaConfig(HFCompatConfig):
             flash_attention_block_size=self.flash_attention_block_size,
             rope=self.rope,
         )
+
+    @property
+    def actual_head_size(self):
+        """Returns the actual head size based on the head_dim or calculated from hidden_dim and num_heads."""
+        if self.head_dim is not None:
+            return self.head_dim
+        return self.hidden_dim // self.num_heads
 
 
 class LlamaMlp(eqx.Module):
@@ -296,12 +312,14 @@ class LlamaDecoderLayer(eqx.Module):
         return LlamaDecoderLayer(config, attn, mlp, ln_1, ln_2, post_attn_ln, post_mlp_ln)
 
     @named_call
-    def __call__(self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None) -> NamedArray:
+    def __call__(
+        self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None, pos_ids: NamedArray | None = None
+    ) -> NamedArray:
         k_attn, k_mlp = maybe_rng_split(key, 2)
         # self attention and skip connection
         residual = x
         x = self.input_layernorm(x)
-        attn_output = self.self_attn(x=x, mask=mask, key=k_attn)
+        attn_output = self.self_attn(x=x, mask=mask, key=k_attn, pos_ids=pos_ids)
         if self.post_attn_layernorm is not None:
             attn_output = self.post_attn_layernorm(attn_output)
         x = residual + attn_output
@@ -314,6 +332,42 @@ class LlamaDecoderLayer(eqx.Module):
             mlp_output = self.post_mlp_layernorm(mlp_output)
         output = residual + mlp_output
         return output
+
+    @named_call
+    def decode(
+        self,
+        x: NamedArray,
+        kv_cache: KvPageCache,
+        batch_info: PageBatchInfo,
+        pos_ids: NamedArray,
+        *,
+        key=None,
+    ) -> tuple[NamedArray, KvPageCache]:
+        k_attn, k_mlp = maybe_rng_split(key, 2)
+        # self attention and skip connection
+        residual = x
+        x = self.input_layernorm(x)
+        attn_output, kv_cache = self.self_attn.paged_decode(x, kv_cache, batch_info, pos_ids=pos_ids, key=k_attn)
+
+        if self.post_attn_layernorm is not None:
+            attn_output = self.post_attn_layernorm(attn_output)
+        x = residual + attn_output
+
+        # MLP and skip connection
+        residual = x
+        x = self.post_attention_layernorm(x)
+        mlp_output = self.mlp(x, key=k_mlp)
+        if self.post_mlp_layernorm is not None:
+            mlp_output = self.post_mlp_layernorm(mlp_output)
+        output = residual + mlp_output
+        return output, kv_cache
+
+    def initial_cache(self, page_table: PageTable, *, dtype) -> KvPageCache:
+        """
+        Creates an empty page cache for this layer. Note that in order to create a decoder state, you
+        need to couple the KvPageCache to the PageTable's state with a BatchInfo object.
+        """
+        return self.self_attn.empty_page_cache(page_table, dtype=dtype)
 
 
 class LlamaTransformer(eqx.Module):
@@ -338,12 +392,44 @@ class LlamaTransformer(eqx.Module):
         return LlamaTransformer(config, layers, ln_f)
 
     @named_call
-    def __call__(self, x: NamedArray, attn_mask: Optional[NamedArray | AttentionMask], *, key) -> NamedArray:
+    def __call__(
+        self, x: NamedArray, attn_mask: Optional[NamedArray | AttentionMask], *, key, pos_ids: NamedArray | None = None
+    ) -> NamedArray:
         keys = maybe_rng_split(key, self.config.num_layers) if key is not None else None
-        x = self.layers.fold(x, mask=attn_mask, key=keys)
+        x = self.layers.fold(x, mask=attn_mask, key=keys, pos_ids=pos_ids)
         x = self.norm(x)
 
         return x
+
+    @named_call
+    def decode(
+        self,
+        kv_cache: KvPageCache,
+        x: NamedArray,
+        batch_info: PageBatchInfo,
+        pos_ids: NamedArray,
+        *,
+        key=None,
+    ) -> tuple[NamedArray, KvPageCache]:
+        keys = maybe_rng_split(key, self.config.num_layers) if key is not None else None
+
+        x, kv_cache = self.layers.scan_via(LlamaDecoderLayer.decode)(
+            x,
+            kv_cache,
+            batch_info,
+            pos_ids=pos_ids,
+            key=keys,
+        )
+        x = self.norm(x)
+
+        return x, kv_cache
+
+    def initial_cache(self, page_table: PageTable, *, dtype) -> KvPageCache:
+        """
+        Creates an empty page cache for this transformer. Note that in order to create a decoder state, you
+        need to couple the KvPageCache to the PageTable's state with a BatchInfo object.
+        """
+        return self.layers.vmap_via(LlamaDecoderLayer.initial_cache)(page_table, dtype=dtype)
 
 
 class LlamaEmbedding(ModuleWithStateDictSerialization, eqx.Module):
@@ -422,6 +508,7 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
         self,
         input_ids: NamedArray,
         attn_mask: Optional[Union[NamedArray, AttentionMask]] = None,
+        pos_ids: NamedArray | None = None,
         *,
         key=None,
     ) -> NamedArray:
@@ -432,13 +519,14 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
             attn_mask (Union[NamedArray, AttentionMask], optional): [batch, position]
                 Mask to avoid performing attention on the padding token indices of the encoder input.
                 The attn_mask from training pipeline may be an AttentionMask object instead of NamedArray
+            pos_ids: NamedArray | None = None,
 
         Returns:
             NamedArray: logits with shape {Batch, Pos, Vocab}
         """
         k_t, k_head = maybe_rng_split(key, 2)
         x = self.embeddings.embed(input_ids)
-        x = self.transformer(x, attn_mask=attn_mask, key=k_t)
+        x = self.transformer(x, attn_mask=attn_mask, key=k_t, pos_ids=pos_ids)
         if self.lm_head:
             lm_logits = self.lm_head(x, key=k_head)
         else:
@@ -446,7 +534,12 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
         return lm_logits
 
     def activations(
-        self, input_ids: NamedArray, attn_mask: Optional[AttentionMask | NamedArray] = None, *, key=None
+        self,
+        input_ids: NamedArray,
+        attn_mask: Optional[AttentionMask | NamedArray] = None,
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
     ) -> NamedArray:
         """
         Compute the activations for the next token in a sequence.
@@ -454,13 +547,14 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
             input_ids: token IDs with shape {Pos}
             attn_mask: attention mask with shape {Pos, KeyPos}
             key: PRNGKeyArray for random number generation
+            pos_ids: position IDs with shape {Pos}
 
         Returns:
             NamedArray: activations with shape {Pos, Embed}
 
         """
         x = self.embeddings.embed(input_ids)
-        x = self.transformer(x, attn_mask=attn_mask, key=key)
+        x = self.transformer(x, attn_mask=attn_mask, key=key, pos_ids=pos_ids)
 
         return x
 
@@ -483,3 +577,58 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
 
     def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
         return {"transformer": "model", "embeddings": None}
+
+    def initial_cache(self, page_table: PageTable, *, dtype) -> KvPageCache:
+        """
+        Creates an initial cache for this model. Note that in order to create a decoder state, you
+        need to couple the KvPageCache to the PageTable's state with a BatchInfo object.
+        """
+        return hax.auto_sharded(self.transformer.initial_cache(page_table, dtype=dtype))
+
+    @named_call
+    def decode(
+        self,
+        input_ids: NamedArray,  # token IDs for *this* step (shape {Pos} or {Batch, Pos})
+        kv_cache: KvPageCache,
+        batch_info: PageBatchInfo,
+        pos_ids: NamedArray,
+        *,
+        key=None,
+    ) -> tuple[NamedArray, KvPageCache]:
+        """Run one decode / pre-fill step with an existing paged-KV *state*.
+
+        Parameters
+        ----------
+        input_ids : NamedArray
+            Token IDs for the positions being decoded **this call**.
+        kv_cache : KvPageCache
+            Current paged-KV cache (one per layer). Obtain the initial value via
+            ``self.initial_cache`` and update with the returned *new_state* each step.
+        pos_ids : NamedArray
+            Absolute position IDs matching *input_ids* (negative IDs can mark padding as
+            in the lower-level API).
+        key : jax.random.PRNGKey | None
+            RNG key for dropout etc.  Can be omitted during inference.
+
+        Returns
+        -------
+        logits : NamedArray
+            Logits for the provided tokens (axes match *input_ids* + ``Vocab``).
+        new_state : KvPageCache
+            Updated cache to pass into the next decode call.
+        """
+
+        # Embed the incoming token IDs
+        x = self.embeddings.embed(input_ids)
+
+        # Propagate through the transformer with paged-KV caching
+        k_t = maybe_rng_split(key, 1)[0] if key is not None else None
+        x, new_state = self.transformer.decode(kv_cache, x, batch_info, pos_ids, key=k_t)
+
+        # Project to logits
+        if self.lm_head is not None:
+            logits = self.lm_head(x, key=None)
+        else:
+            logits = self.embeddings.unembed(x)
+
+        return logits, new_state

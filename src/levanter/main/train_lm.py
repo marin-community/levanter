@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 import functools
 import gc
@@ -22,7 +25,7 @@ from levanter.checkpoint import load_checkpoint
 from levanter.compat.hf_checkpoints import HFCompatConfig, save_hf_checkpoint_callback
 from levanter.data.text import LMMixtureDatasetConfig, SingleDatasetLMConfig, UrlSingleDatasetLMConfig
 from levanter.eval_harness import LmEvalHarnessConfig
-from levanter.models.gpt2 import Gpt2Config
+from levanter.models.llama import LlamaConfig
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, compute_next_token_loss
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.trainer import Trainer, TrainerConfig
@@ -36,7 +39,7 @@ logger = logging.getLogger(__name__)
 class TrainLmConfig:
     data: Union[SingleDatasetLMConfig, LMMixtureDatasetConfig] = field(default_factory=UrlSingleDatasetLMConfig)
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
-    model: LmConfig = field(default_factory=Gpt2Config)
+    model: LmConfig = field(default_factory=LlamaConfig)
     optimizer: OptimizerConfig = field(default_factory=AdamConfig)
 
     # config related to continued pretraining
@@ -198,7 +201,7 @@ def main(config: TrainLmConfig):
         )
         # trainer.add_hook(callbacks.GradWatchCallback(include_histograms=True), every=5)
 
-        if config.hf_save_path is not None:
+        if config.hf_save_path is not None and config.hf_save_steps is not None:
             # bit gross to reach this far into the config, but it's fine
             if config.trainer.checkpointer.append_run_id_to_base_path:
                 full_save_path = os.path.join(config.hf_save_path, trainer.run_id)
