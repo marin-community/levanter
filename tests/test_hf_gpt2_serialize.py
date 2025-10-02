@@ -242,7 +242,7 @@ def test_hf_save_to_gcs_roundtrip():
         pytest.skip(f"GCS unavailable: {exc}")
 
     try:
-        with maybe_mesh():
+        with use_test_mesh():
             converter.save_pretrained(simple_model, unique_path)
             loaded_model = converter.load_pretrained(Gpt2LMHeadModel, ref=unique_path)
 

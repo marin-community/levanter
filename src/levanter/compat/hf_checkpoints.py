@@ -5,6 +5,7 @@ import abc
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import json
 import logging
 import os
@@ -90,8 +91,10 @@ except ImportError:
         data_callback: Callable[[Any, jax.Device], Awaitable[jax.Array]],
     ):
         device_to_index_map = inp_sharding.devices_indices_map(global_shape)
+        print(device_to_index_map, global_shape)
         addressable_da = inp_sharding._addressable_device_assignment
         future_arrays = [data_callback(device_to_index_map[d], d) for d in addressable_da]
+        print([type(fa) for fa in future_arrays])
         dbs = await asyncio.gather(*future_arrays)
         return jax.make_array_from_single_device_arrays(global_shape, inp_sharding, dbs)
 
@@ -226,7 +229,7 @@ def _load_torch(path, dtype):
 
 def _load_safe_tensors(path, dtype):
     d = {}
-    with safetensors.safe_open(path, framework="jax", device="cpu") as f:
+    with safetensors.safe_open(path, framework="np", device="cpu") as f:
         keys = list(f.keys())
         for key in tqdm(keys, total=len(keys), desc="Loading weights"):
             tensor_slice = f.get_slice(key)
@@ -247,7 +250,7 @@ async def _sharded_load_tensorstore_async(path, dtype):
     ts_dict = await load_tensor_dict(path)
 
     # we want jax arrays, we use best effort sharding
-    if jax.devices() == 1:
+    if len(jax.devices()) == 1:
         # just read everything
         with ts.Batch():
             d = {}
@@ -262,20 +265,23 @@ async def _sharded_load_tensorstore_async(path, dtype):
         d = {}
         with ts.Batch():
             for k, v in ts_dict.items():
-                if len(jax.devices()) == 1:
-                    d[k] = v.read()
-                    continue
-                else:
-                    sharding = best_effort_sharding(v.shape)
-
-                    def _callback(index, _):
-                        slice_array = v[index]
-                        return slice_array.astype(dtype) if dtype is not None else slice_array
-
-                    d[k] = create_async_array_from_callback(v.shape, sharding, _callback)
+                print(k)
+                sharding = best_effort_sharding(v.shape)
+                d[k] = create_async_array_from_callback(v.shape, sharding, functools.partial(_callback, k, v, dtype))
 
         d = {k: (await v) for k, v in d.items()}
         return d
+
+
+async def _callback(k, v, dtype, index, device):
+    print(k, v.shape, index)
+    slice_array = v[index]
+    if dtype and jnp.issubdtype(slice_array.dtype.numpy_dtype, jnp.floating):
+        slice_array = slice_array.astype(dtype)
+    arr = await slice_array.read()
+    arr = jax.device_put(arr, device)
+
+    return arr
 
 
 # NB: for large models this will be jitted several times (once for each unique subset of keys at least)
@@ -621,9 +627,49 @@ class HFCheckpointConverter(Generic[LevConfig]):
 
     def _load_from_gcs(self, gcs_path: str, dtype: Optional[jnp.dtype] = None) -> dict:
         """Load a state dict from a GCS path"""
+
+        final_state_dict = {}
+
         fs: AbstractFileSystem
         fs, path = fsspec.core.url_to_fs(gcs_path)
 
+        shard_files, loader = self._locate_shard_files(fs, path)
+
+        if not shard_files:
+            raise FileNotFoundError(f"No HF-ish checkpoint files found in {gcs_path}")
+
+        for shard_file in shard_files:
+            shard_path = os.path.join(path, shard_file)
+            if not fs.exists(shard_path):
+                raise FileNotFoundError(f"Shard file {shard_path} not found")
+
+            # Download shard to temporary file
+            with tempfile.NamedTemporaryFile() as tmp:
+                fs.get(shard_path, tmp.name)
+                assert loader is not None
+                shard_state_dict = loader(tmp.name, dtype)
+
+                # compare the new _sharded_load_tensorstore_async
+                comparison = asyncio.run(_sharded_load_tensorstore_async(tmp.name, dtype))
+
+                # compare the two dicts (in jit)
+                @jax.jit
+                def tree_equal(a, b):
+                    return jax.tree_util.tree_map(jnp.array_equal, a, b)
+
+                assert jax.tree_util.tree_all(tree_equal(comparison, shard_state_dict))
+
+                final_state_dict.update(shard_state_dict)
+
+        return final_state_dict
+
+    def _locate_shard_files(self, fs: AbstractFileSystem, path) -> tuple[list[str], Callable]:
+        """
+        Locate shard files in a GCS path. Returns a list of shard files and a loader function.
+        """
+
+        shard_files = None
+        loader = None
         # First try to load sharded checkpoint
         for index_file in [SAFE_TENSORS_INDEX_NAME, PYTORCH_WEIGHTS_INDEX_NAME]:
             index_path = os.path.join(path, index_file)
@@ -632,49 +678,30 @@ class HFCheckpointConverter(Generic[LevConfig]):
                     index = json.load(f)
 
                 shard_files = list(set(index["weight_map"].values()))
-                final_state_dict = {}
 
                 if "safetensors" in index_file:
                     loader = _load_safe_tensors
                 else:
                     loader = _load_torch
 
-                for shard_file in shard_files:
-                    shard_path = os.path.join(path, shard_file)
-                    if not fs.exists(shard_path):
-                        raise FileNotFoundError(f"Shard file {shard_path} not found")
+                break
 
-                    # Download shard to temporary file
-                    with tempfile.NamedTemporaryFile() as tmp:
-                        fs.get(shard_path, tmp.name)
-                        shard_state_dict = loader(tmp.name, dtype)
-
-                        # compare the new _sharded_load_tensorstore_async
-                        comparison = asyncio.run(_sharded_load_tensorstore_async(tmp.name, dtype))
-
-                        # compare the two dicts (in jit)
-                        @jax.jit
-                        def tree_equal(a, b):
-                            return jax.tree_util.tree_map(jnp.array_equal, a, b)
-
-                        assert jax.tree_util.tree_all(tree_equal(comparison, shard_state_dict))
-
-                        final_state_dict.update(shard_state_dict)
-
-                return final_state_dict
 
         # If no index file found, try loading single file checkpoint
-        for model_file in [SAFE_TENSORS_MODEL, PYTORCH_MODEL]:
-            model_path = os.path.join(path, model_file)
-            if fs.exists(model_path):
-                with tempfile.NamedTemporaryFile() as tmp:
-                    fs.get(model_path, tmp.name)
-                    if model_file == SAFE_TENSORS_MODEL:
-                        return _load_safe_tensors(tmp.name, dtype)
-                    else:
-                        return _load_torch(tmp.name, dtype)
+        if not shard_files:
+            for model_file in [SAFE_TENSORS_MODEL, PYTORCH_MODEL]:
+                model_path = os.path.join(path, model_file)
+                if fs.exists(model_path):
+                    shard_files = [model_file]
 
-        raise FileNotFoundError(f"No checkpoint files found in {gcs_path}")
+                    if model_file == SAFE_TENSORS_MODEL:
+                        loader = _load_safe_tensors
+                    else:
+                        loader = _load_torch
+
+                    break
+
+        return shard_files, loader
 
     def load_pretrained(
         self,
@@ -708,15 +735,14 @@ class HFCheckpointConverter(Generic[LevConfig]):
 
         # we want to use a CPU if (1) we only have 1 device, or (2) the total amount of accelerator memory is less than
         # the amount of CPU memory.
-        just_use_cpu = _should_use_cpu_for_checkpoint_loading()
-        if just_use_cpu:
-            # if we only have 1 device, use CPU ram
-            contexts.enter_context(local_cpu_mesh())
+        # just_use_cpu = _should_use_cpu_for_checkpoint_loading()
+        # if just_use_cpu:
+        #     if we only have 1 device, use CPU ram
+            # contexts.enter_context(local_cpu_mesh())
 
-        with contexts:
-            # TODO: in an ideal world, we would only load the part of the array we needed, but
-            # AFAICT neither torch state dicts nor safetensors support this.
-            state_dict = self.load_state_dict(ref, dtype)
+        # TODO: in an ideal world, we would only load the part of the array we needed, but
+        # AFAICT neither torch state dicts nor safetensors support this.
+        state_dict = self.load_state_dict(ref, dtype)
 
         ignore_prefix: Optional[str] = None
         if self.ignore_prefix:
@@ -1297,8 +1323,7 @@ def _shard_hf_checkpoint(
 def _maybe_shard_best_effort(array_or_slice, dtype) -> jax.Array:
     """Shards an array to non-cpu devices if we have more than one device, otherwise just stays on cpu"""
     # We do this to not waste memory on the target device if it's not going to help us save memory/io
-    # TODO: This mostly helps with Stacked modules, which we should move away from
-    if jax.device_count() > 1:
+    if jax.device_count() > 1 or True:
         return _shard_best_effort(array_or_slice, dtype)
     else:
         with use_cpu_device():
