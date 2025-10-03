@@ -12,6 +12,7 @@ from jaxtyping import PRNGKeyArray
 
 import haliax as hax
 import haliax.nn as hnn
+import haliax.nn.mup as mup
 from haliax import Axis, AxisSpec, NamedArray
 from haliax.jax_utils import maybe_rng_split, named_call, shaped_rng_split
 from haliax.nn.scan import ScanCheckpointPolicy, Stacked
@@ -81,6 +82,7 @@ class LlamaConfig(HFCompatConfig):
     scan_layers: bool = True
 
     use_bias: bool = False
+    use_mup: bool = False
     use_layer_norm_weight: bool = True
     rope: RotaryEmbeddingsConfig = dataclasses.field(default_factory=DefaultRotaryEmbeddingsConfig)
 
@@ -95,9 +97,9 @@ class LlamaConfig(HFCompatConfig):
     Mlp = property(lambda self: Axis(name="mlp", size=self.intermediate_dim))
 
     def __post_init__(self):
-        assert (
-            self.num_heads % self.num_kv_heads == 0
-        ), f"num_heads={self.num_heads} not divisible by num_kv_heads={self.num_kv_heads}."
+        assert self.num_heads % self.num_kv_heads == 0, (
+            f"num_heads={self.num_heads} not divisible by num_kv_heads={self.num_kv_heads}."
+        )
 
     def hf_checkpoint_converter(self, ref_checkpoint: Optional[str] = None) -> HFCheckpointConverter["LlamaConfig"]:  # type: ignore
         return HFCheckpointConverter(
@@ -233,11 +235,12 @@ class LlamaConfig(HFCompatConfig):
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             use_bias=self.use_bias,
+            use_mup=self.use_mup,
             upcast_attn=self.upcast_attn,
             attn_backend=self.attn_backend,
             flash_attention_block_size=self.flash_attention_block_size,
             rope=self.rope,
-            qk_norm=self.norm_config if self.use_qk_norm else None,
+            scaling_factor=1.0 if self.use_mup else None,  # Scaling is done by muP
         )
 
     @property
@@ -267,11 +270,33 @@ class LlamaMlp(eqx.Module):
         *,
         key,
         use_bias: bool = False,
+        use_mup: bool = False,
     ) -> "LlamaMlp":
         k_fc, k_up_proj, k_down_proj = jrandom.split(key, 3)
-        gate_proj = hnn.Linear.init(Out=Mlp, In=Embed, key=k_fc, use_bias=use_bias, out_first=True)
-        up_proj = hnn.Linear.init(Out=Mlp, In=Embed, key=k_up_proj, use_bias=use_bias, out_first=True)
-        down_proj = hnn.Linear.init(Out=Embed, In=Mlp, key=k_down_proj, use_bias=use_bias, out_first=True)
+        gate_proj = hnn.Linear.init(
+            Out=Mlp,
+            In=Embed,
+            key=k_fc,
+            use_bias=use_bias,
+            out_first=True,
+            reparam_cls=mup.HiddenLinearMup if use_mup else mup.LinearStandardParam,
+        )
+        up_proj = hnn.Linear.init(
+            Out=Mlp,
+            In=Embed,
+            key=k_up_proj,
+            use_bias=use_bias,
+            out_first=True,
+            reparam_cls=mup.HiddenLinearMup if use_mup else mup.LinearStandardParam,
+        )
+        down_proj = hnn.Linear.init(
+            Out=Embed,
+            In=Mlp,
+            key=k_down_proj,
+            use_bias=use_bias,
+            out_first=True,
+            reparam_cls=mup.HiddenLinearMup if use_mup else mup.LinearStandardParam,
+        )
         if isinstance(activation_fn, ActivationFunctionEnum):
             activation_fn = activation_fn.to_fn()
         elif isinstance(activation_fn, str):
@@ -309,6 +334,7 @@ class LlamaDecoderLayer(eqx.Module):
             config.activation_function,
             key=k_mlp,
             use_bias=config.use_bias,
+            use_mup=config.use_mup,
         )
         ln_1 = config.mk_LayerNorm(config.Embed)
         ln_2 = config.mk_LayerNorm(config.Embed)
@@ -475,7 +501,12 @@ class LlamaEmbedding(ModuleWithStateDictSerialization, eqx.Module):
 
     @staticmethod
     def init(Vocab: Axis, config: LlamaConfig, *, key) -> "LlamaEmbedding":
-        token_embeddings = hnn.Embedding.init(Vocab, config.Embed, key=key)
+        token_embeddings = hnn.Embedding.init(
+            Vocab,
+            config.Embed,
+            key=key,
+            reparam_cls=mup.EmbeddingMup if config.use_mup else mup.EmbeddingStandardParam,
+        )
         norm = None
         if config.input_embedding_norm:
             norm = config.mk_LayerNorm(config.Embed)
@@ -532,7 +563,14 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
         if config.tie_word_embeddings:
             lm_head = None
         else:
-            lm_head = hnn.Linear.init(In=config.Embed, Out=Vocab, key=k_emb, use_bias=False, out_first=True)
+            lm_head = hnn.Linear.init(
+                In=config.Embed,
+                Out=Vocab,
+                key=k_emb,
+                use_bias=False,
+                out_first=True,
+                reparam_cls=mup.OutputLinearMup if config.use_mup else mup.LinearStandardParam,
+            )
 
         return LlamaLMHeadModel(transformer, embeddings, lm_head)
 

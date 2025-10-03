@@ -28,6 +28,7 @@ import haliax
 import haliax as hax
 import haliax.haxtyping as ht
 import haliax.nn as hnn
+import haliax.nn.mup as mup
 from haliax import Axis, AxisSelection, AxisSelector, NamedArray, axis_name
 from haliax.jax_utils import maybe_rng_split, named_call
 from haliax.nn.attention import causal_mask, combine_masks_and, combine_masks_or
@@ -641,9 +642,9 @@ def _te_materialize_mask(KPos, QPos, batch_size, mask):
 
             fused_attn_mask = mask.materialize(QPos, KPos)
 
-            assert (
-                fused_attn_mask is not None
-            ), "If AttentionMask is causal, the materialized array should never be None. Something is wrong."
+            assert fused_attn_mask is not None, (
+                "If AttentionMask is causal, the materialized array should never be None. Something is wrong."
+            )
 
             fused_attn_mask = fused_attn_mask.array
             fused_attn_mask = jnp.dstack([fused_attn_mask] * batch_size)
@@ -1451,6 +1452,7 @@ class AttentionConfig:
     num_kv_heads: int
     head_dim: int | None = None
     use_bias: bool = False
+    use_mup: bool = False
     use_output_bias: Optional[bool] = None  # If None, uses use_bias
     upcast_attn: bool = False
     attn_backend: Optional[AttentionBackend] = None
@@ -1462,9 +1464,9 @@ class AttentionConfig:
     """Configuration for QK normalization. If None, no normalization is applied."""
 
     def __post_init__(self):
-        assert (
-            self.num_heads % self.num_kv_heads == 0
-        ), f"num_heads={self.num_heads} not divisible by num_kv_heads={self.num_kv_heads}."
+        assert self.num_heads % self.num_kv_heads == 0, (
+            f"num_heads={self.num_heads} not divisible by num_kv_heads={self.num_kv_heads}."
+        )
 
     @property
     def head_size(self) -> int:
@@ -1522,6 +1524,7 @@ class Attention(eqx.Module):
     @staticmethod
     def init(config: AttentionConfig, *, key) -> "Attention":
         use_bias = config.use_bias
+        use_mup = config.use_mup
         use_output_bias = config.use_output_bias if config.use_output_bias is not None else use_bias
         k_q, k_k, k_v, k_o = jrandom.split(key, 4)
         q_proj = hnn.Linear.init(
@@ -1530,6 +1533,7 @@ class Attention(eqx.Module):
             key=k_q,
             use_bias=use_bias,
             out_first=True,
+            reparam_cls=mup.OutputLinearMup if use_mup else mup.LinearStandardParam,  # Q out is not Width Dependent
         )
         k_proj = hnn.Linear.init(
             In=config.Embed,
@@ -1537,6 +1541,7 @@ class Attention(eqx.Module):
             key=k_k,
             use_bias=use_bias,
             out_first=True,
+            reparam_cls=mup.OutputLinearMup if use_mup else mup.LinearStandardParam,  # K out is not Width Dependent
         )
         v_proj = hnn.Linear.init(
             In=(config.Embed),
@@ -1544,6 +1549,7 @@ class Attention(eqx.Module):
             key=k_v,
             use_bias=use_bias,
             out_first=True,
+            reparam_cls=mup.HiddenLinearMup if use_mup else mup.LinearStandardParam,
         )
         o_proj = hnn.Linear.init(
             In=(config.Heads, config.HeadSize),
@@ -1551,6 +1557,7 @@ class Attention(eqx.Module):
             key=k_o,
             use_bias=use_output_bias,
             out_first=True,
+            reparam_cls=mup.HiddenLinearMup if use_mup else mup.LinearStandardParam,
         )
 
         q_norm = None
@@ -2158,9 +2165,9 @@ class MultiHeadLatentAttention(eqx.Module):
         if self.config.q_lora_rank is None:
             q = self.q_proj(x, key=k_q_a)
         else:
-            assert (
-                self.q_a_proj is not None and self.q_a_norm is not None and self.q_b_proj is not None
-            ), "q_lora_rank defined, but LoRA matrices are not."
+            assert self.q_a_proj is not None and self.q_a_norm is not None and self.q_b_proj is not None, (
+                "q_lora_rank defined, but LoRA matrices are not."
+            )
             q = self.q_a_proj(x, key=k_q_a)
             q = self.q_a_norm(q)
             q = self.q_b_proj(q, key=k_q_b)
