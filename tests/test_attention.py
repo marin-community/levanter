@@ -15,10 +15,12 @@ from jax.lax import Precision
 from jax.sharding import NamedSharding, PartitionSpec
 
 import haliax as hax
+import haliax.nn.mup as mup
 from haliax import Axis
 from haliax.partitioning import ResourceAxis
 
 from levanter.layers.attention import (
+    Attention,
     AttentionBackend,
     AttentionConfig,
     AttentionMask,
@@ -783,3 +785,25 @@ def test_attention_equivalence_jax_flash(
     o2 = sink_attention_ref_gpt_oss(q, k, v, sinks, sm_scale, sliding_window, start_q)
 
     torch.testing.assert_close(o1, o2)
+
+
+@pytest.mark.parametrize("use_mup", [False, True])
+def test_attention_use_mup_sets_reparam_classes(use_mup):
+    Embed = Axis("embed", 16)
+    config = AttentionConfig(
+        Embed=Embed,
+        num_heads=2,
+        num_kv_heads=2,
+        use_bias=False,
+        use_mup=use_mup,
+    )
+
+    attn = Attention.init(config, key=jrandom.PRNGKey(0))
+
+    expected_output_cls = mup.OutputLinearMup if use_mup else mup.LinearStandardParam
+    expected_hidden_cls = mup.HiddenLinearMup if use_mup else mup.LinearStandardParam
+
+    assert isinstance(attn.q_proj.reparam, expected_output_cls)
+    assert isinstance(attn.k_proj.reparam, expected_output_cls)
+    assert isinstance(attn.v_proj.reparam, expected_hidden_cls)
+    assert isinstance(attn.o_proj.reparam, expected_hidden_cls)

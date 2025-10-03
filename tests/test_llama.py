@@ -13,9 +13,10 @@ from jax import random
 
 import haliax as hax
 import haliax.nn as hnn
+import haliax.nn.mup as mup
 
 from levanter.layers.attention import AttentionBackend, AttentionMask
-from levanter.models.llama import Attention, LlamaConfig, LlamaDecoderLayer, LlamaLMHeadModel
+from levanter.models.llama import Attention, LlamaConfig, LlamaDecoderLayer, LlamaEmbedding, LlamaLMHeadModel
 from levanter.utils.jax_utils import parameter_count
 from test_utils import (
     check_load_config,
@@ -71,6 +72,54 @@ def test_llama_params():
     actual_params = 6.738415616e9
     params = llama_config.total_trainable_params(hf_config.vocab_size)
     assert np.isclose(actual_params, params, rtol=1e-2)
+
+
+@pytest.mark.parametrize("use_mup", [False, True])
+def test_llama_use_mup_sets_reparam_classes(use_mup):
+    config = LlamaConfig(
+        seq_len=8,
+        hidden_dim=16,
+        intermediate_dim=32,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=2,
+        use_bias=False,
+        use_mup=use_mup,
+        tie_word_embeddings=False,
+    )
+
+    attn_config = config.attention_config()
+    assert attn_config.use_mup is use_mup
+    if use_mup:
+        assert attn_config.scaling_factor == 1.0
+    else:
+        assert attn_config.scaling_factor is None
+
+    Vocab = hax.Axis("vocab", 32)
+    embeddings = LlamaEmbedding.init(Vocab, config, key=random.PRNGKey(0))
+
+    expected_embedding_cls = mup.EmbeddingMup if use_mup else mup.EmbeddingStandardParam
+    expected_hidden_cls = mup.HiddenLinearMup if use_mup else mup.LinearStandardParam
+    expected_output_cls = mup.OutputLinearMup if use_mup else mup.LinearStandardParam
+
+    assert isinstance(embeddings.token_embeddings.reparam, expected_embedding_cls)
+
+    decoder_layer = LlamaDecoderLayer.init(config, key=random.PRNGKey(1))
+
+    assert isinstance(decoder_layer.mlp.gate_proj.reparam, expected_hidden_cls)
+    assert isinstance(decoder_layer.mlp.up_proj.reparam, expected_hidden_cls)
+    assert isinstance(decoder_layer.mlp.down_proj.reparam, expected_hidden_cls)
+
+    self_attn = decoder_layer.self_attn
+    assert isinstance(self_attn.q_proj.reparam, expected_output_cls)
+    assert isinstance(self_attn.k_proj.reparam, expected_output_cls)
+    assert isinstance(self_attn.v_proj.reparam, expected_hidden_cls)
+    assert isinstance(self_attn.o_proj.reparam, expected_hidden_cls)
+
+    model = LlamaLMHeadModel.init(Vocab, config, key=random.PRNGKey(2))
+    assert model.lm_head is not None
+    assert isinstance(model.lm_head.reparam, expected_output_cls)
+    assert isinstance(model.embeddings.token_embeddings.reparam, expected_embedding_cls)
 
 
 @skip_if_no_torch
