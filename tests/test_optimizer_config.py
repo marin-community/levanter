@@ -4,7 +4,6 @@
 import dataclasses
 
 import numpy as np
-import pytest
 import jax
 from jax import numpy as jnp
 import jax.random as jr
