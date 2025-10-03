@@ -5,7 +5,6 @@ import abc
 import asyncio
 import contextlib
 import dataclasses
-import functools
 import json
 import logging
 import os
@@ -15,7 +14,7 @@ import urllib.parse
 import warnings
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Generic, Optional, Tuple, Type, TypeVar, Union, cast, Callable, Any, Awaitable
+from typing import Generic, Optional, Tuple, Type, TypeVar, Union, cast, Callable
 
 import draccus
 import equinox as eqx
@@ -52,13 +51,12 @@ from haliax.state_dict import from_torch_compatible_state_dict, save_state_dict
 from levanter.callbacks import StepInfo
 from levanter.models.asr_model import ASRMixin
 from levanter.models.lm_model import LmConfig, LmHeadModel
-from levanter.utils import jax_utils
 from levanter.utils.cloud_utils import temp_dir_before_upload
 from levanter.utils.hf_utils import HfTokenizer
-from levanter.utils.jax_utils import best_effort_sharding, local_cpu_mesh, use_cpu_device
+from levanter.utils.jax_utils import best_effort_sharding, use_cpu_device
 from levanter.utils.json_utils import ConfigJSONEncoder
 from levanter.utils.logging import silence_transformer_nag
-from levanter.utils.py_utils import dataclass_with_default_init, logical_cpu_memory_size
+from levanter.utils.py_utils import dataclass_with_default_init
 
 
 silence_transformer_nag()
@@ -79,24 +77,6 @@ from transformers import (  # noqa: E402
 )
 from transformers.dynamic_module_utils import get_class_from_dynamic_module  # noqa: E402
 from transformers.models.auto.auto_factory import _get_model_class  # noqa: E402
-
-
-try:
-    from jax.experimental.array_serialization.serialization import create_async_array_from_callback
-except ImportError:
-
-    async def create_async_array_from_callback(
-        global_shape,
-        inp_sharding: jax.sharding.Sharding,
-        data_callback: Callable[[Any, jax.Device], Awaitable[jax.Array]],
-    ):
-        device_to_index_map = inp_sharding.devices_indices_map(global_shape)
-        print(device_to_index_map, global_shape)
-        addressable_da = inp_sharding._addressable_device_assignment
-        future_arrays = [data_callback(device_to_index_map[d], d) for d in addressable_da]
-        print([type(fa) for fa in future_arrays])
-        dbs = await asyncio.gather(*future_arrays)
-        return jax.make_array_from_single_device_arrays(global_shape, inp_sharding, dbs)
 
 
 DEFAULT_MAX_SHARD_SIZE = int(10e9)
@@ -239,49 +219,22 @@ def _load_safe_tensors(path, dtype):
 
 
 async def _sharded_load_tensorstore_async(path, dtype):
-    """
-    Uses fsspec_safetensor to load a safetensors file from GCS (or other fsspec file system)
-    into a dictionary of TensorStore objects.
-    This allows for efficient sharded reads.
-    """
+    """Stream a safetensors shard from remote storage and return JAX arrays."""
 
-    from levanter.compat.fsspec_safetensor import load_tensor_dict
+    from levanter.compat.fsspec_safetensor import SafetensorChunkLoader
 
-    ts_dict = await load_tensor_dict(path)
+    loader = await SafetensorChunkLoader.create(path)
+    arrays: dict[str, jax.Array] = {}
 
-    # we want jax arrays, we use best effort sharding
-    if len(jax.devices()) == 1:
-        # just read everything
-        with ts.Batch():
-            d = {}
-            for k, v in ts_dict.items():
-                d[k] = v.read()
+    for chunk in loader.chunk_specs:
+        tensor_views = await loader.materialize_chunk(chunk, dtype_override=dtype)
+        for key, np_array in tensor_views.items():
+            sharding = best_effort_sharding(np_array.shape)
+            # arrays[key] = jax.device_put(np_array, sharding)
+            arrays[key] = jax.jit(lambda x: jax.lax.with_sharding_constraint(x, sharding))(np_array)
+        loader.release_chunk(chunk.chunk_id)
 
-        # now wait on all the futures
-        d = {k: (await v) for k, v in d.items()}
-
-        return d
-    else:
-        d = {}
-        with ts.Batch():
-            for k, v in ts_dict.items():
-                print(k)
-                sharding = best_effort_sharding(v.shape)
-                d[k] = create_async_array_from_callback(v.shape, sharding, functools.partial(_callback, k, v, dtype))
-
-        d = {k: (await v) for k, v in d.items()}
-        return d
-
-
-async def _callback(k, v, dtype, index, device):
-    print(k, v.shape, index)
-    slice_array = v[index]
-    if dtype and jnp.issubdtype(slice_array.dtype.numpy_dtype, jnp.floating):
-        slice_array = slice_array.astype(dtype)
-    arr = await slice_array.read()
-    arr = jax.device_put(arr, device)
-
-    return arr
+    return arrays
 
 
 # NB: for large models this will be jitted several times (once for each unique subset of keys at least)
@@ -663,7 +616,7 @@ class HFCheckpointConverter(Generic[LevConfig]):
 
         return final_state_dict
 
-    def _locate_shard_files(self, fs: AbstractFileSystem, path) -> tuple[list[str], Callable]:
+    def _locate_shard_files(self, fs: AbstractFileSystem, path) -> tuple[list[str] | None, Callable]:
         """
         Locate shard files in a GCS path. Returns a list of shard files and a loader function.
         """
@@ -686,7 +639,6 @@ class HFCheckpointConverter(Generic[LevConfig]):
 
                 break
 
-
         # If no index file found, try loading single file checkpoint
         if not shard_files:
             for model_file in [SAFE_TENSORS_MODEL, PYTORCH_MODEL]:
@@ -701,7 +653,7 @@ class HFCheckpointConverter(Generic[LevConfig]):
 
                     break
 
-        return shard_files, loader
+        return shard_files, loader  # type: ignore
 
     def load_pretrained(
         self,
@@ -720,7 +672,6 @@ class HFCheckpointConverter(Generic[LevConfig]):
             ref: The reference to load from. If None, will use the reference_checkpoint
             axis_mapping: The axis mapping to use for sharding. If None, will use the context axis mapping
         """
-        from contextlib import ExitStack
 
         hf_config = self.hf_config_from_hf_checkpoint(ref)
         if config is None:
@@ -731,18 +682,11 @@ class HFCheckpointConverter(Generic[LevConfig]):
         tokenizer_Vocab = self.Vocab
         Vocab = tokenizer_Vocab.resize(hf_config.vocab_size)
 
-        contexts = ExitStack()
-
-        # we want to use a CPU if (1) we only have 1 device, or (2) the total amount of accelerator memory is less than
-        # the amount of CPU memory.
-        # just_use_cpu = _should_use_cpu_for_checkpoint_loading()
-        # if just_use_cpu:
-        #     if we only have 1 device, use CPU ram
-            # contexts.enter_context(local_cpu_mesh())
-
         # TODO: in an ideal world, we would only load the part of the array we needed, but
         # AFAICT neither torch state dicts nor safetensors support this.
         state_dict = self.load_state_dict(ref, dtype)
+
+        print(list(state_dict.keys()))
 
         ignore_prefix: Optional[str] = None
         if self.ignore_prefix:
@@ -750,6 +694,8 @@ class HFCheckpointConverter(Generic[LevConfig]):
                 if k.startswith(f"{self.ignore_prefix}."):
                     ignore_prefix = self.ignore_prefix
                     break
+
+        print("ignore_prefix", ignore_prefix)
 
         def load_from_state_dict(template, state_dict):
             lev_model = from_torch_compatible_state_dict(template, state_dict, prefix=ignore_prefix)
@@ -776,20 +722,11 @@ class HFCheckpointConverter(Generic[LevConfig]):
 
             return lev_model
 
-        if just_use_cpu:
-            with local_cpu_mesh():
-                lev_model = eqx.filter_eval_shape(lm_model_cls.init, Vocab, config, key=PRNGKey(0))
-                lev_model = eqx.filter_jit(load_from_state_dict, donate="all")(lev_model, state_dict)
-
-            del state_dict
-            # gotta move it to the accelerator now (assuming there is one!)
-            lev_model = haliax.shard_with_axis_mapping(lev_model, axis_mapping)
-        else:
-            load_from_state_dict = haliax.named_jit(
-                load_from_state_dict, axis_resources=axis_mapping, out_axis_resources=axis_mapping, donate_args=(True,)
-            )
-            lev_model = eqx.filter_eval_shape(lm_model_cls.init, Vocab, config, key=PRNGKey(0))
-            lev_model = load_from_state_dict(lev_model, state_dict)
+        load_from_state_dict = haliax.named_jit(
+            load_from_state_dict, axis_resources=axis_mapping, out_axis_resources=axis_mapping, donate_args=(True,)
+        )
+        lev_model = eqx.filter_eval_shape(lm_model_cls.init, Vocab, config, key=PRNGKey(0))
+        lev_model = load_from_state_dict(lev_model, state_dict)
 
         return lev_model
 
@@ -1363,22 +1300,6 @@ def _shard_best_effort(array_or_slice, dtype) -> jax.Array:
             return arr
 
     return jax.make_array_from_callback(tuple(shape), sharding, get_slice)
-
-
-def _should_use_cpu_for_checkpoint_loading():
-    if jax.process_count() > 1:
-        return False
-
-    if jax.device_count() == 1:
-        return True
-
-    cpu_memory = logical_cpu_memory_size()
-    devices = jax.devices()
-    accel_memory = [jax_utils.estimated_free_device_memory(d) for d in devices]
-    if any(m is None for m in accel_memory):
-        return False
-    if sum(accel_memory) < cpu_memory:
-        return True
 
 
 def _is_hf_hub_model(ref: RepoRef):
