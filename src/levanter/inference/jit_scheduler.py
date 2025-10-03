@@ -490,7 +490,9 @@ class TokenQueue(eqx.Module):
     ) -> "TokenQueue":
         """Append ``new_tokens`` and ``new_slot_ids`` to the queue."""
         # jax.debug.print("Enqueueing tokens {} {} {} {}", new_tokens, new_slot_ids, new_pos_ids, num_new_tokens)
-        assert new_tokens.axis_size("position") <= self.max_queued_tokens, "Too many new tokens to enqueue"
+        assert (
+            new_tokens.axis_size("position") <= self.max_queued_tokens
+        ), f"Too many new tokens to enqueue {new_tokens.axis_size('position')} > {self.max_queued_tokens}"
 
         new_q_tokens = masked_set(
             self.queued_tokens,

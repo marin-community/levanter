@@ -91,6 +91,13 @@ class InferenceEngineConfig:
         if self.max_queued_tokens < self.max_tokens_per_round:
             raise ValueError("max_queued_tokens must be >= max_tokens_per_round")
 
+        if self.max_queued_tokens < self.max_seqs_in_prefill:
+            raise ValueError("max_queued_tokens must be >= max_seqs_in_prefill")
+
+        # this one is only required because of clones. If we really care, we could relax this
+        if self.max_queued_tokens < self.max_seqs:
+            raise ValueError("max_queued_tokens must be >= max_seqs")
+
     # Decode loop knobs
     max_tokens_per_round: int | None = None
     """Pack size for each decode loop iteration."""
@@ -311,6 +318,7 @@ def _prefill_kernel(
     new_tokens, log_probs = hax.vmap(sampler, "position")(logits_at_samples, temps, key=prng_keys)
 
     # Update decode_state (also enqueues into the main decode queue)
+    print(new_tokens.shape)
     decode_state = gen_state.decode_state.update_tokens(new_tokens, new_slot_ids, log_probs, num_new_tokens)
 
     # Initialize outputs buffer and append prefill-sampled tokens
