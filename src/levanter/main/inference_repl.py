@@ -157,7 +157,7 @@ class InferenceReplConfig:
                 max_seqs=64,
                 page_size=8,
                 max_pages_per_seq=8,
-                max_queued_tokens=1024,
+                max_queued_tokens=16,
                 max_seqs_in_prefill=64,
                 max_prefill_size=64,
                 max_tokens_per_round=16,

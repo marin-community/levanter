@@ -87,6 +87,10 @@ class InferenceEngineConfig:
     falls back to the page table's `max_len_per_seq` or 4096 as a final default.
     """
 
+    def __post_init__(self):
+        if self.max_queued_tokens < self.max_tokens_per_round:
+            raise ValueError("max_queued_tokens must be >= max_tokens_per_round")
+
     # Decode loop knobs
     max_tokens_per_round: int | None = None
     """Pack size for each decode loop iteration."""
