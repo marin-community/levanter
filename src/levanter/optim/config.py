@@ -19,6 +19,7 @@ import haliax
 
 import levanter.tracker
 from levanter.optim.clip_update_norm import ClipUpdateNormConfig
+from levanter.optim.mup import scale_by_mup_lr
 from levanter.optim.skipstep import SkipStepConfig
 from levanter.optim.util import log_norm_passthrough, scan_aware_clip_by_block_rms
 from levanter.utils.jax_utils import leaf_key_paths
@@ -444,6 +445,9 @@ class AdamConfig(OptimizerConfig):
     (2025, https://arxiv.org/abs/2506.02285v2).
     """
 
+    use_mup: bool = False
+    """If set, apply MuP per-parameter learning rate scaling."""
+
     def __post_init__(self):
         if self.update_rms_clipping is not None and self.update_rms_clipping <= 0:
             raise ValueError("update_rms_clipping must be a positive number or None.")
@@ -470,6 +474,9 @@ class AdamConfig(OptimizerConfig):
                 else:
                     weight_decay = self.weight_decay
                 components.append(optax.add_decayed_weights(weight_decay, self.build_weight_decay_mask()))
+
+            if self.use_mup:
+                components.append(scale_by_mup_lr())
 
             if self.update_rms_clipping is not None:
                 components.append(log_norm_passthrough("optim/pre_clip_update_norm"))
