@@ -74,7 +74,7 @@ from levanter.schedule import BatchSchedule, IntSchedule, ScheduleStep, value_at
 from levanter.tracker import TrackerConfig, capture_time
 from levanter.trainer_state import InsideJitInfo, TrainerState, saveable_training_mask, trainables_only
 from levanter.utils import cloud_utils, fsspec_utils
-from levanter.utils.jax_utils import barrier_sync, create_fsdp_mesh, zeros_like_tree
+from levanter.utils.jax_utils import barrier_sync, create_fsdp_mesh, zeros_like_tree, best_effort_sharding
 from levanter.utils.tree_utils import inference_mode, tree_statistics
 from levanter.utils.types import ComputeLossFunction, FilterSpec, FilterTree
 from levanter.layers.attention import AttentionMask
@@ -91,6 +91,142 @@ DEFAULT_JAX_CONFIG: Dict[str, JsonAtom] = {
     "jax_softmax_custom_jvp": True,
     "jax_explain_cache_misses": True,
 }
+from jax.tree_util import tree_map_with_path
+import haliax as hax
+
+def _is_leaf(x):
+    # Don't descend into NamedArray internals; also treat raw JAX arrays as leaves.
+    return isinstance(x, hax.NamedArray) or (hasattr(x, "shape") and hasattr(x, "dtype"))
+
+def _path_to_str(path):
+    parts = []
+    for k in path:
+        if hasattr(k, "name"):
+            parts.append(k.name)       # GetAttrKey
+        elif hasattr(k, "key"):
+            parts.append(str(k.key))   # DictKey
+        elif hasattr(k, "idx"):
+            parts.append(str(k.idx))   # SequenceKey / FlattenedIndexKey
+        else:
+            parts.append(str(k))
+    return ".".join(parts)
+
+def list_weight_paths(tree, limit=30):
+    paths = []
+    def _collect(path, x):
+        name = _path_to_str(path)
+        if "weight" in name:          # loose and simple
+            paths.append(name)
+    tree_map_with_path(_collect, tree, is_leaf=_is_leaf)
+    for p in paths[:limit]:
+        print(p)
+    print(f"... ({len(paths)} total)")
+
+def print_one_sharding(tree, match: str):
+    found = False
+    def _visit(path, x):
+        nonlocal found
+        if found: return
+        name = _path_to_str(path)
+        if match in name:
+            arr = x.array if hasattr(x, "array") else x
+            sh  = getattr(arr, "sharding", None)
+            spec = getattr(sh, "spec", None)
+            print(f"[Shard] {name}\n        shape={getattr(arr,'shape',None)} sharding={sh} pspec={spec}")
+            found = True
+    tree_map_with_path(_visit, tree, is_leaf=_is_leaf)
+    if not found:
+        print(f"[Shard] no match for '{match}'")
+
+def log_layer_sharding(label: str, tree, match: str):
+    if jax.process_index() == 0:
+        print(f"[Shard] {label} -> {match}")
+        print_one_sharding(tree, match)
+
+# Representative transformer linear weights we try to match for sharding debug prints
+TARGET_MATCHES = (
+    "attn.c_attn.weight",
+    "mlp.c_fc.weight",
+    "attn.c_proj.weight",
+    "embeddings.token_embeddings.weight",
+)
+
+def _select_weight_array(tree):
+    selected = {"arr": None, "name": None, "axes": None, "named_sharding": None}
+
+    def _visit(path, x):
+        if selected["arr"] is not None:
+            return
+        name = _path_to_str(path)
+        for m in TARGET_MATCHES:
+            if m in name:
+                arr = x.array if isinstance(x, hax.NamedArray) else x
+                if hasattr(arr, "shape") and hasattr(arr, "dtype"):
+                    selected["arr"] = arr
+                    selected["name"] = name
+                    if isinstance(x, hax.NamedArray):
+                        try:
+                            selected["axes"] = [ax.name for ax in x.axes]
+                        except Exception:
+                            selected["axes"] = None
+                        try:
+                            selected["named_sharding"] = getattr(x, "sharding", None)
+                        except Exception:
+                            selected["named_sharding"] = None
+                    break
+
+    tree_map_with_path(_visit, tree, is_leaf=_is_leaf)
+    return selected["name"], selected["arr"], selected["axes"], selected["named_sharding"]
+
+def _debug_weight_sharding(label, tree):
+    name, arr, axes_names, named_sharding = _select_weight_array(tree)
+    if arr is None:
+        debug.print("[ShardDBG] {}: no match in tree", label)
+    else:
+        shape = getattr(arr, "shape", None)
+
+        def _cb(sh):
+            try:
+                spec = getattr(sh, "spec", None)
+            except Exception:
+                spec = None
+            try:
+                n_spec = getattr(named_sharding, "spec", None)
+            except Exception:
+                n_spec = None
+            print(f"\n[ShardDBG] {label}: {name}\n\tshape={shape}\n\taxes={axes_names}\n\tnamed_sharding={named_sharding}\n\tnamed_pspec={n_spec}\n\tarray_sharding={sh}\n\tarray_pspec={spec}", flush=True)
+
+    debug.inspect_array_sharding(arr, callback=_cb)
+
+def _debug_array_sharding(label, arr):
+    try:
+        shape = getattr(arr, "shape", None)
+        def _cb(sh):
+            try:
+                spec = getattr(sh, "spec", None)
+            except Exception:
+                spec = None
+            print(f"\n[ShardDBG] {label}: shape={shape}\n\tarray_sharding={sh}\n\tarray_pspec={spec}", flush=True)
+        debug.inspect_array_sharding(arr, callback=_cb)
+    except Exception:
+        pass
+
+def _constrain_array_to_fsdp(x, mesh):
+    """Attach NamedSharding derived from best_effort_sharding to a raw JAX array."""
+    if hasattr(x, "shape") and hasattr(x, "dtype"):
+        try:
+            sh = best_effort_sharding(x, mesh=mesh)
+            return jax.lax.with_sharding_constraint(x, sh)
+        except Exception:
+            return x
+    return x
+
+def _constrain_named_or_array(x, mesh):
+    """Same as above, but preserves/rewraps Haliax NamedArray leaves."""
+    if isinstance(x, hax.NamedArray):
+        arr = _constrain_array_to_fsdp(x.array, mesh)
+        return hax.named(arr, x.axes)
+    return _constrain_array_to_fsdp(x, mesh)
 
 
 # A note on the semantics of "step" vs "next_step":
@@ -308,8 +444,13 @@ def compute_weighted_loss(
         return losses
 
 
-def make_train_functions(optimizer: optax.GradientTransformation, pad_token_id: int,
-                         is_trainable: FilterTree = True, compute_axis_mapping: ResourceMapping = None):
+def make_train_functions(
+    optimizer: optax.GradientTransformation,
+    pad_token_id: int,
+    is_trainable: FilterTree = True,
+    compute_axis_mapping: ResourceMapping = None,
+    parameter_axis_mapping: ResourceMapping = None,
+):
     """Takes in the static arguments and returns training functions.
 
     Training operates over single batches, where each batch consists of grad_accum_size microbatches.
@@ -390,17 +531,54 @@ def make_train_functions(optimizer: optax.GradientTransformation, pad_token_id: 
 
 
     def update_with_grads(avg_grad: jnp.ndarray, train_state):
-        """ updates the model parameters with the average gradient """
+        """Updates the model parameters with the average gradient (FSDP-safe)."""
         model, opt_state = train_state
 
+        # 1) Filter to trainable parts and compute 'overwrites' (unchanged logic)
         train_grads = trainables_only(avg_grad, is_trainable)
         overwrites, train_grads = partition_for_grad_overwrite(train_grads)
-        trainable_model = trainables_only(model, is_trainable)
-        _, trainable_model = partition_for_grad_overwrite(trainable_model)
 
+        trainable_model = trainables_only(model, is_trainable)
+        _ignored, trainable_model = partition_for_grad_overwrite(trainable_model)
+
+        # 2) Get the current mesh (works inside/outside jit)
+        current_mesh = (
+            mesh_lib.get_abstract_mesh()
+            if mesh_lib.get_concrete_mesh() is not None
+            else mesh_lib.thread_resources.env.physical_mesh
+        )
+
+        # 3) Re-assert FSDP sharding precisely on the objects passed to the optimizer
+        #    (prevents XLA from up-gathering full-width params for the update)
+        '''
+        train_grads = jax.tree.map(
+            lambda x: _constrain_array_to_fsdp(x, current_mesh),
+            train_grads,
+            is_leaf=lambda x: hasattr(x, "shape") and hasattr(x, "dtype"),
+        )
+
+        trainable_model = jax.tree.map(
+            lambda x: _constrain_named_or_array(x, current_mesh),
+            trainable_model,
+            is_leaf=lambda x: isinstance(x, hax.NamedArray) or (hasattr(x, "shape") and hasattr(x, "dtype")),
+        )
+        '''
+
+        # 4) Optimizer step (unchanged)
         updates, opt_state = optimizer.update(train_grads, opt_state, params=trainable_model)
-        model = apply_updates(model, updates, overwrites)
-        return model, opt_state
+
+        '''
+        # 5) (Optional) Constrain updates as well (can reduce incidental gathers/copies)
+        updates = jax.tree.map(
+            lambda x: _constrain_array_to_fsdp(x, current_mesh),
+            updates,
+            is_leaf=lambda x: hasattr(x, "shape") and hasattr(x, "dtype"),
+        '''
+
+        # 6) Apply updates with your existing 'overwrites' mechanism
+        new_model = apply_updates(model, updates, overwrites)
+        return new_model, opt_state
+
 
 
     def single_batch_step(data_weights: jnp.ndarray, train_state: Tuple[Any, Any], batch_data: Dict[str, jnp.ndarray]) -> Tuple[Tuple[Any, Any], jnp.ndarray]:
@@ -453,44 +631,52 @@ def make_train_functions(optimizer: optax.GradientTransformation, pad_token_id: 
 
 
     def run_vjp_update(non_donated_args, params_grad, opt_grad, grad_sharding):
-        """ computes the backwards functions that reverse state->compute_grads->update_with_grads->new_state.
-        this computes the branch that does not involve the metagrads themselves  """
+        """computes the backwards functions that reverse state->compute_grads->update_with_grads->new_state.
+        This computes the branch that does not involve the metagrads themselves.
+        Mirrors forward sharding: params/opt state use parameter_axis_mapping, compute uses compute_axis_mapping."""
         initial_params, initial_opt_state, data_weights, batch_data = non_donated_args
         train_state = (initial_params, initial_opt_state)
-        current_mesh = mesh_lib.get_abstract_mesh() if mesh_lib.get_concrete_mesh() is not None else mesh_lib.thread_resources.env.physical_mesh # shard opt state across accelerators
-        replicated_sharding = jax.sharding.NamedSharding(current_mesh, jax.sharding.PartitionSpec())
-        # first, run forward from state -> average grads and do bookkeeping for the later backwards
-        def train_state_to_grads_with_sharding(state):
-            # Partition the model to apply sharding constraints only to arrays
-            with jax.named_scope("train_state_to_grads_with_sharding"):
-                model, opt_state = state
-                arrays, static = eqx.partition(model, eqx.is_array)
-                arrays = jax.lax.with_sharding_constraint(arrays, replicated_sharding)
-                opt_state = jax.lax.with_sharding_constraint(opt_state, replicated_sharding)
-                model = eqx.combine(arrays, static)
-                train_state = (model, opt_state)
 
-                grad_buffer, loss = compute_grads(data_weights, train_state, batch_data)
-                grad_buffer = jax.lax.with_sharding_constraint(grad_buffer, replicated_sharding)
+        _debug_weight_sharding("vjp_update/initial_params", initial_params)
+        _debug_weight_sharding("vjp_update/initial_opt_state", initial_opt_state)
+        #import pdb; pdb.set_trace()
+
+        # 1) Forward leg: state -> avg grads; respect parameter sharding layout if provided
+        def train_state_to_grads_with_sharding(state):
+            with jax.named_scope("train_state_to_grads_with_fsdp_sharding"):
+                model, opt_state = state
+                #if parameter_axis_mapping is not None:
+                #    with hax.axis_mapping(parameter_axis_mapping):
+                #        grad_buffer, loss = compute_grads(data_weights, (model, opt_state), batch_data)
+                #else:
+                grad_buffer, loss = compute_grads(data_weights, (model, opt_state), batch_data)
                 return grad_buffer, loss
         (grad_buffer, loss), vjp_grad_state_fun = eqx.filter_vjp(train_state_to_grads_with_sharding, train_state)
+        # Debug: sharding of avg grad buffer produced by state→grads leg
+        _debug_weight_sharding("vjp_update/grad_buffer_post_state_to_grads", grad_buffer)
 
-        # now the second forward part from avg grads + state -> new state, but this is very memory expensive (each residual is the size of a model) so we shard the train state and re-collect
-        grad_buffer = jax.lax.with_sharding_constraint(grad_buffer, grad_sharding) # TODO: switch back; grad_sharding is not used
-        _, vjp_update_fun = eqx.filter_vjp(update_with_grads, grad_buffer, train_state)  # do computation with sharding
+        # 2) Forward leg: (avg grads, state) -> new state; apply grad sharding if provided
+        if grad_sharding is not None:
+            grad_buffer = hax.shard(grad_buffer, parameter_axis_mapping)
+            # Debug: sharding after applying grad_sharding constraint
+            _debug_weight_sharding("vjp_update/grad_buffer_post_grad_sharding", grad_buffer)
+        _, vjp_update_fun = eqx.filter_vjp(update_with_grads, grad_buffer, train_state)
         avg_grad_grad, train_state_grad = vjp_update_fun((params_grad, opt_grad))
 
-        if False:
-            self.debug_print("run_vjp_update > avg_grad_grad (embedding): {}", avg_grad_grad.embedding.weight.array)
-            self.debug_print("run_vjp_update > avg_grad_grad (lm_head): {}", avg_grad_grad.lm_head.weight.array.T)
+        # 3) Backward through grads path and sum contributions
+        avg_grad_grad = hax.shard(avg_grad_grad, parameter_axis_mapping)
+        # Debug: sharding of gradient wrt avg grads and wrt train_state from update leg
+        _debug_weight_sharding("vjp_update/avg_grad_grad_from_update", avg_grad_grad)
+        _debug_weight_sharding("vjp_update/train_state_grad_from_update", train_state_grad)
 
-        # re-collect results onto the same device, for computational efficiency in the next step
-        avg_grad_grad = jax.lax.with_sharding_constraint(avg_grad_grad, replicated_sharding)
-        # now we do the second backwards through the grads (avg grads -> state)
         train_state_grad_through_grads = vjp_grad_state_fun((avg_grad_grad, 0.0))[0]
-        # the state affects the next state via two paths, so sum the backward partials
-        train_state_grad = jax.tree.map(lambda x, y: x + y if x.dtype is not jax.dtypes.float0 else x, train_state_grad, train_state_grad_through_grads) #float 0 is the opt state accumulator, so ignore it.
-        train_state_grad = jax.lax.with_sharding_constraint(train_state_grad, replicated_sharding)
+        train_state_grad = jax.tree.map(
+            lambda x, y: x + y if x.dtype is not jax.dtypes.float0 else x,
+            train_state_grad,
+            train_state_grad_through_grads,
+        )
+        # Debug: final sharding after summing both gradient paths
+        _debug_weight_sharding("vjp_update/train_state_grad_post_sum", train_state_grad)
         return avg_grad_grad, train_state_grad, loss
 
 
@@ -498,18 +684,57 @@ def make_train_functions(optimizer: optax.GradientTransformation, pad_token_id: 
         """ computes the backwards functions that reverse data_weights -> compute grads
         this is the second part that propagates gradients at the batch level to each example and uses a hand computed VJP """
         train_state = (initial_model, initial_opt_state)
-        manual_vjp_grad_fun = jax.tree_util.Partial(microbatch_vjp_grad_fun, data_weights=data_weights, train_state=train_state, batch_data=batch_data)
-        return manual_vjp_grad_fun(avg_grad_grad)
+        # Debug: inspect sharding of the incoming avg_grad_grad tree
+        _debug_weight_sharding("vjp_grad_manual/avg_grad_grad_input", avg_grad_grad)
+
+        manual_vjp_grad_fun = jax.tree_util.Partial(
+            microbatch_vjp_grad_fun,
+            data_weights=data_weights,
+            train_state=train_state,
+            batch_data=batch_data,
+        )
+        if parameter_axis_mapping is not None:
+            with hax.axis_mapping(parameter_axis_mapping):
+                res = manual_vjp_grad_fun(avg_grad_grad)
+        else:
+            res = manual_vjp_grad_fun(avg_grad_grad)
+
+        # Debug: inspect sharding of gradient wrt data_weights (first return)
+        try:
+            d_dw = res[0]
+            _debug_array_sharding("vjp_grad_manual/d_data_weights", d_dw)
+        except Exception:
+            pass
+
+        return res
 
 
     def run_vjp_grad_jax(initial_model, initial_opt_state, data_weights, batch_data, avg_grad_grad):
         """ computes the backwards functions that reverse data_weights -> compute grads
         this is the second part that propagates gradients at the batch level to each example. this is a slower, jax computed version to be used for a reference in tests"""
         train_state = (initial_model, initial_opt_state)
-        _, vjp_grad_fun, loss = eqx.filter_vjp(
-            compute_grads, data_weights, train_state, batch_data, has_aux=True
-        )
-        return vjp_grad_fun(avg_grad_grad)
+        # Debug: inspect sharding of the incoming avg_grad_grad tree
+        _debug_weight_sharding("vjp_grad_jax/avg_grad_grad_input", avg_grad_grad)
+
+        if parameter_axis_mapping is not None:
+            with hax.axis_mapping(parameter_axis_mapping):
+                _, vjp_grad_fun, loss = eqx.filter_vjp(
+                    compute_grads, data_weights, train_state, batch_data, has_aux=True
+                )
+        else:
+            _, vjp_grad_fun, loss = eqx.filter_vjp(
+                compute_grads, data_weights, train_state, batch_data, has_aux=True
+            )
+        res = vjp_grad_fun(avg_grad_grad)
+
+        # Debug: inspect sharding of gradient wrt data_weights (first return)
+        try:
+            d_dw = res[0]
+            _debug_array_sharding("vjp_grad_jax/d_data_weights", d_dw)
+        except Exception:
+            pass
+
+        return res
 
     return single_batch_step, run_vjp_update, run_vjp_grad_manual, run_vjp_grad_jax
 
@@ -634,6 +859,22 @@ class Trainer:
         if len(self._cmanagers) > 0:
             raise RuntimeError("Trainer is already entered")
 
+        # Debug: device mesh summary
+        try:
+            mesh = self.device_mesh
+            mesh_shape = getattr(mesh.devices, "shape", None)
+            devices_total = getattr(mesh.devices, "size", None)
+            print(
+                f"[Mesh DBG] axis_names={mesh.axis_names} shape={mesh_shape} devices_total={devices_total}",
+                flush=True,
+            )
+            print(
+                f"[AxisMapping DBG] compute={self.compute_axis_mapping} params={self.parameter_axis_mapping}",
+                flush=True,
+            )
+        except Exception:
+            pass
+
         self._cmanagers = [
             levanter.current_tracker(self.tracker),
             haliax.partitioning.set_mesh(self.device_mesh),
@@ -731,6 +972,26 @@ class Trainer:
             allow_partial=self.config.allow_partial_checkpoint,
         )(model_init, training_key)
 
+                # --- Force FSDP sharding on state once, pre-JIT ---
+        with hax.axis_mapping(self.parameter_axis_mapping):
+            mesh = self.device_mesh
+
+            # Constrain model parameters (handles NamedArray leaves)
+            constrained_model = jax.tree.map(
+                lambda x: _constrain_named_or_array(x, mesh),
+                state.model,
+                is_leaf=lambda z: isinstance(z, hax.NamedArray) or (hasattr(z, "shape") and hasattr(z, "dtype")),
+            )
+
+            # Constrain optimizer state (raw arrays only)
+            constrained_opt = jax.tree.map(
+                lambda x: _constrain_array_to_fsdp(x, mesh),
+                state.opt_state,
+                is_leaf=lambda z: hasattr(z, "shape") and hasattr(z, "dtype"),
+            )
+
+            state = eqx.tree_at(lambda s: (s.model, s.opt_state), state, (constrained_model, constrained_opt))
+
         return state
 
     @property
@@ -786,7 +1047,7 @@ class Trainer:
         iter_data = iter(train_loader)
 
         # print optimizer info
-        print('$$$$ Optimizer info:', state.opt_state)
+        #print('$$$$ Optimizer info:', state.opt_state)
 
         while int(state.step) < self.num_train_steps:
             print(f'\n\n------------------------------- Forward it: {state.step} -------------------------------')
@@ -856,7 +1117,12 @@ class Trainer:
 
     def construct_metagrad_helpers(self, use_manual_vjp=True):
         pad_token_id = -100
-        single_batch_step, run_vjp_update, run_vjp_grad_manual, run_vjp_grad_jax = make_train_functions(self.optimizer, pad_token_id, compute_axis_mapping=self.compute_axis_mapping)
+        single_batch_step, run_vjp_update, run_vjp_grad_manual, run_vjp_grad_jax = make_train_functions(
+            self.optimizer,
+            pad_token_id,
+            compute_axis_mapping=self.compute_axis_mapping,
+            parameter_axis_mapping=self.parameter_axis_mapping,
+        )
         if use_manual_vjp: # this should be the faster manual VJP that uses JVPs internally.
             self.run_vjp_grad = run_vjp_grad_manual
         else: # this is the 'exact' VJP chaining approach. used to check correctness.
@@ -889,6 +1155,7 @@ class Trainer:
         final_model = inference_mode(final_model, True)
         final_model = self.mp.cast_to_compute(final_model)
 
+        '''
         @eqx.filter_jit
         def single_batch_reward(model, batch):
             with hax.axis_mapping(self.compute_axis_mapping):
@@ -912,9 +1179,9 @@ class Trainer:
 
         for i, val_batch in tqdm(enumerate(val_loader), desc="Computing reward"):
             #print('\n\n\nREWARD val_batch.tokens.array:', val_batch.tokens.array, flush=True)
-            loss, p_grad = value_and_grad_fn(final_model, val_batch)
-
-            params_grad = jax.tree_util.tree_map(jnp.add, params_grad, p_grad)
+            with hax.axis_mapping(self.compute_axis_mapping):
+                loss, p_grad = value_and_grad_fn(final_model, val_batch)
+                params_grad = jax.tree_util.tree_map(jnp.add, params_grad, p_grad)
             total_loss += loss
             total_weights += val_batch.tokens.array.shape[0]
             # TODO: put this in config
@@ -928,13 +1195,79 @@ class Trainer:
         else:
             reward = jnp.array(0.0)
             # params_grad is already zeros
+        '''
+
+        # 1) Define a scalar reward loss (same as you already do, just as a callable)
+        def reward_loss_fn(model, batch):
+            with hax.axis_mapping(self.compute_axis_mapping):
+                losses = compute_next_token_loss(model, batch, reduction=None, reduction_axis=())
+                mask = batch.loss_mask
+                return (-hax.einsum("->", losses, mask) / losses.axes[1].size).scalar()
+
+        # JIT a plain two-arg function that calls your microbatched gradient helper
+        def _reward_grad_step_impl(model, batch):
+            return self._compute_gradients_microbatched(reward_loss_fn, model, batch)
+
+        reward_grad_step = eqx.filter_jit(_reward_grad_step_impl)
+
+        # 2) Init a device-resident, sharded accumulator that matches param sharding
+        differentiable_final_model, _ = eqx.partition(final_model, eqx.is_inexact_array)
+        differentiable_final_model = hax.shard(differentiable_final_model, self.parameter_axis_mapping)
+        #with hax.axis_mapping(self.parameter_axis_mapping):
+
+        @eqx.filter_jit
+        def zeros_like(m):
+            return hax.shard(hax.tree_util.tree_map(hax.zeros_like, m), self.parameter_axis_mapping)
+
+        params_grad = zeros_like(differentiable_final_model)
+        #params_grad = hax.tree_util.tree_map(hax.zeros_like, differentiable_final_model)
+        #params_grad = hax.shard(params_grad, self.parameter_axis_mapping)
+
+        # (optional but recommended) constrain to best-effort FSDP sharding
+        _debug_weight_sharding("reward_grad_init/params_grad", params_grad)
+        '''
+        params_grad = jax.tree_util.tree_map(
+            lambda x: jax.lax.with_sharding_constraint(
+                x, best_effort_sharding(x, mesh=self.device_mesh)
+            ),
+            params_grad,
+        )
+        '''
+
+        print('parameter_axis_mapping:', self.parameter_axis_mapping, flush=True)
+        #import pdb; pdb.set_trace()
+
+        total_weights = 0.0
+
+        # 3) Use the SAME microbatched machinery you use for training to compute reward grads
+        reward = 0.0
+        for i, val_batch in tqdm(enumerate(val_loader), desc="Computing reward"):
+            loss, p_grad = reward_grad_step(  # <- microbatched + checkpointed
+                final_model, val_batch
+            )
+            # Accumulate on device (params_grad is sharded, so we don't replicate)
+            params_grad = jax.tree_util.tree_map(jnp.add, params_grad, p_grad)
+            total_weights += val_batch.tokens.array.shape[0]
+            reward += loss
+            if i == 1:
+                break
+
+        # 4) Normalize once at the end
+        if total_weights > 0:
+            params_grad = jax.tree_util.tree_map(lambda g: g / total_weights, params_grad)
+
 
         # The original code differentiated wrt (final_model, final_opt_state).
         # final_opt_state isn't used in reward computation, so its gradient is zero.
         differentiable_opt_state, _ = eqx.partition(final_opt_state, eqx.is_inexact_array)
         opt_grad = jax.tree_util.tree_map(jnp.zeros_like, differentiable_opt_state)
 
-        print(f"Final reward: {reward}")
+
+        _debug_weight_sharding("reward_grad_init/params_grad", params_grad)
+        _debug_weight_sharding("reward_grad_init/opt_grad", opt_grad)
+        #import pdb; pdb.set_trace()
+
+        #print(f"Final reward: {reward}")
 
         if self.debug:
             self.jax_debug_print("grad_buffer (embedding): {}", params_grad.embedding.weight.array)
@@ -969,15 +1302,21 @@ class Trainer:
         rev_it = self.config.num_train_steps - 1
 
         # Metagrad checkpointing setup
+        print("[DBG] Creating metagrad checkpointer...", flush=True)
         checkpointer = self.config.checkpointer.create(
             self.run_id, axis_mapping=self.parameter_axis_mapping, mesh=self.device_mesh
         )
-        metagrad_ckpt_dir = Path(self.checkpoint_path) / "metagrad_checkpoints"
+        print("[DBG] Metagrad checkpointer created", flush=True)
+        metagrad_ckpt_dir = fsspec_utils.join_path(self.checkpoint_path, "metagrad_checkpoints")
+        print(f"[DBG] Metagrad checkpoint directory: {metagrad_ckpt_dir}", flush=True)
         if self.config.metagrad_checkpoint_frequency > 0:
-            fsspec_utils.mkdirs(str(metagrad_ckpt_dir))
+            print("[DBG] Ensuring metagrad checkpoint directory exists...", flush=True)
+            fsspec_utils.mkdirs(metagrad_ckpt_dir)
+            print("[DBG] mkdirs completed", flush=True)
 
         # Backward profiler setup
         if self.config.backward_profiler:
+            print("[DBG] Backward profiler enabled", flush=True)
             backward_profile_path = str(self.config.log_dir / self.run_id / "backward_profiler")
             start_step = self.config.backward_profiler_start_step
             num_steps = self.config.backward_profiler_num_steps
@@ -994,62 +1333,80 @@ class Trainer:
         backward_profiler_started_by_us = False
 
         # Resume from metagrad checkpoint if available
-        if self.config.metagrad_checkpoint_frequency > 0 and fsspec_utils.exists(str(metagrad_ckpt_dir)):
+        print(f"[DBG] Checking for existing metagrad checkpoints at {metagrad_ckpt_dir}...", flush=True)
+        _has_metagrad_ckpt_dir = fsspec_utils.exists(metagrad_ckpt_dir)
+        print(f"[DBG] metagrad_ckpt_dir exists: {_has_metagrad_ckpt_dir}", flush=True)
+        if self.config.metagrad_checkpoint_frequency > 0 and _has_metagrad_ckpt_dir:
             try:
                 # with fsspec, we can't glob, so we list and filter
-                fs, _, paths = fsspec.get_fs_token_paths(str(metagrad_ckpt_dir))
+                print("[DBG] Listing checkpoint directory...", flush=True)
+                fs, _, paths = fsspec.get_fs_token_paths(metagrad_ckpt_dir)
                 files = fs.ls(paths[0])
-                # fs.ls can return a list of dicts (with file details) or a list of strings (paths)
-                if files and isinstance(files[0], dict):
-                    checkpoints = [f["name"] for f in files if f["name"].endswith(".npz")]
-                else:
-                    checkpoints = [str(f) for f in files if str(f).endswith(".npz")]
+                print(f"[DBG] Found {len(files)} entries in checkpoint directory", flush=True)
+
+                # Collect TensorStore dir checkpoints (step-<n>/metadata.json)
+                dir_steps: list[int] = []
+                for entry in files:
+                    name = entry["name"] if isinstance(entry, dict) else str(entry)
+                    base = os.path.basename(name)
+                    if base.startswith("step-"):
+                        meta_path = fsspec_utils.join_path(metagrad_ckpt_dir, base)
+                        meta_json = fsspec_utils.join_path(meta_path, "metadata.json")
+                        if fsspec_utils.exists(meta_json):
+                            try:
+                                dir_steps.append(int(base.split("-")[1]))
+                            except Exception:
+                                pass
             except (FileNotFoundError, IndexError):
-                checkpoints = []
+                dir_steps = []
 
-            if checkpoints:
-                # Find the checkpoint with the lowest rev_it, which is the latest one saved.
-                steps = [int(Path(c).stem.split("_")[1]) for c in checkpoints]
-                if steps:
-                    latest_step = min(steps)
-                    logger.info(f"Resuming metagrad computation from step {latest_step}")
+            if dir_steps:
+                latest_step = min(dir_steps)
+                logger.info(f"Resuming metagrad computation from step {latest_step}")
+                ckpt_dir = fsspec_utils.join_path(metagrad_ckpt_dir, f"step-{latest_step}")
+                print(f"[DBG] Loading metagrad checkpoint from {ckpt_dir}", flush=True)
 
-                    ckpt_path = str(metagrad_ckpt_dir / f"step_{latest_step}.npz")
+                exemplar = {
+                    "params_grad": params_grad,
+                    "opt_grad": opt_grad,
+                    "metagrads": metagrads,
+                }
+                loaded = levanter.checkpoint.load_checkpoint(
+                    exemplar,
+                    ckpt_dir,
+                    discover_latest=False,
+                    axis_mapping=self.parameter_axis_mapping,
+                    mesh=self.device_mesh,
+                )
+                print("[DBG] Metagrad checkpoint load completed", flush=True)
+                params_grad = loaded["params_grad"]
+                opt_grad = loaded["opt_grad"]
+                # Normalize metagrads to single-device array for consistent scatter updates
+                metagrads = jnp.asarray(jax.device_get(loaded["metagrads"]))
 
-                    with fsspec.open(ckpt_path, "rb") as f:
-                        with np.load(f, allow_pickle=True) as data:
-                            params_grad_flat = list(data["params_grad"])
-                            opt_grad_flat = list(data["opt_grad"])
-                            metagrads = jnp.array(data["metagrads"])
-
-                            differentiable_final_model, _ = eqx.partition(final_model, eqx.is_inexact_array)
-                            params_grad = jax.tree_util.tree_unflatten(
-                                jax.tree_util.tree_structure(differentiable_final_model), params_grad_flat
-                            )
-
-                            differentiable_opt_state, _ = eqx.partition(final_opt_state, eqx.is_inexact_array)
-                            opt_grad = jax.tree_util.tree_unflatten(
-                                jax.tree_util.tree_structure(differentiable_opt_state), opt_grad_flat
-                            )
-
-                    # we need to fast forward the dataloader and set rev_it to the step *before* the one we loaded
-                    steps_to_skip = (self.config.num_train_steps - 1) - (latest_step - 1) - 1
-                    if steps_to_skip > 0:
-                        logger.info(f"Skipping {steps_to_skip} batches in reversed_train_loader to resume.")
-                        for _ in tqdm(range(steps_to_skip), desc="Fast-forwarding dataloader"):
-                            next(iter_data)
-
-                    rev_it = latest_step - 1
+                # Fast-forward reversed loader and set rev_it
+                steps_to_skip = (self.config.num_train_steps - 1) - (latest_step - 1) - 1
+                if steps_to_skip > 0:
+                    logger.info(f"Skipping {steps_to_skip} batches in reversed_train_loader to resume.")
+                    print(f"[DBG] Fast-forwarding dataloader by {steps_to_skip} steps...", flush=True)
+                    for _ in tqdm(range(steps_to_skip), desc="Fast-forwarding dataloader"):
+                        next(iter_data)
+                    print("[DBG] Dataloader fast-forward complete", flush=True)
+                rev_it = latest_step - 1
+                print(f"[DBG] rev_it set to {rev_it} after resume", flush=True)
 
         global_idx_start = (rev_it) * self.config.train_batch_size
         print(self.config)
+        print(f"[DBG] global_idx_start initialized to {global_idx_start}", flush=True)
 
         # Prefetch the first checkpoint
         if rev_it > 0:
+            print(f"[DBG] Prefetching checkpoint for step {rev_it - 1}...", flush=True)
             checkpointer.begin_checkpoint_loading(rev_it - 1, state)
+            print("[DBG] Prefetch request issued", flush=True)
 
         while rev_it >= 0:
-            print(f'------------------------------- Backward it: {rev_it} -------------------------------')
+            print(f'------------------------------- Backward it: {rev_it} -------------------------------', flush=True)
 
             if self.config.backward_profiler:
                 if rev_it == start_step:
@@ -1108,6 +1465,14 @@ class Trainer:
             checkpoint_duration = checkpoint_end_time - checkpoint_start_time
             print(f"[Timing] Checkpoint restoration for step {rev_it-1} took {checkpoint_duration:.3f}s", flush=True)
 
+            # Log sharding for restored state
+            try:
+                #_log_sharding("state.model (restored)", state.model)
+                #_log_sharding("state.opt_state (restored)", state.opt_state)
+                pass
+            except Exception:
+                pass
+
             # Prefetch the next checkpoint while we compute the current one
             if rev_it > 1:
                 checkpointer.begin_checkpoint_loading(rev_it - 2, state)
@@ -1142,34 +1507,32 @@ class Trainer:
 
             if self.config.metagrad_checkpoint_frequency > 0 and (rev_it % self.config.metagrad_checkpoint_frequency == 0):
                 logger.info(f"Checkpointing metagrad computation at step {rev_it}")
-                ckpt_path = str(metagrad_ckpt_dir / f"step_{rev_it}.npz")
+                ckpt_dir = fsspec_utils.join_path(metagrad_ckpt_dir, f"step-{rev_it}")
 
-                params_grad_leaves = jax.tree_util.tree_leaves(params_grad)
-                opt_grad_leaves = jax.tree_util.tree_leaves(opt_grad)
-
-                # Use a temporary file to prevent corruption from pre-emption
-                tmp_path = ckpt_path + ".tmp"
-                with fsspec.open(tmp_path, "wb") as f:
-                    np.savez(
-                        f,
-                        params_grad=np.array([np.asarray(p) for p in params_grad_leaves], dtype=object),
-                        opt_grad=np.array([np.asarray(o) for o in opt_grad_leaves], dtype=object),
-                        metagrads=np.asarray(metagrads),
-                    )
-
-                fs, _, (path,) = fsspec.get_fs_token_paths(ckpt_path)
-                fs.mv(tmp_path, path, recursive=True)
+                # Save using TensorStore-based checkpointing to preserve sharding (TPU-safe, supports gs://)
+                save_tree = {
+                    "params_grad": params_grad,
+                    "opt_grad": opt_grad,
+                    "metagrads": metagrads,
+                }
+                levanter.checkpoint.save_checkpoint(
+                    save_tree,
+                    step=rev_it,
+                    checkpoint_path=ckpt_dir,
+                    manager=None,
+                    is_temporary=False,
+                )
 
                 # After saving the current checkpoint, delete the previous one to save space.
                 # The reverse iteration goes down, so the previous checkpoint is at a higher step number.
                 prev_ckpt_step = rev_it + self.config.metagrad_checkpoint_frequency
                 if prev_ckpt_step < self.config.num_train_steps:
-                    prev_ckpt_path = str(metagrad_ckpt_dir / f"step_{prev_ckpt_step}.npz")
+                    prev_ckpt_path = fsspec_utils.join_path(metagrad_ckpt_dir, f"step-{prev_ckpt_step}")
                     try:
-                        # fs is from get_fs_token_paths, for the same directory, so it's fine
+                        fs, _, (base_path,) = fsspec.get_fs_token_paths(str(metagrad_ckpt_dir))
                         if fs.exists(prev_ckpt_path):
                             logger.info(f"Deleting old metagrad checkpoint at step {prev_ckpt_step}")
-                            fs.rm(prev_ckpt_path)
+                            fs.rm(prev_ckpt_path, recursive=True)
                     except Exception as e:
                         logger.warning(f"Failed to delete old metagrad checkpoint {prev_ckpt_path}: {e}")
 
@@ -1190,13 +1553,13 @@ class Trainer:
     ) -> Tuple[Dict[str, hax.NamedArray], jnp.ndarray]:
         """Re-indexes batch data for data weights"""
         original_indices = batch_data["index"]
-        indices_np = np.asarray(original_indices.array)
-        indices_flat = indices_np.flatten()
-        unique_indices_np, inverse_indices_np = np.unique(indices_flat, return_inverse=True)
+        # Perform unique/inverse on-device to avoid fetching non-addressable shards to host
+        indices_jax = original_indices.array
+        indices_flat = jnp.ravel(indices_jax)
+        unique_indices, inverse_indices = jnp.unique(indices_flat, return_inverse=True)
 
-        local_indices_jnp = jnp.array(inverse_indices_np.reshape(indices_np.shape), dtype=original_indices.dtype)
+        local_indices_jnp = jnp.reshape(inverse_indices, indices_jax.shape).astype(original_indices.dtype)
         local_indices = hax.named(local_indices_jnp, original_indices.axes)
-        unique_indices = jnp.array(unique_indices_np)
 
         batch_data_local = batch_data.copy()
         batch_data_local["index"] = local_indices
@@ -1219,6 +1582,11 @@ class Trainer:
         Returns:
             Tuple of (updated_params_grad, updated_opt_grad, metagrads_for_batch, unique_indices)
         """
+
+        # sanity: list what's matchable
+        if jax.process_index() == 0:
+            list_weight_paths(initial_params, limit=50)
+
         data_processing_start = time.time()
         batch_data_local, unique_indices = self._reindex_interval_data(batch_data)
         interval_weights = data_weight_vector.at[unique_indices].get()
@@ -1226,11 +1594,40 @@ class Trainer:
 
         vjp_start = time.time()
 
+        #try:
+        #    _log_sharding("vjp start params_grad", params_grad)
+        #    _log_sharding("vjp start opt_grad", opt_grad)
+        #except Exception:
+        #    pass
+
+        # choose which layer to inspect
+        LAYER = "embeddings.token_embeddings.weight" #"attn.c_attn.weight"   # or "attn.c_proj.weight", "mlp.c_fc.weight", "token_embeddings.weight"
+
+        # --- BEFORE sharded_update ---
+        log_layer_sharding("pre/initial_params", initial_params, LAYER)
+        log_layer_sharding("pre/params_grad",    params_grad,     LAYER)
+        log_layer_sharding("pre/opt_grad",       opt_grad,        LAYER)
+
         avg_grad_grad, train_state_grad, loss = eqx.filter_jit(sharded_update, donate='all-except-first')( # donate_argnums=(4, 5))(
             (initial_params, initial_opt_state, interval_weights,
             batch_data_local), params_grad, opt_grad
         )
+
         params_grad_new, opt_grad_new = train_state_grad
+
+        # --- AFTER sharded_update ---
+        # after JIT boundary
+        log_layer_sharding("post/avg_grad_grad",   avg_grad_grad,   LAYER)
+        log_layer_sharding("post/params_grad_new", params_grad_new, LAYER)
+        log_layer_sharding("post/opt_grad_new",    opt_grad_new,    LAYER)
+
+        # Log sharding for VJP outputs
+        #try:
+        #    _log_sharding("post sharded_updateavg_grad_grad", avg_grad_grad)
+        #    _log_sharding("post sharded_update params_grad_new", params_grad_new)
+        #    _log_sharding("post sharded_update opt_grad_new", opt_grad_new)
+        #except Exception:
+        #    pass
 
         metagrads_for_batch_local, _, _ = eqx.filter_jit(self.run_vjp_grad)( #), donate_argnums=(0, 1, 4))(
             initial_params, initial_opt_state, interval_weights,
@@ -1648,6 +2045,25 @@ class TrainerConfig:
         self.distributed.initialize()
         self._validate_and_set_defaults()
 
+        # Debug: summarize partitioning topology and mappings
+        try:
+            print(
+                f"[TrainerConfig DBG] axes: batch_axis={self.batch_axis} fsdp_axis={self.fsdp_axis} tp_axes={self.tensor_parallel_axes}",
+                flush=True,
+            )
+            print(
+                f"[TrainerConfig DBG] sizes: replica_ici={self.replica_ici_axis_size} data_ici={self.data_ici_axis_size} "
+                f"model={self.model_axis_size} replica_dcn={self.replica_dcn_axis_size} data_dcn={self.data_dcn_axis_size} "
+                f"devices={jax.device_count()}",
+                flush=True,
+            )
+            print(
+                f"[TrainerConfig DBG] mappings: compute={self.compute_axis_mapping} params={self.parameter_axis_mapping}",
+                flush=True,
+            )
+        except Exception:
+            pass
+
         id = self._maybe_set_id()
         levanter.utils.logging.init_logging(self.log_dir, f"{id}.log")
         _initialize_global_tracker(self.tracker, id)
@@ -1892,4 +2308,3 @@ def _resolve_axis_in_tree(tree, axis):
                 pass
 
     raise ValueError(f"Could not find axis {axis} in tree {tree}")
-
