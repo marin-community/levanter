@@ -323,7 +323,6 @@ def _prefill_kernel(
     new_tokens, log_probs = hax.vmap(sampler, "position")(logits_at_samples, temps, key=prng_keys)
 
     # Update decode_state (also enqueues into the main decode queue)
-    print(new_tokens.shape)
     decode_state = gen_state.decode_state.update_tokens(new_tokens, new_slot_ids, log_probs, num_new_tokens)
 
     # Initialize outputs buffer and append prefill-sampled tokens

@@ -358,7 +358,6 @@ class DecodeState(eqx.Module):
         new_tokens = purge(new_tokens, should_purge)
         pos_ids = purge(pos_ids, should_purge)
         num_new_tokens_to_queue = hax.sum((~should_purge).astype(jnp.int32)).scalar()
-        # jax.debug.print("after {} {} {} {}", local_slot_ids, new_tokens, pos_ids, num_new_tokens_to_queue)
 
         # Enqueue tokens and their corresponding position ids into the queue
         new_tqueue = self.tqueue.enqueue_tokens(new_tokens, local_slot_ids, pos_ids, num_new_tokens_to_queue)
