@@ -11,10 +11,11 @@ from dataclasses import dataclass, field
 from typing import Optional, Union
 from pathlib import Path
 import numpy as np
+import equinox as eqx
 #from jax import config as jcfg
 #jcfg.update("jax_experimental_name_stack", True)
 
-os.environ['XLA_FLAGS'] = '--xla_gpu_deterministic_ops=true'
+#os.environ['XLA_FLAGS'] = '--xla_gpu_deterministic_ops=true'
 
 import jax.numpy as jnp
 import jax.random as jrandom
@@ -36,6 +37,7 @@ from levanter.models.llama import LlamaConfig
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, compute_next_token_loss
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.trainer import Trainer, TrainerConfig
+from levanter.tracker.wandb import WandbConfig
 from levanter.utils.jax_utils import parameter_count
 
 import fsspec
@@ -256,6 +258,16 @@ def main(config: TrainLmConfig):
         )
         # trainer.add_hook(callbacks.GradWatchCallback(include_histograms=True), every=5)
 
+        # Periodically upload XLA dumps to W&B if enabled in tracker config.
+        # Uses existing callbacks.wandb_xla_logger which filters files by mtime.
+        tracker_cfg = trainer.config.tracker
+        cfgs = tracker_cfg if isinstance(tracker_cfg, tuple) else (tracker_cfg,)
+        for c in cfgs:
+            if isinstance(c, WandbConfig) and c.save_xla_dumps:
+                # Default to every eval interval if available; otherwise, every 300 steps.
+                freq = getattr(config.trainer, 'steps_per_eval', None) or 300
+                trainer.add_hook(callbacks.wandb_xla_logger(c), every=freq)
+
         if config.hf_save_path is not None and config.hf_save_steps is not None:
             # bit gross to reach this far into the config, but it's fine
             if config.trainer.checkpointer.append_run_id_to_base_path:
@@ -378,8 +390,8 @@ def main(config: TrainLmConfig):
 
     # This isn't necessary except when Levanter is run in a subprocess (as happens w/ ray)
     trainer.tracker.finish()
+    eqx.clear_caches()
 
 
 if __name__ == "__main__":
     levanter.config.main(main)()
-

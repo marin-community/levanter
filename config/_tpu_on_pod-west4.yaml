@@ -1,32 +1,30 @@
 resources:
-  tpu_type: v4-64
+  tpu_type: v5litepod-128
   slice_count: 1
 
 train_config:
   data:
     train_urls:
-      - "gs://data-values/fineweb_edu_10bt_shuffled/fineweb_edu_10bt.chunk.00.jsonl"
+      - "gs://data-values-europe-west4-b/fineweb_edu_10bt_shuffled/fineweb_edu_10bt.chunk.00.jsonl"
     validation_urls:
-      - "gs://data-values/fineweb_edu_10bt_shuffled/fineweb_edu_10bt.val.jsonl"
-    cache_dir: "gs://data-values/fineweb_edu_10bt_shuffled/cache"
+      - "gs://data-values-europe-west4-b/fineweb_edu_10bt_shuffled/fineweb_edu_10bt.val.jsonl"
+    cache_dir: "gs://data-values-europe-west4-b/fineweb_edu_10bt_shuffled/cache"
     #id: dlwh/wikitext_103_detokenized
     #id: Tristan/RedPajama-Data-V2-sample-100B-filtered-shuffled-tokenized-with-token-counts
   model:
     type: gpt2
-    hidden_dim: 2048
-    num_heads: 16
-    num_layers: 16
-    seq_len: 1024
+    hidden_dim: 768
+    num_heads: 12
+    num_layers: 12
+    seq_len: 128
     gradient_checkpointing: true
-    layer_norm_epsilon: 1e-6
+    layer_norm_epsilon: 1e-2
     qk_norm: true
-    attn_backend: "splash"
   trainer:
-    mp: p=f32,c=bfloat16
-    fsdp_axis: "embed"
+    mp: p=f32,c=f32
     model_axis_size: 1
-    per_device_parallelism: 16
-    per_device_eval_parallelism: 16
+    per_device_parallelism: 32
+    per_device_eval_parallelism: 32
 
     profiler_tpu_trace_mode: "TRACE_COMPUTE_AND_SYNC"
     profiler: false
@@ -37,8 +35,8 @@ train_config:
     backward_profiler_num_steps: 2
     log_dir: "jax_profile_traces"
 
-    train_batch_size: 1024
-    num_train_steps: 20_000
+    train_batch_size: 8192
+    num_train_steps: 5
     max_eval_batches: 1
 
     ray:
@@ -47,13 +45,13 @@ train_config:
     tracker:
       - type: wandb
         project: "levanter"
-        name: "tpu_1B_fast"
+        name: "tpu_test_s128"
 
     checkpointer:
       keep:
         - every: 1
       save_interval: 5m
-      base_path: "gs://data-values/checkpoints/test_1B_fast/"
+      base_path: "gs://data-values-europe-west4-b/checkpoints/test/"
 
 
     load_debug_weights: false
@@ -74,9 +72,7 @@ train_config:
 
   out_dir: out_dir_test
   optimizer:
-    lr_schedule: cosine
-    learning_rate: 0.003
+    lr_schedule: linear
+    learning_rate: 1E-4
     weight_decay: 0.1
-    warmup: 0.05
-    min_lr_ratio: 0.1
-    max_grad_norm: 1.0
+    warmup: 0.1
