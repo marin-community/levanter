@@ -426,4 +426,3 @@ def _is_local_leader():
             atexit.register(_remove_if_possible, action_performed_file)
     except filelock.Timeout:
         return False
-

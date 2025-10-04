@@ -1,6 +1,3 @@
--europe-west4-b
-
-
 data:
   train_urls:
     - "gs://data-values-europe-west4-b/fineweb_edu_10bt_shuffled/fineweb_edu_10bt.chunk.00.jsonl"
