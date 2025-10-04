@@ -8,10 +8,9 @@ model:
 
 trainer:
   num_train_steps: 20
-  log_frequency: 1
-  eval_frequency: 0
   per_device_parallelism: 1
   train_batch_size: 2
+  steps_per_eval: 20
 
 optimizer:
   type: adam
