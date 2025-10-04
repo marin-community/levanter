@@ -196,6 +196,29 @@ class CausalLmDataset(AsyncDataset[LmExample]):
         return await self.dataset.final_length_is_known()
 
 
+class ZeroLossLmDataset(MappedAsyncDataset[LmExample, LmExample]):
+    """Wraps an ``AsyncDataset[LmExample]`` and forces ``loss_mask`` to zeros.
+
+    This makes the dataset contribute zero training loss while preserving tokens and attention masks.
+    Useful for mixing in a "dummy" dataset in an ``LMMixtureDatasetConfig``.
+    """
+
+    def __init__(self, base: AsyncDataset[LmExample], Pos: Axis):
+        self.Pos = Pos
+
+        def _to_zero(ex: LmExample) -> LmExample:
+            zero_mask = hax.zeros(self.Pos, dtype=jnp.int32)
+            return LmExample(
+                tokens=ex.tokens,
+                loss_mask=zero_mask,
+                attn_mask=ex.attn_mask,
+                index=ex.index,
+                dataset_id=ex.dataset_id,
+            )
+
+        super().__init__(base, _to_zero)
+
+
 def _maybe_force_tokenizer_parallelism(tokenizer: PreTrainedTokenizerBase):
     if tokenizer.is_fast and os.getenv("TOKENIZERS_PARALLELISM") is None:
         # if we're using a fast tokenizer, we want to force parallelism
@@ -1158,6 +1181,9 @@ class LMMixtureDatasetConfig(LMTaskConfig):
 
     stop_strategy: str = field(default=StopStrategy.RESTART_STRATEGY)
 
+    # Names of datasets (keys in configs) to wrap in ZeroLossLmDataset so they contribute zero loss.
+    zero_loss_datasets: Optional[List[str]] = None
+
     # Configuration for Simulated Epoching
     target_budget: Optional[int] = None
     experiment_budget: Optional[int] = None
@@ -1206,6 +1232,15 @@ class LMMixtureDatasetConfig(LMTaskConfig):
             )
             for name, cache in caches.items()
         }
+
+        # Optionally wrap selected datasets to force zero loss contribution
+        if self.zero_loss_datasets:
+            for name in self.zero_loss_datasets:
+                if name in token_datasets:
+                    token_datasets[name] = ZeroLossLmDataset(token_datasets[name], Pos)
+                    logger.info(f"Wrapped dataset '{name}' with ZeroLossLmDataset (zero loss masking enabled)")
+                else:
+                    logger.warning(f"zero_loss_datasets contains '{name}' which is not present in built caches")
 
         return token_datasets
 

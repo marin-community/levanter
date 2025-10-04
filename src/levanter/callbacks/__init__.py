@@ -73,7 +73,9 @@ def compute_validation_loss(
     name: Optional[str] = None,
 ):
     def compute_loss(info: StepInfo):
-        loss = eval_loss_loop(loss_fn, info.eval_model, dataset, max_batches=max_batches, name=name)
+        # Use info.model instead of info.eval_model to avoid creating fresh model objects
+        # that change jit cache keys. The eval_loss function handles inference_mode internally.
+        loss = eval_loss_loop(loss_fn, info.model, dataset, max_batches=max_batches, name=name)
 
         prefix = "eval"
         if name:

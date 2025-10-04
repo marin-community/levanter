@@ -1,6 +1,3 @@
-# Copyright 2025 The Levanter Authors
-# SPDX-License-Identifier: Apache-2.0
-
 import dataclasses
 import functools
 import gc
@@ -34,14 +31,15 @@ from levanter.checkpoint import load_checkpoint
 from levanter.compat.hf_checkpoints import HFCompatConfig, save_hf_checkpoint_callback
 from levanter.data.text import LMMixtureDatasetConfig, SingleDatasetLMConfig, UrlSingleDatasetLMConfig
 from levanter.eval_harness import LmEvalHarnessConfig
-from levanter.models.llama import LlamaConfig
+from levanter.models.gpt2 import Gpt2Config
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, compute_next_token_loss
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.tracker.wandb import WandbConfig
-from levanter.utils.jax_utils import parameter_count
+from levanter.utils.jax_utils import parameter_count, multihost_broadcast_sync
 
 import fsspec
+from levanter.utils import fsspec_utils
 import subprocess
 
 def print_host_memory_usage():
@@ -73,7 +71,7 @@ logger = logging.getLogger(__name__)
 class TrainLmConfig:
     data: Union[SingleDatasetLMConfig, LMMixtureDatasetConfig] = field(default_factory=UrlSingleDatasetLMConfig)
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
-    model: LmConfig = field(default_factory=LlamaConfig)
+    model: LmConfig = field(default_factory=Gpt2Config)
     optimizer: OptimizerConfig = field(default_factory=AdamConfig)
 
     # config related to continued pretraining
@@ -112,6 +110,22 @@ class TrainLmConfig:
 
 
 def main(config: TrainLmConfig):
+    # Print JAX/JAXLIB versions early for cluster log introspection
+    try:
+        import jaxlib  # type: ignore
+        try:
+            jaxlib_version = getattr(jaxlib, "__version__", None)
+            if jaxlib_version is None:
+                from jaxlib import version as jaxlib_version_mod  # type: ignore
+                jaxlib_version = getattr(jaxlib_version_mod, "__version__", "unknown")
+        except Exception:
+            jaxlib_version = "unknown"
+    except Exception:
+        jaxlib_version = "unknown"
+
+    print(f"JAX version: {jax.__version__}", flush=True)
+    print(f"jaxlib version: {jaxlib_version}", flush=True)
+
     tokenizer = config.data.the_tokenizer
 
     # print the special tokens
@@ -203,7 +217,7 @@ def main(config: TrainLmConfig):
 
 
         if int(state.step) == 0 and config.initialize_from_checkpoint_path is not None:
-            logger.info(f"Initializing model weights from checkpoint {config.initialize_from_checkpoint_path}")
+            print(f"*** Initializing model weights from checkpoint {config.initialize_from_checkpoint_path}", flush=True)
             # By default, state.step is 0 and we have a fresh model.
             # We load just the model weights from the checkpoint and replace the model in the fresh state.
             # This leaves the step and optimizer state as new.
@@ -291,13 +305,23 @@ def main(config: TrainLmConfig):
             )
 
         if config.eval_harness is not None:
-            eval_harness = config.eval_harness
-            trainer.add_hook(
-                levanter.eval_harness.lm_eval_harness(
-                    eval_harness, tokenizer, EvalBatch, compute_axis_mapping, trainer.mp
-                ),
-                every=config.eval_harness_steps,
-            )
+            try:
+                import lm_eval  # type: ignore
+                _ = lm_eval  # quiet unused
+                eval_harness = config.eval_harness
+                trainer.add_hook(
+                    levanter.eval_harness.lm_eval_harness(
+                        eval_harness,
+                        tokenizer,
+                        EvalBatch,
+                        compute_axis_mapping,
+                        trainer.mp,
+                        checkpoint_base_path=trainer.checkpoint_path,
+                    ),
+                    every=config.eval_harness_steps,
+                )
+            except Exception:
+                logger.warning("lm-evaluation-harness is not installed; skipping eval harness hook registration.")
 
         @named_jit(
             in_axis_resources=parameter_axis_mapping,
@@ -343,6 +367,8 @@ def main(config: TrainLmConfig):
             if i >= 1: # Print 5 examples
                 break
 
+            tokenizer = config.data.the_tokenizer
+
             # Decode a whole batch at once; rely on skip_special_tokens to drop PAD/EOS
             input_ids = np.asarray(example.tokens.array).astype(int)
             texts = tokenizer.batch_decode(
@@ -384,31 +410,91 @@ def main(config: TrainLmConfig):
         ## OK, actually run training!
         #last_info = trainer.train(state, train_loader)
         #data_weight_vector = jnp.ones(len(train_dataset) * trainer.config.batch_size)
-        data_weight_vector = jnp.ones(100_000) # TODO: placeholder
+        data_weight_vector = jnp.ones(trainer.config.num_train_steps * trainer.config.train_batch_size)
 
-        if config.train_only:
+        #if config.train_only:
             # randomly set 5% of indices to 0
-            data_weight_vector = jax.random.bernoulli(jax.random.PRNGKey(config.cfx_seed), 0.95, data_weight_vector.shape).astype(jnp.float32)
+            #data_weight_vector = jax.random.bernoulli(jax.random.PRNGKey(config.cfx_seed), 0.95, data_weight_vector.shape).astype(jnp.float32)
             #data_weight_vector = data_weight_vector.at[:1024*40].set(1.0)
         print(f"data_weight_vector: {data_weight_vector[:100]}")
+        # save data_weight_vector to out_dir
+        if True:
+            out_dir = config.out_dir
+            fsspec_utils.mkdirs(out_dir)
+
+            def _save_array(filename, array):
+                if array is None:
+                    return
+                out_path = fsspec_utils.join_path(out_dir, filename)
+                fs, plain_path = fsspec.core.url_to_fs(out_path)
+                with fs.open(plain_path, "wb") as f:
+                    np.save(f, array)
+
+            _save_array('data_weight_vector.npy', data_weight_vector)
+
+        # If an eval harness is specified, build a reward loader from its tasks (e.g., arc_easy)
+        reward_loader = val_loader
+        used_lm_eval_reward = False
+        logger.info("[RewardLoader] eval_harness configured: %s", config.eval_harness is not None)
+        #try:
+        if config.eval_harness is not None:
+            from levanter.eval_harness import build_reward_loader_for_tasks
+            max_eval_length = config.eval_harness.max_eval_length
+            EvalPos = state.model.Pos if max_eval_length is None else state.model.Pos.resize(max_eval_length)
+            logger.info(
+                "\n\n\n\n\n[RewardLoader] Using LM-Eval tasks for reward | max_eval_length=%s",
+                max_eval_length,
+            )
+            reward_loader = build_reward_loader_for_tasks(
+                config.eval_harness,
+                tokenizer,
+                trainer.EvalBatch,
+                EvalPos,
+            )
+            used_lm_eval_reward = True
+        else:
+            logger.info("[RewardLoader] Using validation loader for reward (no eval_harness configured)")
+
+        #except Exception as e:
+        #logger.warning(f"\n\n\n\n\n[RewardLoader] Falling back to standard val_loader for reward due to: {e}")
+        #logger.info("[RewardLoader] Using validation loader for reward")
+
+        logger.info("[RewardLoader] Final selection: %s", "LM-Eval" if used_lm_eval_reward else "Validation loader")
 
         ret = trainer.train_and_replay(
             state,
             train_loader,
             reversed_train_loader,
-            val_loader,
+            reward_loader,
             data_weight_vector,
             segment_starts,
             train_only=config.train_only,
         )
         reward, metagrads, dataset_ids_global, local_indices_global = ret
-        out_dir = Path(config.out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        np.save(out_dir / 'reward.npy', reward)
-        np.save(out_dir / 'metagrads.npy', metagrads)
-        np.save(out_dir / 'dataset_ids_global.npy', dataset_ids_global)
-        np.save(out_dir / 'local_indices_global.npy', local_indices_global)
-        np.save(out_dir / 'data_weight_vector.npy', data_weight_vector)
+        save_success = False
+        try:
+            if jax.process_index() == 0:
+                out_dir = config.out_dir
+                fsspec_utils.mkdirs(out_dir)
+
+                def _save_array(filename, array):
+                    if array is None:
+                        return
+                    out_path = fsspec_utils.join_path(out_dir, filename)
+                    fs, plain_path = fsspec.core.url_to_fs(out_path)
+                    with fs.open(plain_path, "wb") as f:
+                        np.save(f, array)
+
+                _save_array('reward.npy', reward)
+                _save_array('metagrads.npy', metagrads)
+                _save_array('dataset_ids_global.npy', dataset_ids_global)
+                _save_array('local_indices_global.npy', local_indices_global)
+                _save_array('data_weight_vector.npy', data_weight_vector)
+                save_success = True
+        except Exception:
+            logger.exception("Failed to save outputs to %s", config.out_dir)
+        # Ensure all hosts wait for IO result (helps remote FS consistency)
+        _ = multihost_broadcast_sync(int(save_success))
 
 
         # If running EpochDataset save latest checkpoint by default
