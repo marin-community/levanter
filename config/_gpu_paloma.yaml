@@ -3,13 +3,13 @@ data:
   configs:
     dolma-algebraic-stack:
       train_urls:
-        - gs://marin-us-central2/raw/dolma/v1.7/algebraic-stack-train-{0000..0015}.json.gz
+        - gs://marin-us-central2/raw/dolma/v1.7/algebraic-stack-train-{0000..0000}.json.gz
     dolma-arxiv:
       train_urls:
-        - gs://marin-us-central2/raw/dolma/v1.7/arxiv-{0000..0099}.json.gz
-    dolma-stackexchange:
-      train_urls:
-        - gs://marin-us-central2/raw/dolma/v1.7/stackexchange-{0000..0025}.json.gz
+        - gs://marin-us-central2/raw/dolma/v1.7/arxiv-{0000..0000}.json.gz
+    #dolma-stackexchange:
+    #  train_urls:
+    #    - gs://marin-us-central2/raw/dolma/v1.7/stackexchange-{0000..0000}.json.gz
     # these are just for eval
     "paloma/dolma_100_programing_languages":
       validation_urls:
@@ -18,8 +18,17 @@ data:
     # sampling proportion comes from https://huggingface.co/datasets/allenai/dolma
     dolma-algebraic-stack: 1.0 # 12.6 * 1.0
     dolma-arxiv: 1.0 # 28.0 * 1.0
-    dolma-stackexchange: 1.0 # 1.0
+    #dolma-stackexchange: 1.0 # 1.0
     paloma/dolma_100_programing_languages: 0.0
+  zero_loss_datasets:
+    - dolma-algebraic-stack
+
+eval_harness:
+  task_spec:
+    - task: arc_easy
+      num_fewshot: 0
+  max_eval_length: 128
+  max_examples: 10
 
 model:
   type: gpt2
@@ -34,8 +43,8 @@ trainer:
   mp: p=f32,c=f32
   model_axis_size: 1
   fsdp_axis: "embed"
-  per_device_parallelism: 64
-  per_device_eval_parallelism: 64
+  per_device_parallelism: 4
+  per_device_eval_parallelism: 4
 
   profiler: false
   profiler_start_step: 2
@@ -45,8 +54,8 @@ trainer:
   backward_profiler_num_steps: 2
   log_dir: "jax_profile_traces"
 
-  train_batch_size: 128
-  num_train_steps: 12
+  train_batch_size: 16
+  num_train_steps: 8
   max_eval_batches: 1
 
   ray:
@@ -61,9 +70,7 @@ trainer:
     keep:
       - every: 1
     save_interval: 5m
-    base_path: /juice5b/scr5b/sampark/levanter/checkpoints
-
-  id: test_sqrt_segment_replay_v2
+    base_path: /juice5b/scr5b/sampark/levanter/checkpoints/test_mixture
 
   load_debug_weights: false
 
@@ -76,6 +83,9 @@ trainer:
     include_norms: true
     include_per_parameter_norms: true
     interval: 10
+
+  debug_print_loss_mask: true
+  debug_print_loss_mask_values: true
 
 out_dir: out_dir_test
 optimizer:

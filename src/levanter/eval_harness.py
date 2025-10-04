@@ -56,6 +56,7 @@ from levanter.models.loss import next_token_loss
 from levanter.utils.background_iterable import BackgroundIterator
 from levanter.utils.hf_utils import HfTokenizer
 from levanter.utils.py_utils import set_global_rng_seeds
+from levanter.layers.attention import AttentionMask
 
 try:
     from lm_eval import evaluator
@@ -74,13 +75,13 @@ from haliax.partitioning import ResourceMapping, round_axis_for_partitioning
 from tqdm_loggable.auto import tqdm
 
 import levanter.config
-from levanter.callbacks import StepInfo
+from levanter.callbacks import Callback, StepInfo
 from levanter.checkpoint import load_checkpoint
 from levanter.data import batched
 from levanter.data.loader import stack_batches
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
 from levanter.trainer import TrainerConfig
-from levanter.utils.jax_utils import broadcast_shard, use_cpu_device
+from levanter.utils.jax_utils import broadcast_shard, multihost_broadcast_sync, use_cpu_device
 from levanter.utils.tree_utils import inference_mode
 
 logger = logging.getLogger(__name__)
@@ -113,6 +114,24 @@ class SampleLoggingConfig:
             return True
         assert self.max_samples_per_benchmark is not None
         return current_count < self.max_samples_per_benchmark
+
+# Ensure outputs are JSON-serializable (handle numpy/jax types)
+def _to_jsonable(value):
+    if isinstance(value, dict):
+        return {k: _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    try:
+        import numpy as _np  # local alias to avoid polluting namespace
+        import jax.numpy as _jnp
+
+        if isinstance(value, _np.generic):
+            return value.item()
+        if isinstance(value, (_np.ndarray, _jnp.ndarray)):
+            return value.tolist()
+    except Exception:
+        pass
+    return value
 
 
 # OK, so LM-Eval-Harness is not deterministic. This means we can't just run it on different workers and expect the
@@ -1204,6 +1223,23 @@ def run_eval_harness_main(config: EvalHarnessMainConfig):
                 f_path = f.name
                 levanter.tracker.current_tracker().log_artifact(f_path, name="lm_eval_harness_results")
 
+            # Also save to the provided checkpoint path under latest step dir if available
+            try:
+                if config.checkpoint_path:
+                    from levanter.utils import fsspec_utils
+                    import os
+                    latest_ckpt = __import__("levanter.checkpoint").checkpoint.discover_latest_checkpoint(config.checkpoint_path)  # type: ignore[attr-defined]
+                    target_dir = latest_ckpt or config.checkpoint_path
+                    # If target_dir is a top-level path without step-*, still write a top-level JSON
+                    out_path = fsspec_utils.join_path(target_dir, "lm_eval_harness_results.json")
+                    fs, plain_path = __import__("levanter.checkpoint").checkpoint._get_fs_and_plain_path(out_path)  # type: ignore[attr-defined]
+                    fs.makedirs(os.path.dirname(plain_path), exist_ok=True)
+                    with fs.open(plain_path, "w") as outf:
+                        json.dump(outputs, outf, indent=2)
+                    logger.info("Saved eval harness results to %s", out_path)
+            except Exception:
+                logger.exception("Failed to save eval harness results to checkpoint path in main")
+
             print(json.dumps(outputs, indent=2), flush=True)
 
         return outputs
@@ -1234,43 +1270,80 @@ def log_report_to_tracker(prefix: str, report: dict, tracker: Optional[levanter.
     tracker.log(to_log, step=None)
 
 
-def lm_eval_harness(config: LmEvalHarnessConfig, tokenizer, EvalBatch, axis_resources, mp: jmp.Policy | None):
+def lm_eval_harness(
+    config: LmEvalHarnessConfig,
+    tokenizer,
+    EvalBatch,
+    axis_resources,
+    mp: jmp.Policy | None,
+    *,
+    checkpoint_base_path: str | None = None,
+):
     tasks_to_run = config.to_task_dict()
 
-    def lm_eval_harness(step: StepInfo, force=False):
-        if step.step == 0 and not force:
-            return
+    class _EvalHarnessCallback(Callback):
+        def on_step(self, step: StepInfo, force: bool = False):
+            if step.step == 0 and not force:
+                return
 
-        model = step.eval_model
-        logger.info("Running eval harness...")
-        outputs = _actually_run_eval_harness(
-            config,
-            model,
-            tasks_to_run,
-            tokenizer,
-            EvalBatch,
-            axis_resources,
-            mp,
-        )
-        logger.info("Finished running eval harness.")
+            model = step.eval_model
+            logger.info("Running eval harness...")
+            outputs = _actually_run_eval_harness(
+                config,
+                model,
+                tasks_to_run,
+                tokenizer,
+                EvalBatch,
+                axis_resources,
+                mp,
+            )
+            logger.info("Finished running eval harness.")
 
-        if jax.process_index() == 0:
-            assert outputs is not None
-            log_report_to_tracker("lm_eval", outputs, levanter.tracker.current_tracker())
-            logger.info("Logged report to tracker")
+            # Only process 0 does IO; broadcast success back to others for synchronization
+            save_success = False
+            if jax.process_index() == 0:
+                assert outputs is not None
+                log_report_to_tracker("lm_eval", outputs, levanter.tracker.current_tracker())
+                logger.info("Logged report to tracker")
 
-            # don't delete b/c wandb will sometimes defer upload
-            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as f:
-                import json
+                # don't delete b/c wandb will sometimes defer upload
+                with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as f:
+                    json.dump(_to_jsonable(outputs), f)
+                    f.flush()
+                    levanter.tracker.current_tracker().log_artifact(
+                        f.name, name=f"lm_eval_harness_results.{step.step}.json", type="lm_eval_output"
+                    )
+                    logger.info("Uploaded results to tracker")
 
-                json.dump(outputs, f)
-                f.flush()
-                levanter.tracker.current_tracker().log_artifact(
-                    f.name, name=f"lm_eval_harness_results.{step.step}.json", type="lm_eval_output"
-                )
-                logger.info("Uploaded results to tracker")
+                # Optionally save a copy under the trainer's checkpoint directory
+                if checkpoint_base_path is not None:
+                    try:
+                        from levanter.utils import fsspec_utils
+                        import fsspec
 
-    return lm_eval_harness
+                        # Deterministically write under the expected step directory
+                        target_dir = fsspec_utils.join_path(checkpoint_base_path, f"step-{step.step}")
+                        fsspec_utils.mkdirs(target_dir)
+                        out_path = fsspec_utils.join_path(target_dir, "lm_eval_harness_results.json")
+                        fs, plain_path = fsspec.core.url_to_fs(out_path)
+                        with fs.open(plain_path, "w") as outf:
+                            json.dump(_to_jsonable(outputs), outf, indent=2)
+                        logger.info("Saved eval harness results to %s", out_path)
+
+                        # Also write a copy at the checkpoint base for easier discovery
+                        base_out = fsspec_utils.join_path(checkpoint_base_path, f"lm_eval_harness_results.step-{step.step}.json")
+                        fs2, plain_base = fsspec.core.url_to_fs(base_out)
+                        with fs2.open(plain_base, "w") as outf2:
+                            json.dump(_to_jsonable(outputs), outf2, indent=2)
+                        logger.info("Saved eval harness results to %s", base_out)
+                        save_success = True
+                    except Exception:
+                        logger.exception("Failed to save eval harness results to checkpoint path")
+
+            # Ensure all hosts wait for IO result (helps remote FS consistency)
+            _ = multihost_broadcast_sync(int(save_success), is_source=True)
+
+    return _EvalHarnessCallback()
 
 
 # lifted from lm-eval simple_evaluate
@@ -1346,6 +1419,243 @@ def _pack_requests(
         max_segments_per_example=max_pack_size,
         pad_token=tokenizer.pad_token_id,
     )
+
+
+def build_reward_loader_for_tasks(
+    config: LmEvalHarnessConfig,
+    tokenizer: HfTokenizer,
+    EvalBatch: hax.Axis,
+    EvalPos: hax.Axis,
+) -> BackgroundIterator:
+    """
+    Build a BackgroundIterator of LmExample batches suitable for differentiable reward computation
+    from simple LM-Eval tasks. This constructs loglikelihood requests for each sample's gold target
+    (zero-shot), packs them with prompt-masked loss, and returns a batched iterator.
+
+    Notes:
+      - Currently supports simple zero-shot usage of tasks where doc_to_text/doc_to_target are defined
+        (e.g., arc_easy). Few-shot templating via LM-Eval is not applied in this helper.
+    """
+    try:
+        import lm_eval.tasks as tasks  # type: ignore
+        from lm_eval.api.instance import Instance  # type: ignore
+    except Exception as e:  # pragma: no cover - optional dependency
+        raise ImportError("lm-evaluation-harness is required to build reward loader") from e
+
+    manager = tasks.TaskManager()
+
+    # Ensure pad token is defined; otherwise packing will insert None paddings -> object dtype
+    try:
+        if tokenizer.pad_token_id is None:
+            logger.warning("[RewardLoader] No pad token set. Setting pad_token_id=eos_token_id=%s", tokenizer.eos_token_id)
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+    except Exception:
+        pass
+
+    # Resolve a flat list of (name, task_obj) to iterate
+    task_items: list[tuple[str, object]] = []
+    task_names: list[str] = []
+    for spec in config.to_task_spec():
+        if isinstance(spec, str):
+            # Use list form to be robust across lm-eval versions
+            td = tasks.get_task_dict([spec], manager)
+            for name, obj in td.items():
+                task_items.append((name, obj))
+                task_names.append(name)
+        elif isinstance(spec, dict):
+            # Minimal support: treat like string under key "task"
+            name = spec.get("task")
+            if name is None:
+                continue
+            td = tasks.get_task_dict([name], manager)
+            for n, obj in td.items():
+                task_items.append((n, obj))
+                task_names.append(n)
+
+    requests: list[Instance] = []
+    max_examples = config.max_examples
+    # Track how many examples we have collected per task
+    per_task_counts: dict[str, int] = {}
+
+    skipped_docs = 0
+    for task_name, task_obj in task_items:
+        # Each leaf of the dict may be a ConfigurableGroup or a concrete task
+        # We only handle concrete task objects that expose doc_to_text/doc_to_target and validation/test docs.
+        try:
+            # Prefer validation docs; fall back to test docs
+            if hasattr(task_obj, "validation_docs") and task_obj.validation_docs() is not None:
+                docs_iter = task_obj.validation_docs()
+            elif hasattr(task_obj, "test_docs") and task_obj.test_docs() is not None:
+                docs_iter = task_obj.test_docs()
+            else:
+                continue
+
+            # Honor per-task cap if specified
+            current_count = per_task_counts.get(task_name, 0)
+            if max_examples is not None and current_count >= max_examples:
+                continue
+
+            for idx, doc in enumerate(docs_iter):
+                # Build zero-shot context and gold target
+                if not hasattr(task_obj, "doc_to_text") or not hasattr(task_obj, "doc_to_target"):
+                    continue
+                ctx = task_obj.doc_to_text(doc)
+                tgt = task_obj.doc_to_target(doc)
+                if tgt is None:
+                    continue
+
+                # Normalize context to string
+                if not isinstance(ctx, str):
+                    try:
+                        ctx = str(ctx)
+                    except Exception:
+                        skipped_docs += 1
+                        continue
+
+                # Resolve target text robustly (MC tasks may return an index/label)
+                tgt_str: str
+                if isinstance(tgt, str):
+                    tgt_str = tgt
+                else:
+                    resolved = False
+                    # Try to map via choices if available
+                    try:
+                        if hasattr(task_obj, "doc_to_choice"):
+                            choices = task_obj.doc_to_choice(doc)
+                            # integer index
+                            if isinstance(tgt, (int, np.integer)) and 0 <= int(tgt) < len(choices):
+                                tgt_str = choices[int(tgt)]
+                                resolved = True
+                            # letter label -> index (A,B,C,...) if applicable
+                            elif isinstance(tgt, str) and len(tgt) == 1 and tgt.upper().isalpha():
+                                letter_idx = ord(tgt.upper()) - ord("A")
+                                if 0 <= letter_idx < len(choices):
+                                    tgt_str = choices[letter_idx]
+                                    resolved = True
+                    except Exception:
+                        pass
+
+                    if not resolved:
+                        try:
+                            tgt_str = str(tgt)
+                        except Exception:
+                            skipped_docs += 1
+                            continue
+
+                # Ensure a leading space for typical tokenization behavior on completions
+                if len(tgt_str) > 0 and not tgt_str.startswith(" "):
+                    tgt_str = " " + tgt_str
+
+                inst = Instance(
+                    request_type="loglikelihood",
+                    doc=doc,
+                    arguments=(ctx, tgt_str),
+                    idx=len(requests),
+                    metadata=(task_name, idx, None),
+                )
+                requests.append(inst)
+
+                # Update per-task count and break if this task reached its cap
+                current_count = per_task_counts.get(task_name, 0) + 1
+                per_task_counts[task_name] = current_count
+                if max_examples is not None and current_count >= max_examples:
+                    break
+        except Exception:
+            # Skip tasks we can't parse in this minimal helper
+            continue
+
+    # Debug: log requested tasks and request count
+    try:
+        logger.info(
+            "[RewardLoader] LM-Eval tasks resolved: %s | max_examples=%s",
+            sorted(set(task_names)),
+            config.max_examples,
+        )
+        logger.info(
+            "[RewardLoader] Built %d loglikelihood requests | EvalPos=%d | EvalBatch=%d",
+            len(requests),
+            EvalPos.size,
+            EvalBatch.size,
+        )
+        try:
+            logger.info("[RewardLoader] Skipped %d docs that could not be normalized", skipped_docs)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    print(f"[RewardLoader] Packing {len(requests)} requests", flush=True)
+    #print(f"[RewardLoader] Requests: {requests}", flush=True)
+
+    # Pack into LmExamples with prompt-masked loss and segment-aware causal attention
+    packed = _pack_requests(
+        requests,
+        tokenizer,
+        Pos=EvalPos,
+        max_pack_size=64,
+        apply_chat_template=config.apply_chat_template,
+    )
+
+    # Ensure optional metadata fields are numeric JAX arrays to satisfy JIT stacking
+    def _ensure_numeric_meta(ex: LmExample) -> LmExample:
+        try:
+            if ex.index is None:
+                ex = dataclasses.replace(ex, index=jnp.array(0, dtype=jnp.int32))
+            if ex.dataset_id is None:
+                ex = dataclasses.replace(ex, dataset_id=jnp.array(0, dtype=jnp.int32))
+        except Exception:
+            pass
+        return ex
+
+    def _materialize_attn_mask(ex: LmExample) -> LmExample:
+        attn = ex.attn_mask
+        try:
+            if isinstance(attn, AttentionMask):
+                # Ensure no None offset for vmap path even if unused
+                if attn.causal_offset is None:
+                    attn = AttentionMask(
+                        is_causal=attn.is_causal,
+                        causal_offset=hax.named(0, ()),
+                        explicit_mask=attn.explicit_mask,
+                        segment_ids=attn.segment_ids,
+                        sliding_window=attn.sliding_window,
+                    )
+                explicit = attn.materialize(EvalPos, EvalPos)
+                if explicit is not None:
+                    return dataclasses.replace(ex, attn_mask=explicit)
+        except Exception:
+            pass
+        return ex
+
+    packed = [_materialize_attn_mask(_ensure_numeric_meta(ex)) for ex in packed]
+
+    print(f"[RewardLoader] Packed {len(packed)} examples", flush=True)
+
+    # Pad to a full multiple of EvalBatch to avoid loader-inserted dummies with mismatched structure
+    remainder = len(packed) % EvalBatch.size
+    if remainder != 0 and len(packed) > 0:
+        pad_needed = EvalBatch.size - remainder
+        Pos = EvalPos
+        zero_tokens = hax.zeros(Pos, dtype=jnp.int32)
+        zero_loss = hax.zeros(Pos, dtype=jnp.int32)
+        pad_segs = hax.full(Pos, -1, dtype=jnp.int32)
+        # Causal mask with explicit materialized form
+        pad_attn = AttentionMask.causal(offset=0).with_segment_ids(pad_segs).materialize(Pos, Pos)
+
+        dummy = LmExample(
+            tokens=zero_tokens,
+            loss_mask=zero_loss,
+            attn_mask=pad_attn,
+            index=jnp.array(0, dtype=jnp.int32),
+            dataset_id=jnp.array(0, dtype=jnp.int32),
+        )
+        packed.extend([dummy] * pad_needed)
+
+    print(f"[RewardLoader] Padded to {len(packed)} examples", flush=True)
+
+    # Batch the packed examples
+    packed_iterator = stack_batches(iter(packed), EvalPos, EvalBatch)
+    return BackgroundIterator(packed_iterator, max_capacity=1024)
 
 
 def _make_dummy_batch(EvalBatch, EvalPos):
