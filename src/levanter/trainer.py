@@ -495,6 +495,9 @@ def make_train_functions(
         loss, grads = eqx.filter_checkpoint(
             lambda m: eqx.filter_value_and_grad(weighted_loss)(eqx.combine(m, static_model))
         )(differentiable_model)
+        #loss, grads = eqx.filter_value_and_grad(weighted_loss)(
+        #    eqx.combine(differentiable_model, static_model)
+        #)
 
         grad_buffer = jax.tree.map(lambda g_new, g: g + g_new, grads, grad_buffer)
         return (grad_buffer, loss_sum + loss), loss
@@ -669,10 +672,10 @@ def make_train_functions(
         #_debug_weight_sharding("vjp_update/grad_buffer_post_state_to_grads", grad_buffer)
 
         # 2) Forward leg: (avg grads, state) -> new state; apply grad sharding if provided
-        if grad_sharding is not None:
-            grad_buffer = hax.shard(grad_buffer, parameter_axis_mapping)
-            # Debug: sharding after applying grad_sharding constraint
-            #_debug_weight_sharding("vjp_update/grad_buffer_post_grad_sharding", grad_buffer)
+        #if grad_sharding is not None:
+        grad_buffer = hax.shard(grad_buffer, parameter_axis_mapping)
+        # Debug: sharding after applying grad_sharding constraint
+        #_debug_weight_sharding("vjp_update/grad_buffer_post_grad_sharding", grad_buffer)
         _, vjp_update_fun = eqx.filter_vjp(update_with_grads, grad_buffer, train_state)
         avg_grad_grad, train_state_grad = vjp_update_fun((params_grad, opt_grad))
 
@@ -1077,12 +1080,47 @@ class Trainer:
         # print optimizer info
         #print('$$$$ Optimizer info:', state.opt_state)
 
+        self.dataset_ids = []
+
         while int(state.step) < self.num_train_steps:
             print(f'\n\n------------------------------- Forward it: {state.step} -------------------------------')
             with capture_time() as loading_time:
                 try:
                     example = next(iter_data)
-                    print(f'> step: {state.step} | example tokens: {example.tokens.array} | example index: {example.index} | example dataset_id: {example.dataset_id}')
+                    self.dataset_ids.append(example.dataset_id)
+
+                    if int(state.step) == 0:
+                        # load gpt2 tokenizer
+                        from transformers import GPT2Tokenizer
+                        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+
+                        # Decode a whole batch at once; rely on skip_special_tokens to drop PAD/EOS
+                        input_ids = np.asarray(example.tokens.array).astype(int)
+                        texts = tokenizer.batch_decode(
+                            input_ids.tolist(),
+                            skip_special_tokens=True,
+                            clean_up_tokenization_spaces=False,
+                        )
+
+                        for j, text in enumerate(texts):
+                            print(f"Example {j}:")
+                            print(text)
+                            print("-" * 20)
+                            if j == 5:
+                                break
+
+                    if True: #self.config.debug_print_loss_mask:
+                        # Host-side quick stats for the fetched example
+                        mask_sum = int(hax.sum(example.loss_mask).item()) if hasattr(example, "loss_mask") else -1
+                        print(
+                            f'> step: {state.step} | ds_id: {getattr(example, "dataset_id", None)} | '
+                            f'idx: {getattr(example, "index", None)} | mask_sum: {mask_sum}',
+                            flush=True,
+                        )
+                        if True: #self.config.debug_print_loss_mask_values:
+                            print(f'  mask: {example.loss_mask.array.sum(1)}', flush=True)
+                    else:
+                        print(f'> step: {state.step} | example tokens: {example.tokens.array} | example index: {example.index} | example dataset_id: {example.dataset_id}')
                     self.consumed_tokens += example.tokens.size
                 except StopIteration:
                     logger.info("Reached end of training data loader")
@@ -1230,13 +1268,33 @@ class Trainer:
             final_model = inference_mode(final_model, True)
             final_model = self.mp.cast_to_compute(final_model)
 
+            # save dataset_ids
+            '''
+            out_dir = self.config.out_dir
+            fsspec_utils.mkdirs(out_dir)
+
+            def _save_array(filename, array):
+                if array is None:
+                    return
+                out_path = fsspec_utils.join_path(out_dir, filename)
+                fs, plain_path = fsspec.core.url_to_fs(out_path)
+                with fs.open(plain_path, "wb") as f:
+                    np.save(f, array)
+
+            _save_array('dataset_ids_global_fwd.npy', jnp.concatenate(self.dataset_ids))
+            '''
+            #self.dataset_ids = jnp.concatenate(self.dataset_ids)
+            #print('dataset_ids_global_fwd:', jnp.concatenate(self.dataset_ids))
 
             # 1) Define a scalar reward loss (same as you already do, just as a callable)
             def reward_loss_fn(model, batch):
                 with hax.axis_mapping(self.compute_axis_mapping):
                     losses = compute_next_token_loss(model, batch, reduction=None, reduction_axis=())
                     mask = batch.loss_mask
-                    return (-hax.einsum("->", losses, mask) / losses.axes[1].size).scalar()
+                    #debug.print("losses: {}", losses.array)
+                    #debug.print("mask: {}", mask.array)
+                    #debug.print("hax.sum(mask): {}", hax.sum(mask))
+                    return (-hax.einsum("->", losses, mask) / hax.sum(mask)).scalar()
 
             # JIT a plain two-arg function that calls your microbatched gradient helper
             def _reward_grad_step_impl(model, batch):
@@ -1261,6 +1319,7 @@ class Trainer:
             #_debug_weight_sharding("reward_grad_init/params_grad", params_grad)
 
             total_weights = 0.0
+            total_batches = 0
 
             # 3) Use the SAME microbatched machinery you use for training to compute reward grads
             reward = 0.0
@@ -1271,9 +1330,32 @@ class Trainer:
                 # Accumulate on device (params_grad is sharded, so we don't replicate)
                 params_grad = jax.tree_util.tree_map(jnp.add, params_grad, p_grad)
                 total_weights += val_batch.tokens.array.shape[0]
+                total_batches += 1
                 reward += loss
-                if i == 1: # TODO: fix this
-                    break
+
+                # decode the batch
+                if i == 0:
+                    # load gpt2 tokenizer
+                    from transformers import GPT2Tokenizer
+                    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+
+                    # Decode a whole batch at once; rely on skip_special_tokens to drop PAD/EOS
+                    input_ids = np.asarray(val_batch.tokens.array).astype(int)
+                    texts = tokenizer.batch_decode(
+                        input_ids.tolist(),
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    )
+
+                    for j, text in enumerate(texts):
+                        print(f"Example {i*input_ids.shape[0] + j}:")
+                        print(text)
+                        print("-" * 20)
+                        if j == 5:
+                            break
+
+            print(f'Total weights: {total_weights}', flush=True)
+            print(f'Total batches: {total_batches}', flush=True)
 
             # 4) Normalize once at the end
             if total_weights > 0:
@@ -1286,10 +1368,10 @@ class Trainer:
 
             #_debug_weight_sharding("reward_grad_init/params_grad", params_grad)
             #_debug_weight_sharding("reward_grad_init/opt_grad", opt_grad)
-            #print(f"Final reward: {reward}")
+            print(f"Final reward: {reward}")
 
             if train_only:
-                return reward, None
+                return reward, None, self.dataset_ids, None
 
             print('***** COMPUTED FINAL STATE GRADIENTS *****\n\n\n', flush=True)
 
@@ -1336,8 +1418,9 @@ class Trainer:
 
         # TODO: get this from actual config
         dim = 32 # self.config.model.hidden_dim
-        grad_sharding = jax.tree.map(lambda x: _make_opt_sharding(x, dim, self.device_mesh), params_grad)
-        print('opt grad_sharding:', grad_sharding, flush=True)
+        #grad_sharding = jax.tree.map(lambda x: _make_opt_sharding(x, dim, self.device_mesh), params_grad)
+        grad_sharding = None
+        #print('opt grad_sharding:', grad_sharding, flush=True)
         sharded_update = jax.tree_util.Partial(self.run_vjp_update, grad_sharding=grad_sharding)
 
         rev_it = self.config.num_train_steps - 1
@@ -1436,7 +1519,7 @@ class Trainer:
 
                 if rev_it == -1:
                     # Already fully computed
-                    return 0., None
+                    return 0., None, None, None
 
                 # prefetch data_batches_cache since lost on resume
                 segment_start = max([s for s in segment_starts if s <= rev_it])
@@ -1536,7 +1619,7 @@ class Trainer:
 
             # Retrieve the batch from cache for this step
             example = data_batches_cache[rev_it]
-
+            print(f'> backward step: {rev_it} | step: {state.step} | example tokens: {example.tokens.array} | example index: {example.index} | example dataset_id: {example.dataset_id}')
 
             # Prefetch the next checkpoint while we compute the current one
             if rev_it > 1:
@@ -1570,8 +1653,16 @@ class Trainer:
             # Accumulate metagrads by scattering in true train order using global indices
             metagrads = metagrads.at[metagrads_indices].add(metagrads_for_batch_local)
             # Record dataset id and local index aligned to global positions
+            print('len dataset_ids_global:', len(dataset_ids_global))
+            print('len metagrads_indices:', len(metagrads_indices))
+            print('len ds_ids_flat:', len(ds_ids_flat), flush=True)
             dataset_ids_global = dataset_ids_global.at[metagrads_indices].set(ds_ids_flat)
             local_indices_global = local_indices_global.at[metagrads_indices].set(local_idx_flat)
+
+            # if metagrads exceed threshold / blow up, terminate early
+            if jnp.any(jnp.abs(metagrads) > 1e6):
+                print('Metagrads blew up! Terminating...', flush=True)
+                raise ValueError('Metagrads blew up!')
 
             if self.config.metagrad_checkpoint_frequency > 0 and (rev_it % self.config.metagrad_checkpoint_frequency == 0):
                 logger.info(f"Checkpointing metagrad computation at step {rev_it}")
@@ -1620,9 +1711,9 @@ class Trainer:
             #self.debug_print('> iter:', rev_it, 'global_idx_start:', global_idx_start, 'example.tokens:', example.tokens)
             rev_it -= 1
 
-        print(f"metagrads: {metagrads[:100]}")
-        print(f"dataset_ids_global: {dataset_ids_global[:100]}")
-        print(f"local_indices_global: {local_indices_global[:100]}")
+        print(f"metagrads: {metagrads[:200]}")
+        print(f"dataset_ids_global: {dataset_ids_global[:200]}")
+        print(f"local_indices_global: {local_indices_global[:200]}")
 
         return reward, metagrads, dataset_ids_global, local_indices_global
 
@@ -1851,9 +1942,11 @@ class Trainer:
 
             @eqx.filter_jit
             def eval_loss(model, *batch, **batch_kwargs):
-                print('>>>>> EVAL MODE <<<<<')
-                model = self.mp.cast_to_compute(model)
-                return self.loss_fn(model, *batch, **batch_kwargs, key=None)
+                # Normalize eval pathway to avoid changing cache keys across steps.
+                # Set inference mode and dtype inside the JIT rather than swapping models outside.
+                m = inference_mode(model, True)
+                m = self.mp.cast_to_compute(m)
+                return self._raw_loss_function(m, *batch, **batch_kwargs).mean()
 
             self.add_hook(
                 callbacks.compute_validation_loss(
@@ -1929,8 +2022,24 @@ class Trainer:
             key, new_key = jax.random.split(state.training_key)
             model = inference_mode(state.model, False)
 
-            loss, grads = self._compute_gradients_microbatched(self.loss_fn, model, *batch,**batch_kwargs, key=key)
-            '''
+            # Optional in-JIT debug prints of loss mask and dataset id.
+            if self.config.debug_print_loss_mask:
+                try:
+                    ex = batch[0]
+                    # Print simple stats to avoid massive output.
+                    debug.print(
+                        "[JIT] step={} ds_id={} idx={} mask_sum={} mask_first5={}",
+                        state.step,
+                        getattr(ex, "dataset_id", None),
+                        getattr(ex, "index", None),
+                        hax.sum(ex.loss_mask),
+                        ex.loss_mask[:5],
+                    )
+                except Exception:
+                    pass
+
+            #loss, grads = self._compute_gradients_microbatched(self.loss_fn, model, *batch,**batch_kwargs, key=key)
+
             def loss_fn(model, *batch, key, **kwargs):
                 with hax.axis_mapping(self.compute_axis_mapping):
                     model = self.mp.cast_to_compute(model)
@@ -1953,9 +2062,8 @@ class Trainer:
                         unreduced_loss = hax.named(weighted_loss_array, unreduced_loss.axes)
 
                     return hax.mean(unreduced_loss).scalar()
-            '''
 
-            #loss, grads = self._compute_gradients_microbatched(loss_fn, model, *batch, **batch_kwargs, key=key)
+            loss, grads = self._compute_gradients_microbatched(loss_fn, model, *batch, **batch_kwargs, key=key)
             #metrics["grad_norm"] = optax.global_norm(grads)
 
             # Sophia needs to be able to access the loss function in the optimizer
@@ -2127,6 +2235,12 @@ class TrainerConfig:
     """Whether to log the jaxpr of the training step. This is useful for debugging and understanding the model."""
     log_xla_hlo: bool = True
     """Whether to log the XLA HLO of the training step. This is useful for debugging and understanding the model."""
+
+    # Debug printing controls
+    debug_print_loss_mask: bool = False
+    """If True, print loss mask stats for each example (host-side) and inside JIT (device-side)."""
+    debug_print_loss_mask_values: bool = False
+    """If True, also print the full loss mask values on the host. Potentially very verbose."""
 
     # helpful checks
     crash_on_nan: bool = True
