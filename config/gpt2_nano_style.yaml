@@ -4,7 +4,6 @@ model:
   hidden_dim: 256
   num_layers: 4
   num_heads: 4
-  vocab_size: 50257
 
 trainer:
   num_train_steps: 20
