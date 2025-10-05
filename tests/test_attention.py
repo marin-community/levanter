@@ -588,7 +588,7 @@ def sink_attention(
     pos_keys = jnp.arange(num_keys, dtype=jnp.int32)
     mask_arr = pos_queries[:, None] >= pos_keys[None, :]
     if sliding_window is not None:
-        mask_arr &= pos_keys[None, :] >= (pos_queries[:, None] - sliding_window + 1)
+        mask_arr &= pos_queries[:, None] - sliding_window + 1 <= pos_keys[None, :]
     mask = hax.named(mask_arr, (QPos, KPos))
 
     out = dot_product_attention_with_sink(
