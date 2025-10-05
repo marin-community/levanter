@@ -34,6 +34,7 @@ def flash_attention(
     v: hax.NamedArray,
     mask: Optional[AttentionMask | hax.NamedArray] = None,
     bias: Optional[hax.NamedArray] = None,
+    attn_sink: Optional[hax.NamedArray] = None,
     *,
     dropout: float = 0.0,
     inference: bool,
@@ -47,12 +48,11 @@ def flash_attention(
     """
     Crappy pure-jax Flash Attention impl, vaguely following the v2 paper.
 
-    Args:
-        Key: axis of key dim.
+    - If `block_size` doesn't divide Q/K, this falls back to the VANILLA path.
+      When `attn_sink` is provided, that fallback is forced to VANILLA to avoid recursion.
     """
     if not inference and dropout > 0 and key is None:
         raise ValueError("key must be provided for training")
-
     if dropout < 0 or dropout > 1:
         raise ValueError(f"invalid dropout {dropout}")
 
@@ -68,22 +68,50 @@ def flash_attention(
     KPos = k.resolve_axis(KPos)
 
     if QPos.size < block_size or KPos.size < block_size:
-        from levanter.layers.attention import simple_attention_with_dropout
+        if attn_sink is not None:
+            from levanter.layers.attention import dot_product_attention_with_sink
 
-        return simple_attention_with_dropout(
-            QPos,
-            KPos,
-            Key,
-            q,
-            k,
-            v,
-            mask=mask,
-            bias=bias,
-            dropout=dropout,
-            inference=inference,
-            prng=key,
-            logits_soft_cap=logits_soft_cap,
-        )
+            return dot_product_attention_with_sink(
+                QPos,
+                KPos,
+                Key,
+                q,
+                k,
+                v,
+                attn_sink,
+                mask=mask,
+                bias=bias,
+                attention_dtype=dtype,
+                precision=precision,
+                use_flash=False,  # force VANILLA
+                attn_backend=None,
+                flash_block_size=block_size,
+                dropout=dropout,
+                logits_soft_cap=logits_soft_cap,
+                scaling_factor=scaling_factor,
+                inference=inference,
+                prng=key,
+            )
+        else:
+            from levanter.layers.attention import simple_attention_with_dropout
+
+            return simple_attention_with_dropout(
+                QPos,
+                KPos,
+                Key,
+                q,
+                k,
+                v,
+                mask=mask,
+                bias=bias,
+                inference=inference,
+                dropout=dropout,
+                attention_dtype=dtype,
+                precision=precision,
+                prng=key,
+                scaling_factor=scaling_factor,
+                logits_soft_cap=logits_soft_cap,
+            )
 
     if scaling_factor is None:
         if Key.size == 0:
@@ -92,7 +120,7 @@ def flash_attention(
     q = q * scaling_factor
 
     return _flash_attention(
-        (q, k, v),
+        (q, k, v, attn_sink),
         QPos,
         KPos,
         Key,
@@ -109,7 +137,7 @@ def flash_attention(
 
 @equinox.filter_custom_vjp
 def _flash_attention(
-    qkv: Tuple[hax.NamedArray, hax.NamedArray, hax.NamedArray],
+    qkv_sink: Tuple[hax.NamedArray, hax.NamedArray, hax.NamedArray, Optional[hax.NamedArray]],
     QPos: hax.Axis,
     KPos: hax.Axis,
     Key: hax.Axis,
@@ -125,7 +153,7 @@ def _flash_attention(
 ) -> hax.NamedArray:
     return _flash_attention_forward(
         None,
-        qkv,
+        qkv_sink,
         QPos,
         KPos,
         Key,
@@ -143,7 +171,7 @@ def _flash_attention(
 @named_call
 def _flash_attention_forward(
     ignore,
-    qkv,
+    qkv_sink,
     QPos: hax.Axis,
     KPos: hax.Axis,
     Key: hax.AxisSelector,
@@ -158,7 +186,7 @@ def _flash_attention_forward(
     logits_soft_cap: Optional[float],
 ):
     del ignore
-    q, k, v = qkv
+    q, k, v, attn_sink = qkv_sink
     if QPos.size % block_size != 0:
         raise ValueError(f"q axis size {q.axis_size(QPos)} is not a multiple of {block_size}")
     if KPos.size % block_size != 0:
@@ -168,6 +196,7 @@ def _flash_attention_forward(
     Tr = QPos.size // block_size
     Tc = KPos.size // block_size
 
+    # Row axes: everything in q except (QPos, Key)
     q_batch_axes: Tuple[hax.Axis, ...] = hax.eliminate_axes(q.axes, (QPos, Key))
 
     # output variables: O is the attention output, ell is the per-position log normalizer
@@ -193,9 +222,23 @@ def _flash_attention_forward(
 
         # Step 2: init O_i = 0, sumexp_i = 0, max_i = -inf
         o_i = o[QPos, ds.block(i, block_size)]
+
         QPosBlock = QPos.resize(block_size)
-        sumexp_i = hax.zeros(q_batch_axes + (QPosBlock,), q.dtype)
-        max_i = hax.full(q_batch_axes + (QPosBlock,), -jnp.inf, q.dtype)
+        row_axes_block: Tuple[hax.Axis, ...] = q_batch_axes + (QPosBlock,)
+
+        sumexp_i = hax.zeros(row_axes_block, q.dtype)
+        max_i = hax.full(row_axes_block, -jnp.inf, q.dtype)
+
+        if attn_sink is not None:
+            sink_prefix = attn_sink
+            for ax in q_batch_axes:
+                if ax not in sink_prefix.axes:
+                    sink_prefix = sink_prefix.broadcast_axis(ax)
+            sink_block = sink_prefix.broadcast_axis(QPosBlock).astype(q.dtype)
+            # Ensure axis order matches row_axes_block
+            sink_block = sink_block.rearrange(row_axes_block)
+            max_i = sink_block
+            sumexp_i = hax.ones(row_axes_block, q.dtype)
 
         @named_call
         def do_qk_block(state):
@@ -230,18 +273,25 @@ def _flash_attention_forward(
                 attn_ij = hax.where(mask_ij, attn_ij, -1e10)
 
             if dropout > 0 and not inference:
-                attn_ij = hax.nn.dropout(attn_ij, dropout, inference=False, key=jax.random.fold_in(key, i * Tc + j))
+                attn_ij = hax.nn.dropout(
+                    attn_ij,
+                    dropout,
+                    inference=False,
+                    key=jax.random.fold_in(key, i * Tc + j),
+                )
 
             # Step 9: Compute m_i^j = max(m_i^{j-1}, rowmax(S_i^j)), P_i^j = exp(S_i^j - m_i^j),
             # ...    l_i^j = exp(m_i^{j-1} - m_i^j) + rowsum(P_i^j)
             max_i = hax.maximum(old_max_i, hax.max(attn_ij, axis=KPos.name))
             P_ij = hax.exp(attn_ij - max_i)
+            exp_diff = hax.exp(old_max_i - max_i).rearrange(row_axes_block)
 
-            exp_diff = hax.exp(old_max_i - max_i)
-            sumexp_i = exp_diff * sumexp_i + hax.sum(P_ij, axis=KPos.name)
+            rowsum = hax.sum(P_ij, axis=KPos.name).rearrange(row_axes_block)
+            sumexp_i = exp_diff * sumexp_i + rowsum
 
             # Step 10: Compute O_i = diag(exp(m_i^{j-1} - m_i^j) O_i + P_i^j V_j
-            o_i = exp_diff * o_i + hax.dot(P_ij, v_j, axis=KPos.name)
+            o_term = hax.dot(P_ij, v_j, axis=KPos.name).rearrange(o_i.axes)
+            o_i = exp_diff * o_i + o_term
 
             return (i, j + 1, o_i, q_i, sumexp_i, max_i)
 
@@ -249,7 +299,9 @@ def _flash_attention_forward(
         j_end = jnp.minimum(i + 1, Tc) if is_causal else Tc
 
         _, _, o_i, _, sumexp_i, max_i = jax.lax.while_loop(
-            lambda state: state[1] < j_end, do_qk_block, (i, 0, o_i, q_i, sumexp_i, max_i)
+            lambda state: state[1] < j_end,
+            do_qk_block,
+            (i, 0, o_i, q_i, sumexp_i, max_i),
         )
 
         # Step 12: compute O_i = diag(\ell_i^{Tc})^{-1} O_i^{Tc}
@@ -272,7 +324,7 @@ def _flash_attention_backward(
     residuals,
     grad_in: hax.NamedArray,
     ignore,
-    qkv,
+    qkv_sink,
     QPos: hax.Axis,
     KPos: hax.Axis,
     Key: hax.AxisSelector,
@@ -288,7 +340,7 @@ def _flash_attention_backward(
 ):
     del ignore
     O, L = residuals
-    q, k, v = qkv
+    q, k, v, attn_sink = qkv_sink
     dO = grad_in
 
     Tr = QPos.size // block_size
@@ -330,7 +382,12 @@ def _flash_attention_backward(
             attn_ij = hax.dot(q_i, k_j, precision=precision, axis=Key)
 
             if dropout > 0 and not inference:
-                attn_ij = hax.nn.dropout(attn_ij, dropout, inference=False, key=jax.random.fold_in(key, i * Tc + j))
+                attn_ij = hax.nn.dropout(
+                    attn_ij,
+                    dropout,
+                    inference=False,
+                    key=jax.random.fold_in(key, i * Tc + j),
+                )
 
             if bias is not None:
                 bias_ij = bias[QPos, ds.block(i, block_size), KPos, ds.block(j, block_size)]
@@ -346,7 +403,12 @@ def _flash_attention_backward(
             p_ij = hax.exp(attn_ij - L_i)
 
             if dropout > 0 and not inference:
-                p_ij = hax.nn.dropout(p_ij, dropout, inference=False, key=jax.random.fold_in(key, i * Tc + j))
+                p_ij = hax.nn.dropout(
+                    p_ij,
+                    dropout,
+                    inference=False,
+                    key=jax.random.fold_in(key, i * Tc + j),
+                )
 
             dP_ij = hax.dot(dO_i, v_j, axis=Key)
             dAttn_ij = p_ij * (dP_ij - D_i)
@@ -382,7 +444,23 @@ def _flash_attention_backward(
 
     # dQ, (dK, dV) = hax.scan(do_kv_block, Tc)(dQ, jnp.arange(Tc.size))
     j, dQ, dK, dV = jax.lax.while_loop(lambda state: state[0] < Tc, do_kv_block, (0, dQ, dK, dV))
-    return dQ.rearrange(q.axes), dK.rearrange(k.axes), dV.rearrange(v.axes)
+
+    if attn_sink is not None:
+        q_batch_axes: Tuple[hax.Axis, ...] = hax.eliminate_axes(q.axes, (QPos, Key))
+        sink_prefix = attn_sink
+        for ax in q_batch_axes:
+            if ax not in sink_prefix.axes:
+                sink_prefix = sink_prefix.broadcast_axis(ax)
+        sink_rows = sink_prefix.broadcast_axis(QPos).astype(L.dtype)
+
+        p_sink = hax.exp(sink_rows - L)
+        dsink_rows = -p_sink * D
+        reduce_axes = tuple(ax for ax in dsink_rows.axes if ax not in attn_sink.axes)
+        dsink = hax.sum(dsink_rows, reduce_axes).astype(attn_sink.dtype)
+    else:
+        dsink = None
+
+    return (dQ.rearrange(q.axes), dK.rearrange(k.axes), dV.rearrange(v.axes), dsink)
 
 
 _flash_attention.def_fwd(_flash_attention_forward)
@@ -395,7 +473,13 @@ def _infer_attention_output_block_shape(QPos, KPos, Key, q_i, k, v):
 
 
 def _materialize_mask_slice(mask, i, j, QPos, KPos, block_size):
-    return materialize_mask(mask, QPos, KPos, q_slice=hax.ds.block(i, block_size), k_slice=hax.ds.block(j, block_size))
+    return materialize_mask(
+        mask,
+        QPos,
+        KPos,
+        q_slice=hax.ds.block(i, block_size),
+        k_slice=hax.ds.block(j, block_size),
+    )
 
 
 def _strip_sizes(axes: AxisSpec) -> AxisSelection:
