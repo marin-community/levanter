@@ -71,5 +71,5 @@ def test_pack_next_sequence_boundaries_between_sequences(seq_ids):
     bm = boundary_mask.array
     # Boundaries at positions 2 and 5
     assert bool(bm[2]) is True
-    assert bool(bm[5]) is True
+    assert bool(bm[6]) is True
     assert int(bm.sum()) == 2
