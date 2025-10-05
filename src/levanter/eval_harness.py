@@ -255,7 +255,7 @@ class _LmEvalHarnessWorker:
                 raise ValueError(f"Unknown message type: {message}")
 
     def _receive_message(self):
-        stop_message = jnp.array(_Message.STOP)
+        stop_message = np.array(_Message.STOP)
         message = broadcast_shard(stop_message, PartitionSpec())
         return message.item()
 
@@ -268,7 +268,7 @@ class _LmEvalHarnessWorker:
 
     def _send_message(self, message):
         assert jax.process_index() == 0
-        out = broadcast_shard(jnp.array(message), PartitionSpec())
+        out = broadcast_shard(np.array(message), PartitionSpec())
         return out
 
     def _send_payload(self, payload):
@@ -1593,7 +1593,7 @@ def build_reward_loader_for_tasks(
         tokenizer,
         Pos=EvalPos,
         max_pack_size=64,
-        apply_chat_template=config.apply_chat_template,
+        #apply_chat_template=config.apply_chat_template,
     )
 
     # Ensure optional metadata fields are numeric JAX arrays to satisfy JIT stacking
