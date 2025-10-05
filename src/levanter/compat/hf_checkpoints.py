@@ -205,7 +205,7 @@ def _load_torch(path, dtype):
 
     return d
 
-
+'''
 def _load_safe_tensors(path, dtype):
     d = {}
     with safetensors.safe_open(path, framework="jax", device="cpu") as f:
@@ -216,6 +216,19 @@ def _load_safe_tensors(path, dtype):
             d[key] = _maybe_shard_best_effort(tensor_slice, dtype)
             if 'printed' not in locals(): printed = 0
             if printed < 1: print(f"[rank {jax.process_index()}] tensor_slice type={type(tensor_slice)}, has_get_shape={hasattr(tensor_slice, 'get_shape')}", flush=True); printed += 1
+    return d
+'''
+
+def _load_safe_tensors(path, dtype):
+    d = {}
+    # Use NumPy framework to ensure host-local slices for callback-based sharding on multi-host meshes.
+    # This avoids returning non-fully-addressable JAX arrays from the callback.
+    with safetensors.safe_open(path, framework="numpy") as f:
+        keys = list(f.keys())
+        for key in tqdm(keys, total=len(keys), desc="Loading weights"):
+            tensor_slice = f.get_slice(key)
+            d[key] = _maybe_shard_best_effort(tensor_slice, dtype)
+
     return d
 
 

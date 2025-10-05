@@ -283,6 +283,7 @@ def main(config: TrainLmConfig):
                 freq = getattr(config.trainer, 'steps_per_eval', None) or 300
                 trainer.add_hook(callbacks.wandb_xla_logger(c), every=freq)
 
+        '''
         if config.hf_save_path is not None and config.hf_save_steps is not None:
             # bit gross to reach this far into the config, but it's fine
             if config.trainer.checkpointer.append_run_id_to_base_path:
@@ -302,7 +303,7 @@ def main(config: TrainLmConfig):
                     full_save_path, converter, upload_to_hf=config.hf_upload or False, save_dtype=save_dtype
                 ),
                 every=config.hf_save_steps,
-            )
+            )'''
 
         if config.eval_harness is not None:
             try:
@@ -439,7 +440,7 @@ def main(config: TrainLmConfig):
         #try:
         if config.eval_harness is not None:
             from levanter.eval_harness import build_reward_loader_for_tasks
-            max_eval_length = config.eval_harness.max_eval_length
+            max_eval_length = config.eval_harness.max_length
             EvalPos = state.model.Pos if max_eval_length is None else state.model.Pos.resize(max_eval_length)
             logger.info(
                 "\n\n\n\n\n[RewardLoader] Using LM-Eval tasks for reward | max_eval_length=%s",

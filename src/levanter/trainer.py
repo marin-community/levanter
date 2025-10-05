@@ -1089,44 +1089,46 @@ class Trainer:
                     example = next(iter_data)
                     self.dataset_ids.append(example.dataset_id)
 
-                    if int(state.step) == 0:
-                        # load gpt2 tokenizer
-                        from transformers import GPT2Tokenizer
-                        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+                    #if int(state.step) == 0:
+                        # NOTE(safety): The preview decode below fetches a global jax.Array to host, which
+                        # fails on multi-host TPU pods ("non-addressable devices"). Commented out for now.
+                        # If needed later, gate on jax.process_count()==1 or gather via multihost_utils.
+                        #
+                        # from transformers import GPT2Tokenizer
+                        # tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+                        # input_ids = np.asarray(example.tokens.array).astype(int)
+                        # texts = tokenizer.batch_decode(
+                        #     input_ids.tolist(),
+                        #     skip_special_tokens=True,
+                        #     clean_up_tokenization_spaces=False,
+                        # )
+                        # for j, text in enumerate(texts):
+                        #     print(f"Example {j}:")
+                        #     print(text)
+                        #     print("-" * 20)
+                        #     if j == 5:
+                        #         break
 
-                        # Decode a whole batch at once; rely on skip_special_tokens to drop PAD/EOS
-                        input_ids = np.asarray(example.tokens.array).astype(int)
-                        texts = tokenizer.batch_decode(
-                            input_ids.tolist(),
-                            skip_special_tokens=True,
-                            clean_up_tokenization_spaces=False,
-                        )
-
-                        for j, text in enumerate(texts):
-                            print(f"Example {j}:")
-                            print(text)
-                            print("-" * 20)
-                            if j == 5:
-                                break
-
-                    if True: #self.config.debug_print_loss_mask:
-                        # Host-side quick stats for the fetched example
-                        mask_sum = int(hax.sum(example.loss_mask).item()) if hasattr(example, "loss_mask") else -1
-                        print(
-                            f'> step: {state.step} | ds_id: {getattr(example, "dataset_id", None)} | '
-                            f'idx: {getattr(example, "index", None)} | mask_sum: {mask_sum}',
-                            flush=True,
-                        )
-                        if True: #self.config.debug_print_loss_mask_values:
-                            print(f'  mask: {example.loss_mask.array.sum(1)}', flush=True)
-                    else:
-                        print(f'> step: {state.step} | example tokens: {example.tokens.array} | example index: {example.index} | example dataset_id: {example.dataset_id}')
+                    # NOTE: Commented out debug prints that format jax.Arrays.
+                    # These can trigger host fetch of global arrays on multi-host TPU pods.
+                    # If needed later, switch to jax.debug.print or gather only addressable shards.
+                    # if True: # self.config.debug_print_loss_mask:
+                    #     mask_sum = int(hax.sum(example.loss_mask).item()) if hasattr(example, "loss_mask") else -1
+                    #     print(
+                    #         f'> step: {state.step} | ds_id: {getattr(example, "dataset_id", None)} | '
+                    #         f'idx: {getattr(example, "index", None)} | mask_sum: {mask_sum}',
+                    #         flush=True,
+                    #     )
+                    #     if True: # self.config.debug_print_loss_mask_values:
+                    #         print(f'  mask: {example.loss_mask.array.sum(1)}', flush=True)
+                    # else:
+                    #     print(f'> step: {state.step} | example tokens: {example.tokens.array} | example index: {example.index} | example dataset_id: {example.dataset_id}')
                     self.consumed_tokens += example.tokens.size
                 except StopIteration:
                     logger.info("Reached end of training data loader")
                     break
 
-            print('[Timing Info] > data loading time:', loading_time(), flush=True)
+            # print('[Timing Info] > data loading time:', loading_time(), flush=True)
 
             info = self.train_step(state, example)
             state = info.state
@@ -1333,26 +1335,23 @@ class Trainer:
                 total_batches += 1
                 reward += loss
 
-                # decode the batch
-                if i == 0:
-                    # load gpt2 tokenizer
-                    from transformers import GPT2Tokenizer
-                    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-
-                    # Decode a whole batch at once; rely on skip_special_tokens to drop PAD/EOS
-                    input_ids = np.asarray(val_batch.tokens.array).astype(int)
-                    texts = tokenizer.batch_decode(
-                        input_ids.tolist(),
-                        skip_special_tokens=True,
-                        clean_up_tokenization_spaces=False,
-                    )
-
-                    for j, text in enumerate(texts):
-                        print(f"Example {i*input_ids.shape[0] + j}:")
-                        print(text)
-                        print("-" * 20)
-                        if j == 5:
-                            break
+                # NOTE(safety): The validation preview decode fetches a global jax.Array to host, which
+                # breaks on multi-host TPU pods. Commented out for now; re-enable with proper multihost gather.
+                # if i == 0:
+                #     from transformers import GPT2Tokenizer
+                #     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+                #     input_ids = np.asarray(val_batch.tokens.array).astype(int)
+                #     texts = tokenizer.batch_decode(
+                #         input_ids.tolist(),
+                #         skip_special_tokens=True,
+                #         clean_up_tokenization_spaces=False,
+                #     )
+                #     for j, text in enumerate(texts):
+                #         print(f"Example {i*input_ids.shape[0] + j}:")
+                #         print(text)
+                #         print("-" * 20)
+                #         if j == 5:
+                #             break
 
             print(f'Total weights: {total_weights}', flush=True)
             print(f'Total batches: {total_batches}', flush=True)
@@ -1619,7 +1618,23 @@ class Trainer:
 
             # Retrieve the batch from cache for this step
             example = data_batches_cache[rev_it]
-            print(f'> backward step: {rev_it} | step: {state.step} | example tokens: {example.tokens.array} | example index: {example.index} | example dataset_id: {example.dataset_id}')
+            # Safe multi-host logging: avoid embedding global jax.Arrays in f-strings.
+            # Print metadata only (host step, shapes, sharding), which does not trigger host fetches.
+            try:
+                step_host = int(jax.device_get(state.step)) if hasattr(state.step, "dtype") else int(state.step)
+            except Exception:
+                step_host = int(state.step)
+            tokens_arr = getattr(getattr(example, "tokens", None), "array", None)
+            tokens_shape = getattr(tokens_arr, "shape", None)
+            tokens_sharding = getattr(tokens_arr, "sharding", None)
+            index_shape = getattr(getattr(example, "index", None), "shape", None)
+            dsid_shape = getattr(getattr(example, "dataset_id", None), "shape", None)
+            print(
+                f"> backward step: {rev_it} | step: {step_host} | "
+                f"tokens shape={tokens_shape} sharding={tokens_sharding} | "
+                f"index shape={index_shape} | dataset_id shape={dsid_shape}",
+                flush=True,
+            )
 
             # Prefetch the next checkpoint while we compute the current one
             if rev_it > 1:
