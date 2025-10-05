@@ -209,11 +209,13 @@ def _load_torch(path, dtype):
 def _load_safe_tensors(path, dtype):
     d = {}
     with safetensors.safe_open(path, framework="jax", device="cpu") as f:
+        print(f"[rank {jax.process_index()}] opening {path} with safetensors framework='jax'", flush=True)
         keys = list(f.keys())
         for key in tqdm(keys, total=len(keys), desc="Loading weights"):
             tensor_slice = f.get_slice(key)
             d[key] = _maybe_shard_best_effort(tensor_slice, dtype)
-
+            if 'printed' not in locals(): printed = 0
+            if printed < 1: print(f"[rank {jax.process_index()}] tensor_slice type={type(tensor_slice)}, has_get_shape={hasattr(tensor_slice, 'get_shape')}", flush=True); printed += 1
     return d
 
 
@@ -639,6 +641,7 @@ class HFCheckpointConverter(Generic[LevConfig]):
         # we want to use a CPU if (1) we only have 1 device, or (2) the total amount of accelerator memory is less than
         # the amount of CPU memory.
         just_use_cpu = _should_use_cpu_for_checkpoint_loading()
+        print(f"[rank {jax.process_index()}] just_use_cpu={just_use_cpu}, processes={jax.process_count()}, devices={jax.device_count()}", flush=True)
         if just_use_cpu:
             # if we only have 1 device, use CPU ram
             contexts.enter_context(local_cpu_mesh())
@@ -1246,11 +1249,42 @@ def _shard_best_effort(array_or_slice, dtype) -> jax.Array:
         shape = array_or_slice.shape
 
     sharding = best_effort_sharding(shape)
+    try:
+        print(
+            f"[rank {jax.process_index()}] _shard_best_effort shape={shape}, sharding={sharding}",
+            flush=True,
+        )
+    except Exception:
+        pass
 
     def get_slice(indices):
         arr = array_or_slice[indices]
         if dtype is not None:
             arr = arr.astype(dtype)
+
+        dbg = getattr(get_slice, "_dbg", 0)
+        if dbg < 3:
+            try:
+                fully = getattr(arr, "is_fully_addressable", "n/a")
+                shard = getattr(arr, "sharding", "n/a")
+                print(
+                    f"[rank {jax.process_index()}] get_slice indices={indices} -> "
+                    f"type={type(arr)}, fully_addressable={fully}, sharding={shard}, "
+                    f"shape={getattr(arr, 'shape', None)}",
+                    flush=True,
+                )
+                if hasattr(arr, "sharding"):
+                    try:
+                        devs = list(arr.sharding.addressable_devices())
+                        print(
+                            f"[rank {jax.process_index()}] addressable_devices(sample)={devs[:3]} total={len(devs)}",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        print(f"[rank {jax.process_index()}] addressable_devices error: {e}", flush=True)
+            except Exception as e:
+                print(f"[rank {jax.process_index()}] get_slice debug print error: {e}", flush=True)
+            get_slice._dbg = dbg + 1
 
         return arr
 
