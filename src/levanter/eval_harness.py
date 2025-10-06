@@ -30,15 +30,14 @@ from functools import cached_property
 from typing import Iterator, List, Optional, Tuple, Union
 
 import equinox as eqx
+import haliax
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
 import jmp
 import numpy as np
-from jax.sharding import PartitionSpec
-
-import haliax
 from haliax import NamedArray
+from jax.sharding import PartitionSpec
 
 import levanter.tracker
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, load_tokenizer
@@ -48,14 +47,15 @@ from levanter.data.packing import (
     per_segment_correct,
     per_segment_loss,
 )
+from levanter.inference.engine import InferenceEngine, InferenceEngineConfig
+from levanter.inference.engine import Request as GenRequest
+from levanter.inference.jit_scheduler import SeqDecodingParams
+from levanter.inference.utils import INVALID
 from levanter.models.gpt2 import Gpt2Config
 from levanter.models.loss import next_token_loss
 from levanter.utils.background_iterable import BackgroundIterator
 from levanter.utils.hf_utils import HfTokenizer
 from levanter.utils.py_utils import set_global_rng_seeds
-from levanter.inference.engine import InferenceEngine, InferenceEngineConfig, Request as GenRequest
-from levanter.inference.jit_scheduler import SeqDecodingParams
-from levanter.inference.utils import INVALID
 
 try:
     from lm_eval import evaluator
@@ -69,10 +69,9 @@ except ImportError:
     handle_stop_sequences = None
     postprocess_generated_text = None
 
-from tqdm_loggable.auto import tqdm
-
 import haliax as hax
 from haliax.partitioning import ResourceMapping, round_axis_for_partitioning
+from tqdm_loggable.auto import tqdm
 
 import levanter.config
 from levanter.callbacks import StepInfo
@@ -84,8 +83,36 @@ from levanter.trainer import TrainerConfig
 from levanter.utils.jax_utils import broadcast_shard, use_cpu_device
 from levanter.utils.tree_utils import inference_mode
 
-
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SampleLoggingConfig:
+    """Configuration for controlling how many sample generations we keep per benchmark."""
+
+    log_all: bool = False
+    """If True, keep every sample that the harness sees."""
+    max_samples_per_benchmark: int | None = None
+    """Optional cap on the number of samples to store for each benchmark."""
+
+    def __post_init__(self):
+        if self.max_samples_per_benchmark is not None and self.max_samples_per_benchmark < 0:
+            raise ValueError("max_samples_per_benchmark must be non-negative or None")
+
+    def should_log(self) -> bool:
+        """Return True if any sample logging should occur."""
+        if self.log_all:
+            return True
+        return self.max_samples_per_benchmark is not None and self.max_samples_per_benchmark > 0
+
+    def allow_more(self, current_count: int) -> bool:
+        """Return True if we should store another sample for the benchmark."""
+        if not self.should_log():
+            return False
+        if self.log_all:
+            return True
+        assert self.max_samples_per_benchmark is not None
+        return current_count < self.max_samples_per_benchmark
 
 
 # OK, so LM-Eval-Harness is not deterministic. This means we can't just run it on different workers and expect the
@@ -116,6 +143,7 @@ class _LmEvalHarnessWorker:
         mp,
         max_packed_segments,
         generation_kwargs=None,
+        sample_logging_config: SampleLoggingConfig | None = None,
     ):
         self.tokenizer = tokenizer
         self.max_packed_segments = max_packed_segments
@@ -126,6 +154,7 @@ class _LmEvalHarnessWorker:
         self.mp = mp
         self.max_packed_segments = max_packed_segments
         self._generation_kwargs = generation_kwargs or {"max_gen_toks": 256, "temperature": 0.0, "n": 1, "seed": None}
+        self.sample_logging_config = sample_logging_config or SampleLoggingConfig()
 
         self._dummy_batch = _make_dummy_batch(EvalBatch, EvalPos)
 
@@ -272,6 +301,7 @@ class LevanterHarnessLM(TemplateLM):
         self.leader = leader
         # Storage for prompts and generations to include in outputs
         self.sample_outputs: dict[str, list[dict]] = {}
+        self.sample_logging_config = leader.sample_logging_config
 
     tokenizer = property(lambda self: self.leader.tokenizer)
     EvalBatch = property(lambda self: self.leader.EvalBatch)
@@ -342,7 +372,7 @@ class LevanterHarnessLM(TemplateLM):
     def set_current_task(self, task_name: str):
         """Set the current task name for organizing sample outputs."""
         self._current_task = task_name
-        if task_name not in self.sample_outputs:
+        if self.sample_logging_config.should_log() and task_name not in self.sample_outputs:
             self.sample_outputs[task_name] = []
 
     def get_sample_outputs(self) -> dict[str, list[dict]]:
@@ -352,6 +382,16 @@ class LevanterHarnessLM(TemplateLM):
     def clear_sample_outputs(self):
         """Clear all stored sample outputs."""
         self.sample_outputs.clear()
+
+    def _prepare_bucket(self, task_name: str) -> list[dict[str, str]] | None:
+        if not self.sample_logging_config.should_log():
+            return None
+
+        bucket = self.sample_outputs.setdefault(task_name, [])
+        if self.sample_logging_config.allow_more(len(bucket)):
+            return bucket
+
+        return None
 
     def _loglikelihood_tokens(self, requests, disable_tqdm: bool = False):
         raise NotImplementedError("_loglikelihood_tokens is not yet supported")
@@ -366,18 +406,17 @@ class LevanterHarnessLM(TemplateLM):
             logger.warning("No pad token set. Setting to eos token.")
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        # Store prompt-continuation pairs for output logging
         current_task = getattr(self, "_current_task", "loglikelihood_task")
-        if current_task not in self.sample_outputs:
-            self.sample_outputs[current_task] = []
-
         for request in requests:
+            bucket = self._prepare_bucket(current_task)
+            if bucket is None:
+                break
             prompt = request.args[0]
             continuation = request.args[1]
-            self.sample_outputs[current_task].append(
+            bucket.append(
                 {
                     "prompt": prompt,
-                    "generation": continuation,  # For loglikelihood, the "generation" is the continuation being evaluated
+                    "generation": continuation,
                 }
             )
 
@@ -668,19 +707,16 @@ class LevanterHarnessLM(TemplateLM):
                 text = ""
                 outputs.append(text)
 
-            # Store prompt and generation for output logging
             current_task = getattr(self, "_current_task", "generation_task")
-            if current_task not in self.sample_outputs:
-                self.sample_outputs[current_task] = []
-            # Decode the prompt for storage
-            prompt_text = self.tokenizer.decode(toks, skip_special_tokens=False)
-            self.sample_outputs[current_task].append(
-                {
-                    "prompt": prompt_text,
-                    "generation": text,
-                }
-            )
-
+            bucket = self._prepare_bucket(current_task)
+            if bucket is not None:
+                prompt_text = self.tokenizer.decode(toks, skip_special_tokens=False)
+                bucket.append(
+                    {
+                        "prompt": prompt_text,
+                        "generation": text,
+                    }
+                )
         # print(f'{outputs=}')
 
         return outputs
@@ -783,6 +819,7 @@ class LmEvalHarnessConfig:
     bootstrap_iters: int = 0
     apply_chat_template: bool = False
     fewshot_as_multiturn: bool = False
+    sample_logging: SampleLoggingConfig = dataclasses.field(default_factory=SampleLoggingConfig)
     generation_kwargs: dict = dataclasses.field(
         default_factory=lambda: {"max_gen_toks": 256, "temperature": 0.0, "n": 1, "seed": None}
     )
@@ -1011,6 +1048,7 @@ def _actually_run_eval_harness(
         mp,
         max_packed_segments=64,  # Reduced from 64
         generation_kwargs=config.generation_kwargs,
+        sample_logging_config=config.sample_logging,
     )
 
     if jax.process_index() == 0:
@@ -1041,7 +1079,7 @@ def _actually_run_eval_harness(
 
         # Get the collected sample outputs and add them to the results
         sample_outputs = harness.get_sample_outputs()
-        if sample_outputs:
+        if config.sample_logging.should_log() and sample_outputs:
             # Add outputs to each benchmark in results
             for task_name in outputs.get("results", {}):
                 # Get all sample outputs for this task (since we don't track individual tasks yet)
@@ -1113,7 +1151,7 @@ def run_eval_harness_main(config: EvalHarnessMainConfig):
     compute_axis_mapping = config.trainer.compute_axis_mapping
     parameter_axis_mapping = config.trainer.parameter_axis_mapping
 
-    with config.trainer.device_mesh, hax.axis_mapping(parameter_axis_mapping):
+    with config.trainer.use_device_mesh(), hax.axis_mapping(parameter_axis_mapping):
         key = jax.random.PRNGKey(0)
 
         vocab_size = len(tokenizer)
