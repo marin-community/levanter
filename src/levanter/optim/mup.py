@@ -31,15 +31,10 @@ def _scale_module_updates(updates: Any, lr_scale: float) -> Any:
             return leaf * lr_scale
         return leaf
 
-    # Avoid descending into nested ReparamEnabled modules. We need to allow traversal
-    # of the root ``updates`` object, so we key off object identity instead of the type
-    # alone.
-    root_id = id(updates)
+    def _is_reparam_enabled(node: Any) -> bool:
+        return isinstance(node, ReparamEnabled)
 
-    def _is_nested_reparam_enabled(node: Any) -> bool:
-        return isinstance(node, ReparamEnabled) and id(node) != root_id
-
-    return jax.tree_util.tree_map(_maybe_scale, updates, is_leaf=_is_nested_reparam_enabled)
+    return jax.tree_util.tree_map(_maybe_scale, updates, is_leaf=_is_reparam_enabled)
 
 
 def scale_by_mup_lr() -> GradientTransformation:
