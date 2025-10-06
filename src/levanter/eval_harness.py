@@ -638,17 +638,17 @@ class LevanterHarnessLM(TemplateLM):
                 max_stop_tokens = max(max_stop_tokens, num_stop_tokens)
 
         # Memory-optimized configuration for HBM constraints
-        # Reduced from original values to fit within 31.25G HBM limit
+        # Significantly reduced to fit within 27.5GB HBM limit for 8B models
         engine_cfg = InferenceEngineConfig(
             max_stop_seqs=max_stop_seqs,
             max_stop_tokens=max_stop_tokens,
-            max_pages=131072,  # Must be equals to max_seqs * max_pages_per_seq
-            max_seqs=256,     # Reduced from 256
+            max_pages=1024,  # Must be equals to max_seqs * max_pages_per_seq
+            max_seqs=4,      # Drastically reduced from 256 to 4
             page_size=8,
-            max_pages_per_seq=512,  # Reduced from 512
+            max_pages_per_seq=256,  # Keep reasonable sequence length
             compute_dtype=jnp.bfloat16,
-            max_queued_tokens=256,  # Reduced from 256
-            max_seqs_in_prefill=16,  # Reduced from 16
+            max_queued_tokens=64,   # Reduced from 256
+            max_seqs_in_prefill=2,  # Reduced from 16
             max_prefill_size=max_length,
         )
         engine = InferenceEngine.from_model_with_config(
