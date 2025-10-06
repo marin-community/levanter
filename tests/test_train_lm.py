@@ -1,6 +1,7 @@
 # Copyright 2025 The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
 import os
 import tempfile
 
@@ -13,6 +14,14 @@ import levanter.main.train_lm as train_lm
 import tiny_test_corpus
 from levanter.distributed import DistributedConfig, RayConfig
 from levanter.tracker import NoopConfig
+
+
+def test_configure_use_mup_sets_flags():
+    config = train_lm.TrainLmConfig(use_mup=True)
+    config = train_lm._configure_use_mup(config)
+
+    assert getattr(config.model, "use_mup", False) is True
+    assert getattr(config.optimizer, "use_mup", False) is True
 
 
 @pytest.mark.entry
