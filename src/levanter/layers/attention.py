@@ -1536,7 +1536,7 @@ class Attention(eqx.Module):
             key=k_q,
             use_bias=use_bias,
             out_first=True,
-            reparam_cls=mup.HiddenLinearMup if use_mup else mup.LinearStandardParam,
+            reparam_cls=mup.hidden(use_mup=use_mup),
         )
         k_proj = hnn.Linear.init(
             In=config.Embed,
@@ -1544,7 +1544,7 @@ class Attention(eqx.Module):
             key=k_k,
             use_bias=use_bias,
             out_first=True,
-            reparam_cls=mup.HiddenLinearMup if use_mup else mup.LinearStandardParam,
+            reparam_cls=mup.hidden(use_mup=use_mup),
         )
         v_proj = hnn.Linear.init(
             In=(config.Embed),
@@ -1552,7 +1552,7 @@ class Attention(eqx.Module):
             key=k_v,
             use_bias=use_bias,
             out_first=True,
-            reparam_cls=mup.HiddenLinearMup if use_mup else mup.LinearStandardParam,
+            reparam_cls=mup.hidden(use_mup=use_mup),
         )
         o_proj = hnn.Linear.init(
             In=(config.Heads, config.HeadSize),
@@ -1560,7 +1560,7 @@ class Attention(eqx.Module):
             key=k_o,
             use_bias=use_output_bias,
             out_first=True,
-            reparam_cls=mup.HiddenLinearMup if use_mup else mup.LinearStandardParam,
+            reparam_cls=mup.hidden(use_mup=use_mup),
         )
 
         q_norm = None
