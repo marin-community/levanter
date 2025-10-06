@@ -278,7 +278,7 @@ class LlamaMlp(eqx.Module):
             key=k_fc,
             use_bias=use_bias,
             out_first=True,
-            reparam_cls=mup.hidden(use_mup=use_mup),
+            reparam_cls=hnn.Linear.hidden_reparam(use_mup=use_mup),
         )
         up_proj = hnn.Linear.init(
             Out=Mlp,
@@ -286,7 +286,7 @@ class LlamaMlp(eqx.Module):
             key=k_up_proj,
             use_bias=use_bias,
             out_first=True,
-            reparam_cls=mup.hidden(use_mup=use_mup),
+            reparam_cls=hnn.Linear.hidden_reparam(use_mup=use_mup),
         )
         down_proj = hnn.Linear.init(
             Out=Embed,
@@ -294,7 +294,7 @@ class LlamaMlp(eqx.Module):
             key=k_down_proj,
             use_bias=use_bias,
             out_first=True,
-            reparam_cls=mup.hidden(use_mup=use_mup),
+            reparam_cls=hnn.Linear.hidden_reparam(use_mup=use_mup),
         )
         if isinstance(activation_fn, ActivationFunctionEnum):
             activation_fn = activation_fn.to_fn()
@@ -568,7 +568,7 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
                 key=k_emb,
                 use_bias=False,
                 out_first=True,
-                reparam_cls=mup.output(use_mup=config.use_mup),
+                reparam_cls=hnn.Linear.output_reparam(use_mup=config.use_mup),
             )
 
         return LlamaLMHeadModel(transformer, embeddings, lm_head)
