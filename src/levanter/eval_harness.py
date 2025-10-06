@@ -1167,7 +1167,10 @@ def run_eval_harness_main(config: EvalHarnessMainConfig):
             converter: HFCheckpointConverter = model_config.hf_checkpoint_converter()
             converter = converter.replaced(reference_checkpoint=config.checkpoint_path, tokenizer=tokenizer)
             model = converter.load_pretrained(
-                model_config.model_type, ref=config.checkpoint_path, dtype=config.trainer.mp.compute_dtype  # type: ignore
+                model_config.model_type, 
+                ref=config.checkpoint_path, 
+                dtype=config.trainer.mp.compute_dtype,  # type: ignore
+                axis_mapping=parameter_axis_mapping
             )
         else:
             with use_cpu_device():
