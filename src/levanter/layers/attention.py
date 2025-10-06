@@ -1464,6 +1464,9 @@ class AttentionConfig:
     """Configuration for QK normalization. If None, no normalization is applied."""
 
     def __post_init__(self):
+        if self.use_mup and self.scaling_factor is None:
+            self.scaling_factor = 1 / self.head_dim
+
         assert self.num_heads % self.num_kv_heads == 0, (
             f"num_heads={self.num_heads} not divisible by num_kv_heads={self.num_kv_heads}."
         )
@@ -1533,7 +1536,7 @@ class Attention(eqx.Module):
             key=k_q,
             use_bias=use_bias,
             out_first=True,
-            reparam_cls=mup.OutputLinearMup if use_mup else mup.LinearStandardParam,  # Q out is not Width Dependent
+            reparam_cls=mup.HiddenLinearMup if use_mup else mup.LinearStandardParam,
         )
         k_proj = hnn.Linear.init(
             In=config.Embed,
@@ -1541,7 +1544,7 @@ class Attention(eqx.Module):
             key=k_k,
             use_bias=use_bias,
             out_first=True,
-            reparam_cls=mup.OutputLinearMup if use_mup else mup.LinearStandardParam,  # K out is not Width Dependent
+            reparam_cls=mup.HiddenLinearMup if use_mup else mup.LinearStandardParam,
         )
         v_proj = hnn.Linear.init(
             In=(config.Embed),

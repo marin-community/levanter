@@ -240,7 +240,6 @@ class LlamaConfig(HFCompatConfig):
             attn_backend=self.attn_backend,
             flash_attention_block_size=self.flash_attention_block_size,
             rope=self.rope,
-            scaling_factor=1.0 if self.use_mup else None,  # Scaling is done by muP
         )
 
     @property
