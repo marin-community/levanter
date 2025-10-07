@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 
 import haliax as hax
-from haliax.partitioning import ResourceMapping
+from haliax.partitioning import ResourceMapping, set_mesh
 
 import levanter
 from levanter.books.util import create_pz_histogram, create_pz_histogram_linear
@@ -23,6 +23,14 @@ from levanter.models.lm_model import LmExample, LmHeadModel
 from levanter.models.loss import next_token_loss
 from levanter.utils.hf_utils import HfTokenizer
 from levanter.tracker.histogram import Histogram
+
+
+# Debug helpers for inspecting mesh/device state when verbose=True.
+def _describe_mesh(mesh) -> str:
+    try:
+        return f"Mesh(shape={mesh.shape}, axis_names={getattr(mesh, 'axis_names', None)})"
+    except Exception:
+        return repr(mesh)
 
 
 @dataclass
@@ -45,6 +53,7 @@ class PzInnerLoopConfig:
     verify_treecache: bool = False
     # Verbose printing for debug; default false so configs need not set it
     verbose: bool = False
+    # (no extra debug controls here; use verbose for lightweight logging)
 
 
 def pz_eval_callback(
@@ -53,6 +62,8 @@ def pz_eval_callback(
     axis_resources: ResourceMapping,
     mp,
     data_config: Union[LMMixtureDatasetConfig, SingleDatasetLMConfigBase],
+    *,
+    device_mesh=None,
 ):
     pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
     decode_once_state: dict = {}
@@ -70,6 +81,22 @@ def pz_eval_callback(
         if all_hosts or jax.process_index() == 0:
             print(f"[PZ][{_ts()}][proc={jax.process_index()}] {msg}", flush=True)
 
+    # Detailed context logging to help diagnose mesh/device mismatches during P(z)
+    def _log_ctx(prefix: str = "ctx"):
+        if not config.verbose:
+            return
+        try:
+            devices = [(d.platform, getattr(d, "id", None)) for d in jax.devices()]
+            mesh = hax.partitioning._get_mesh()
+            mapping = hax.partitioning.current_thread_local_mapping()
+            _log(
+                f"{prefix}: default_backend={jax.default_backend()} devices={devices} "
+                f"mesh={_describe_mesh(mesh)} axis_mapping={mapping}",
+                all_hosts=True,
+            )
+        except Exception as e:
+            _log(f"{prefix}: failed to log context: {e}", all_hosts=True)
+
     def _compute_logprob_for_tokens(model: LmHeadModel, tokens_1d: np.ndarray, prompt_len: int) -> float:
         N = int(tokens_1d.shape[0])
         Pos = model.Pos.resize(N)
@@ -78,13 +105,31 @@ def pz_eval_callback(
         m = model
         if mp is not None:
             m = mp.cast_to_compute(m)
-        with hax.axis_mapping(axis_resources):
-            logits = m(ex.tokens, attn_mask=ex.attn_mask)
-            logits = logits.astype(jnp.float32)
-            nll = next_token_loss(
-                Pos=Pos, Vocab=m.Vocab, logits=logits, true_ids=ex.tokens, loss_mask=ex.loss_mask, reduction=None
-            )
-            total_nll = hax.sum(nll, axis=Pos).array
+        if device_mesh is not None:
+            ctx = set_mesh(device_mesh)
+        else:
+            ctx = None
+        # Ensure compute runs under the trainer mesh (if provided) and axis mapping
+        if ctx is not None:
+            with ctx, hax.axis_mapping(axis_resources):
+                _log_ctx(prefix="before_scalar_forward")
+                logits = m(ex.tokens, attn_mask=ex.attn_mask)
+                logits = logits.astype(jnp.float32)
+                nll = next_token_loss(
+                    Pos=Pos, Vocab=m.Vocab, logits=logits, true_ids=ex.tokens, loss_mask=ex.loss_mask, reduction=None
+                )
+                total_nll = hax.sum(nll, axis=Pos).array
+                _log_ctx(prefix="after_scalar_forward")
+        else:
+            with hax.axis_mapping(axis_resources):
+                _log_ctx(prefix="before_scalar_forward")
+                logits = m(ex.tokens, attn_mask=ex.attn_mask)
+                logits = logits.astype(jnp.float32)
+                nll = next_token_loss(
+                    Pos=Pos, Vocab=m.Vocab, logits=logits, true_ids=ex.tokens, loss_mask=ex.loss_mask, reduction=None
+                )
+                total_nll = hax.sum(nll, axis=Pos).array
+                _log_ctx(prefix="after_scalar_forward")
         return -float(np.array(total_nll))
 
     def _run_for_model(model: LmHeadModel, *, log_histogram_now: bool, curr_step: int):
@@ -94,6 +139,7 @@ def pz_eval_callback(
             f"jax world: process_count={jax.process_count()} local_device_count={jax.local_device_count()} total_device_count={len(jax.devices())}",
             all_hosts=True,
         )
+        _log_ctx(prefix="begin_run_for_model")
 
         nonlocal caches_state
         eval_start_time = time.time()
@@ -269,12 +315,20 @@ def pz_eval_callback(
                 arr2d = np.stack(first_mode_windows, axis=0)
 
                 def _vmapped_batch(m: LmHeadModel, toks_2d: jnp.ndarray, prompt_len: int):
+                    # Use Haliax named axes and vmap instead of positional jax.vmap
                     Pos = m.Pos.resize(N)
 
-                    def single(tokens_1d: jnp.ndarray):
-                        toks_named = hax.named(tokens_1d, Pos)
+                    # Define a named batch axis; prefer "batch" to respect any axis_resources mapping
+                    B = int(toks_2d.shape[0])
+                    Batch = hax.Axis("batch", B)
+
+                    # Name the input as (Batch, Pos)
+                    toks_named_2d = hax.named(toks_2d, (Batch, Pos))
+
+                    def single_named(tokens_1d_named):
+                        # tokens_1d_named has axes {Pos}
                         ex = LmExample.from_prompt_and_completion(
-                            Pos, toks_named, prompt_length=int(prompt_len), ignore_id=pad_id
+                            Pos, tokens_1d_named, prompt_length=int(prompt_len), ignore_id=pad_id
                         )
                         mm = m
                         if mp is not None:
@@ -289,17 +343,37 @@ def pz_eval_callback(
                             loss_mask=ex.loss_mask,
                             reduction=None,
                         )
-                        total_nll = hax.sum(nll, axis=Pos).array
-                        return -total_nll
+                        # Return negative total NLL (i.e., log-prob) as a scalar array
+                        return -hax.sum(nll, axis=Pos).array
 
-                    with hax.axis_mapping(axis_resources):
-                        return jax.vmap(single, in_axes=0)(toks_2d)
+                    if device_mesh is not None:
+                        ctx2 = set_mesh(device_mesh)
+                    else:
+                        ctx2 = None
+
+                    if ctx2 is not None:
+                        with ctx2, hax.axis_mapping(axis_resources):
+                            _log_ctx(prefix="before_batched_forward")
+                            out = hax.vmap(single_named, Batch)(toks_named_2d)
+                            _log_ctx(prefix="after_batched_forward")
+                            # hax.vmap returns a vector along Batch; expose as JAX array
+                            return getattr(out, "array", out)
+                    else:
+                        with hax.axis_mapping(axis_resources):
+                            _log_ctx(prefix="before_batched_forward")
+                            out = hax.vmap(single_named, Batch)(toks_named_2d)
+                            _log_ctx(prefix="after_batched_forward")
+                            return getattr(out, "array", out)
 
                 B = int(config.eval_batch_size) if config.eval_batch_size is not None else arr2d.shape[0]
                 b0 = time.perf_counter()
                 for i_b in range(0, arr2d.shape[0], B):
                     batch = jnp.asarray(arr2d[i_b : i_b + B], dtype=jnp.int32)
+                    _log(f"dispatch batched forward: batch_shape={batch.shape}, B={B}")
+                    t_b0 = time.perf_counter()
                     lp_vec = _vmapped_batch(model, batch, P)
+                    t_b1 = time.perf_counter()
+                    _log(f"batched forward done in {t_b1 - t_b0:.3f}s; lp_vec.shape={np.asarray(lp_vec).shape}")
                     for j, lp in enumerate(np.array(lp_vec)):
                         pz_values.append(float(np.exp(lp)))
                         idx = first_mode_indices[i_b + j]
@@ -480,3 +554,12 @@ def pz_eval_callback(
             raise
 
     return cb
+
+
+# Refactor
+# - Replaced jax.vmap in first-mode batched evaluation with haliax.vmap over a named
+#   Batch axis, avoiding positional vmap and aligning with Haliax’s named-tensor style.
+# - Named the input batch tokens as a Haliax NamedArray with axes (batch, Pos), and
+#   vectorized the per-example log-prob computation via haliax.vmap.
+# - Preserved existing mesh and axis_mapping contexts and the scalar (per-window)
+#   evaluation path.

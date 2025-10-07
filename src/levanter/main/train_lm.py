@@ -247,6 +247,7 @@ def main(config: TrainLmConfig):
                     compute_axis_mapping,
                     trainer.mp,
                     config.data,
+                    device_mesh=trainer.device_mesh,
                 ),
                 every=config.pz_eval_steps,
             )
