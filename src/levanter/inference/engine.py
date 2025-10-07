@@ -105,10 +105,26 @@ class InferenceEngineConfig:
     enable_logprobs: bool = False
     """Enable computing logprobs for generated tokens."""
 
+    def __post_init__(self):
+        # this one is only required because of clones. If we really care, we could relax this
+        if self.max_queued_tokens < self.max_seqs:
+            raise ValueError("max_queued_tokens must be >= max_seqs")
+
+        if self.max_queued_tokens < self.imputed_max_tokens_per_round:
+            raise ValueError("max_queued_tokens must be >= max_tokens_per_round")
+
+        if self.max_queued_tokens < self.max_seqs_in_prefill:
+            raise ValueError("max_queued_tokens must be >= max_seqs_in_prefill")
+
     @property
     def imputed_max_pages(self) -> int:
         """Return explicit `max_pages` or compute `max_seqs * max_pages_per_seq` when unset."""
         return int(self.max_pages) if self.max_pages is not None else int(self.max_seqs * self.max_pages_per_seq)
+
+    @property
+    def imputed_max_tokens_per_round(self) -> int:
+        """Return explicit `max_tokens_per_round` or default to `max_seqs` when unset."""
+        return self.max_tokens_per_round if self.max_tokens_per_round is not None else self.max_seqs
 
 
 class GenState(eqx.Module):
@@ -1016,11 +1032,15 @@ class InferenceEngine:
             ),
         )
 
-    def generate(self, requests: Sequence[Request]) -> GenerationResult:
+    def generate(self, requests: Sequence[Request], step_callback=None) -> GenerationResult:
         """Generate tokens for a batch of Requests.
 
         Each Request provides prompt_tokens, decode_params, and n_generations (clones).
         Returns (outputs_per_sequence, total_generated_tokens).
+
+        Args:
+            requests: Sequence of generation requests
+            step_callback: Optional callback function called at each decode iteration with iteration number
         """
         # validate we don't have any sequences with n_generations exceeding max_seqs
         max_needed = max(int(r.n_generations) for r in requests)
@@ -1098,7 +1118,12 @@ class InferenceEngine:
             return True
 
         stagnant_iters = 0
+        decode_iteration = 0
         while not _all_done():
+            # Call step callback if provided
+            if step_callback is not None:
+                step_callback(decode_iteration)
+
             iter_start = time.time()
 
             fake_submit_start = time.time()
@@ -1120,7 +1145,7 @@ class InferenceEngine:
                 self.model,
                 self.sampler,
                 # TODO: tune max_tokens_per_round
-                self.config.max_tokens_per_round or self.config.max_seqs,
+                self.config.imputed_max_tokens_per_round,
                 self.config.max_rounds,
             )
             submit_done = time.time()
@@ -1157,6 +1182,9 @@ class InferenceEngine:
                     f"{tps_total:.2f} tok/s, {new_tokens} new"
                     f" (extract {extract_time:.3f}s, release {release_time:.3f}s)"
                 )
+
+            decode_iteration += 1
+
             # Safety: if nothing new was produced and queue is empty, avoid infinite loop
             if (
                 new_tokens == 0
