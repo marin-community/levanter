@@ -15,6 +15,7 @@ import haliax.haxtyping as ht
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax.tree_utils as otu
 from haliax import NamedArray
 from haliax.jax_utils import is_jax_array_like
 
@@ -31,6 +32,63 @@ from levanter.layers.sampler import Sampler
 from levanter.models.lm_model import LmHeadModel
 
 logger = logging.getLogger(__name__)
+
+
+def _tree_byte_size(tree) -> int:
+    """Return the total number of bytes represented by ``tree``."""
+
+    def _is_named_array_like(x) -> bool:
+        return isinstance(x, NamedArray)
+
+    def _leaf_bytes(x) -> int:
+        if isinstance(x, NamedArray):
+            return _leaf_bytes(x.array)
+        if isinstance(x, jax.ShapeDtypeStruct):
+            # ``tree_size`` counts scalars represented by the shape struct.
+            return int(otu.tree_size(x) * x.dtype.itemsize)
+        if isinstance(x, (jnp.ndarray, np.ndarray)):
+            return int(x.size * x.dtype.itemsize)
+        if hasattr(x, "dtype") and hasattr(x, "shape"):
+            itemsize = getattr(x.dtype, "itemsize", None)
+            if itemsize is None:
+                itemsize = np.dtype(x.dtype).itemsize
+            return int(np.prod(x.shape) * itemsize)
+        return 0
+
+    leaves = jax.tree_util.tree_leaves(tree, is_leaf=_is_named_array_like)
+    return int(sum(_leaf_bytes(leaf) for leaf in leaves))
+
+
+def _available_hbm_budget_bytes(hbm_utilization: float) -> int:
+    """Estimate the per-device HBM budget available to the KV cache."""
+
+    if not (0.0 < hbm_utilization <= 1.0):
+        raise ValueError("hbm_utilization must be in the interval (0, 1].")
+
+    devices = jax.devices()
+    if not devices:
+        raise RuntimeError("No JAX devices available for inference.")
+
+    budgets: list[int] = []
+    for device in devices:
+        memory_stats = getattr(device, "memory_stats", None)
+        if memory_stats is None:
+            raise RuntimeError(f"Device {device} does not expose memory statistics.")
+        stats = memory_stats()
+        if not stats:
+            raise RuntimeError(f"Device {device} returned empty memory statistics.")
+
+        limit = stats.get("bytes_limit")
+        if limit is None:
+            raise RuntimeError(f"Device {device} memory stats missing 'bytes_limit'.")
+        in_use = stats.get("bytes_in_use", 0)
+        free_bytes = max(int(limit) - int(in_use), 0)
+        budgets.append(int(free_bytes * hbm_utilization))
+
+    if not budgets:
+        raise RuntimeError("Unable to determine device HBM budget.")
+
+    return min(budgets)
 
 
 @dataclass(frozen=True)
@@ -65,7 +123,7 @@ class InferenceEngineConfig:
     """
 
     max_pages: Optional[int] = None
-    """Total number of KV pages available. If None, computed as ``max_seqs * max_pages_per_seq``."""
+    """Total number of KV pages available. If None, inferred from :attr:`hbm_utilization`."""
     max_seqs: int = 16
     """Maximum concurrent sequences (local slots)."""
     page_size: int = 128
@@ -104,6 +162,9 @@ class InferenceEngineConfig:
 
     enable_logprobs: bool = False
     """Enable computing logprobs for generated tokens."""
+
+    hbm_utilization: float = 0.9
+    """Fraction of device HBM to reserve for the KV cache when :attr:`max_pages` is ``None``."""
 
     @property
     def imputed_max_pages(self) -> int:
@@ -649,6 +710,59 @@ class InferenceEngine:
         texts = svc.generate(requests)
     """
 
+    @classmethod
+    def _infer_max_pages_from_hbm(cls, model: LmHeadModel, config: InferenceEngineConfig) -> int:
+        """Infer a KV-page budget using HBM utilization targets."""
+
+        try:
+            budget = _available_hbm_budget_bytes(config.hbm_utilization)
+        except Exception as exc:  # pragma: no cover - depends on runtime environment
+            logger.warning(
+                "Falling back to max_seqs * max_pages_per_seq for KV cache sizing because HBM budget "
+                "could not be determined: %s",
+                exc,
+            )
+            return int(config.max_seqs * config.max_pages_per_seq)
+
+        def cache_bytes(num_pages: int) -> int:
+            table = PageTable.init(num_pages, config.max_seqs, config.page_size, config.max_pages_per_seq)
+            cache_shape = jax.eval_shape(model.initial_cache, table, dtype=config.compute_dtype)
+            return _tree_byte_size(cache_shape)
+
+        bytes_one = cache_bytes(1)
+        bytes_two = cache_bytes(2)
+        per_page = bytes_two - bytes_one
+        if per_page <= 0:
+            raise ValueError("Unable to infer KV cache page size: non-positive slope between 1 and 2 pages.")
+
+        base_bytes = max(bytes_one - per_page, 0)
+        usable_budget = max(budget - base_bytes, 0)
+        max_pages = usable_budget // per_page
+
+        if max_pages <= 0:
+            raise ValueError(
+                "HBM budget insufficient to allocate even a single KV cache page. "
+                "Provide `max_pages` explicitly or increase `hbm_utilization`."
+            )
+
+        max_pages = int(max_pages)
+        min_required = int(config.max_seqs * config.max_pages_per_seq)
+        if max_pages < min_required:
+            raise ValueError(
+                f"HBM-derived max_pages ({max_pages}) smaller than minimum required ({min_required}). "
+                "Provide `max_pages` explicitly or adjust `hbm_utilization`."
+            )
+
+        logger.info(
+            "Auto-computed KV cache budget: base=%d bytes, per_page=%d bytes, budget=%d bytes -> max_pages=%d",
+            base_bytes,
+            per_page,
+            budget,
+            max_pages,
+        )
+
+        return max_pages
+
     def __init__(
         self,
         *,
@@ -708,7 +822,7 @@ class InferenceEngine:
         model: LmHeadModel,
         tokenizer,
         *,
-        max_pages: int,
+        max_pages: int | None = None,
         max_seqs: int,
         page_size: int,
         max_pages_per_seq: int,
@@ -716,8 +830,13 @@ class InferenceEngine:
         max_queued_tokens: int = 32,
         max_seqs_in_prefill: int = 16,
         max_prefill_size: Optional[int] = None,
+        hbm_utilization: float = 0.9,
     ) -> "InferenceEngine":
-        """Build an engine using basic sizing knobs. Uses defaults for stop-token capacity."""
+        """Build an engine using basic sizing knobs. Uses defaults for stop-token capacity.
+
+        When ``max_pages`` is ``None`` the total number of pages is inferred using
+        :attr:`hbm_utilization` and the model's cache size.
+        """
         cfg = InferenceEngineConfig(
             max_pages=max_pages,
             max_seqs=max_seqs,
@@ -727,6 +846,7 @@ class InferenceEngine:
             max_queued_tokens=max_queued_tokens,
             max_seqs_in_prefill=max_seqs_in_prefill,
             max_prefill_size=max_prefill_size,
+            hbm_utilization=hbm_utilization,
         )
         return cls.from_model_with_config(model=model, tokenizer=tokenizer, config=cfg)
 
@@ -738,6 +858,9 @@ class InferenceEngine:
         config: InferenceEngineConfig,
     ) -> "InferenceEngine":
         """Build an engine using a EngineConfig for sizing knobs."""
+        if config.max_pages is None:
+            inferred_pages = cls._infer_max_pages_from_hbm(model, config)
+            config = dataclasses.replace(config, max_pages=int(inferred_pages))
         table = PageTable.init(config.imputed_max_pages, config.max_seqs, config.page_size, config.max_pages_per_seq)
         cache = hax.named_jit(model.initial_cache)(table, dtype=config.compute_dtype)
         decode_state = DecodeState.init(
