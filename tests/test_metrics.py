@@ -17,6 +17,7 @@ from levanter.metrics import (
     fold,
     unwrap_metrics,
 )
+from levanter.tracker import NoopConfig
 from levanter.trainer import Trainer, TrainerConfig, WrappedLossFunction
 
 Batch = hax.Axis("batch", size=4)
@@ -254,6 +255,7 @@ def test_trainer_train_step(loss_fn, per_device_parallelism, expected_metrics):
     model = SimpleModel.init(jax.random.PRNGKey(0))
 
     config = TrainerConfig(
+        tracker=NoopConfig(),
         seed=42,
         num_train_steps=10,
         train_batch_size=Batch.size,
@@ -287,6 +289,7 @@ def test_microbatching_metric_aggregation():
     model = SimpleModel.init(jax.random.PRNGKey(0))
 
     config = TrainerConfig(
+        tracker=NoopConfig(),
         seed=42,
         num_train_steps=10,
         train_batch_size=Batch.size,
