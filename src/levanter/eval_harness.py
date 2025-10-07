@@ -62,8 +62,13 @@ try:
     from lm_eval import evaluator
     from lm_eval.api.instance import Instance
     from lm_eval.api.model import TemplateLM
-    from lm_eval.models.utils import handle_stop_sequences, postprocess_generated_text
-except ImportError:
+    from lm_eval.models.utils import handle_stop_sequences
+    #, postprocess_generated_text
+except ImportError as e:
+    import sys
+    print(f"WARNING: Failed to import lm_eval components: {e}", file=sys.stderr)
+    print(f"  Import error type: {type(e).__name__}", file=sys.stderr)
+    print(f"  Import error details: {str(e)}", file=sys.stderr)
     TemplateLM = object
     Instance = object
     evaluator = object
@@ -873,27 +878,46 @@ class LmEvalHarnessConfig:
         logger.info("Loading tasks...")
         import lm_eval.tasks as tasks
 
-        manager = tasks.TaskManager()
-        # we need to do it this way b/c i can't figure out how to run e.g. hellaswag 0 shot and 10 shot in a single run
-        this_tasks = {}
-        for task in tqdm(self.to_task_spec()):
-            try:
-                if isinstance(task, str):
-                    this_tasks.update(tasks.get_task_dict(task, manager))
-                else:
-                    our_name = task.get("task_alias", task["task"]) if isinstance(task, dict) else task
-                    our_name = our_name.replace(" ", "_")
-                    tasks_for_this_task_spec = self._get_task_and_rename(manager, our_name, task)
-                    for k, v in tasks_for_this_task_spec.items():
-                        if k in this_tasks:
-                            raise ValueError(f"Task {k} already exists")
-                        this_tasks[k] = v
-            except Exception as e:
-                logger.exception(f"Failed to load task {task}")
-                raise ValueError(f"Failed to load task {task}") from e
+        # Patch datasets.load_dataset to remove trust_remote_code=True
+        # This is needed because newer versions of HF Datasets reject this flag for datasets like cais/mmlu
+        import datasets as hf_datasets
+        _original_load_dataset = hf_datasets.load_dataset
 
-        logger.info(f"Loaded {len(this_tasks)} tasks")
-        return this_tasks
+        def _patched_load_dataset(*args, **kwargs):
+            # Remove trust_remote_code from kwargs to avoid errors with newer HF Datasets
+            if "trust_remote_code" in kwargs:
+                logger.debug("Removing trust_remote_code from load_dataset call")
+                kwargs = {k: v for k, v in kwargs.items() if k != "trust_remote_code"}
+            return _original_load_dataset(*args, **kwargs)
+
+        # Apply the patch
+        hf_datasets.load_dataset = _patched_load_dataset
+
+        try:
+            manager = tasks.TaskManager()
+            # we need to do it this way b/c i can't figure out how to run e.g. hellaswag 0 shot and 10 shot in a single run
+            this_tasks = {}
+            for task in tqdm(self.to_task_spec()):
+                try:
+                    if isinstance(task, str):
+                        this_tasks.update(tasks.get_task_dict(task, manager))
+                    else:
+                        our_name = task.get("task_alias", task["task"]) if isinstance(task, dict) else task
+                        our_name = our_name.replace(" ", "_")
+                        tasks_for_this_task_spec = self._get_task_and_rename(manager, our_name, task)
+                        for k, v in tasks_for_this_task_spec.items():
+                            if k in this_tasks:
+                                raise ValueError(f"Task {k} already exists")
+                            this_tasks[k] = v
+                except Exception as e:
+                    logger.exception(f"Failed to load task {task}")
+                    raise ValueError(f"Failed to load task {task}") from e
+
+            logger.info(f"Loaded {len(this_tasks)} tasks")
+            return this_tasks
+        finally:
+            # Restore original load_dataset
+            hf_datasets.load_dataset = _original_load_dataset
 
     def _get_task_and_rename(self, manager, our_name, task: dict | str):
         """
@@ -1442,35 +1466,92 @@ def build_reward_loader_for_tasks(
     except Exception as e:  # pragma: no cover - optional dependency
         raise ImportError("lm-evaluation-harness is required to build reward loader") from e
 
-    manager = tasks.TaskManager()
+    # Patch datasets.load_dataset to remove trust_remote_code=True
+    # This is needed because newer versions of HF Datasets reject this flag for datasets like cais/mmlu
+    import datasets as hf_datasets
+    _original_load_dataset = hf_datasets.load_dataset
 
-    # Ensure pad token is defined; otherwise packing will insert None paddings -> object dtype
+    def _patched_load_dataset(*args, **kwargs):
+        # Remove trust_remote_code from kwargs to avoid errors with newer HF Datasets
+        if "trust_remote_code" in kwargs:
+            logger.debug("[RewardLoader] Removing trust_remote_code from load_dataset call")
+            kwargs = {k: v for k, v in kwargs.items() if k != "trust_remote_code"}
+        return _original_load_dataset(*args, **kwargs)
+
+    # Apply the patch
+    hf_datasets.load_dataset = _patched_load_dataset
+
     try:
-        if tokenizer.pad_token_id is None:
-            logger.warning("[RewardLoader] No pad token set. Setting pad_token_id=eos_token_id=%s", tokenizer.eos_token_id)
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-    except Exception:
-        pass
+        # Rank 0 loads tasks first and downloads datasets to cache
+        # Other ranks wait and then load from the shared cache
+        if jax.process_index() == 0:
+            logger.info("[RewardLoader] Rank 0 loading tasks and downloading datasets to cache...")
 
-    # Resolve a flat list of (name, task_obj) to iterate
-    task_items: list[tuple[str, object]] = []
-    task_names: list[str] = []
-    for spec in config.to_task_spec():
-        if isinstance(spec, str):
-            # Use list form to be robust across lm-eval versions
-            td = tasks.get_task_dict([spec], manager)
-            for name, obj in td.items():
-                task_items.append((name, obj))
-                task_names.append(name)
-        elif isinstance(spec, dict):
-            # Minimal support: treat like string under key "task"
-            name = spec.get("task")
-            if name is None:
-                continue
-            td = tasks.get_task_dict([name], manager)
-            for n, obj in td.items():
-                task_items.append((n, obj))
-                task_names.append(n)
+        # Ensure pad token is defined; otherwise packing will insert None paddings -> object dtype
+        try:
+            if tokenizer.pad_token_id is None:
+                logger.warning("[RewardLoader] No pad token set. Setting pad_token_id=eos_token_id=%s", tokenizer.eos_token_id)
+                tokenizer.pad_token_id = tokenizer.eos_token_id
+        except Exception:
+            pass
+
+        # On rank 0, load immediately. On other ranks, wait for rank 0 to finish
+        if jax.process_index() == 0:
+            manager = tasks.TaskManager()
+
+            # Resolve a flat list of (name, task_obj) to iterate
+            task_items: list[tuple[str, object]] = []
+            task_names: list[str] = []
+            for spec in config.to_task_spec():
+                if isinstance(spec, str):
+                    # Use list form to be robust across lm-eval versions
+                    td = tasks.get_task_dict([spec], manager)
+                    for name, obj in td.items():
+                        task_items.append((name, obj))
+                        task_names.append(name)
+                elif isinstance(spec, dict):
+                    # Minimal support: treat like string under key "task"
+                    name = spec.get("task")
+                    if name is None:
+                        continue
+                    td = tasks.get_task_dict([name], manager)
+                    for n, obj in td.items():
+                        task_items.append((n, obj))
+                        task_names.append(n)
+
+            logger.info("[RewardLoader] Rank 0 finished loading tasks. Syncing with other ranks...")
+
+        # Synchronize all ranks to ensure datasets are cached before others try to load
+        # Broadcast a signal from rank 0 to all other ranks
+        _ = multihost_broadcast_sync(True)
+
+        # Non-rank-0 processes now load the tasks from cache
+        if jax.process_index() != 0:
+            logger.info(f"[RewardLoader] Rank {jax.process_index()} loading tasks from cache...")
+            manager = tasks.TaskManager()
+
+            # Resolve a flat list of (name, task_obj) to iterate
+            task_items: list[tuple[str, object]] = []
+            task_names: list[str] = []
+            for spec in config.to_task_spec():
+                if isinstance(spec, str):
+                    # Use list form to be robust across lm-eval versions
+                    td = tasks.get_task_dict([spec], manager)
+                    for name, obj in td.items():
+                        task_items.append((name, obj))
+                        task_names.append(name)
+                elif isinstance(spec, dict):
+                    # Minimal support: treat like string under key "task"
+                    name = spec.get("task")
+                    if name is None:
+                        continue
+                    td = tasks.get_task_dict([name], manager)
+                    for n, obj in td.items():
+                        task_items.append((n, obj))
+                        task_names.append(n)
+    finally:
+        # Restore original load_dataset
+        hf_datasets.load_dataset = _original_load_dataset
 
     requests: list[Instance] = []
     max_examples = config.max_examples

@@ -103,7 +103,7 @@ class TrainLmConfig:
     log_entropy: bool = False
 
     out_dir: str = 'out_dir'
-    cfx_seed: int = 0
+    cfx_seed: int = None
     train_only: bool = False
 
     load_debug_weights: bool = False
@@ -413,9 +413,9 @@ def main(config: TrainLmConfig):
         #data_weight_vector = jnp.ones(len(train_dataset) * trainer.config.batch_size)
         data_weight_vector = jnp.ones(trainer.config.num_train_steps * trainer.config.train_batch_size)
 
-        #if config.train_only:
+        if config.train_only and config.cfx_seed is not None:
             # randomly set 5% of indices to 0
-            #data_weight_vector = jax.random.bernoulli(jax.random.PRNGKey(config.cfx_seed), 0.95, data_weight_vector.shape).astype(jnp.float32)
+            data_weight_vector = jax.random.bernoulli(jax.random.PRNGKey(config.cfx_seed), 0.95, data_weight_vector.shape).astype(jnp.float32)
             #data_weight_vector = data_weight_vector.at[:1024*40].set(1.0)
         print(f"data_weight_vector: {data_weight_vector[:100]}")
         # save data_weight_vector to out_dir
@@ -438,7 +438,7 @@ def main(config: TrainLmConfig):
         used_lm_eval_reward = False
         logger.info("[RewardLoader] eval_harness configured: %s", config.eval_harness is not None)
         #try:
-        if config.eval_harness is not None:
+        if False: #config.eval_harness is not None:
             from levanter.eval_harness import build_reward_loader_for_tasks
             max_eval_length = config.eval_harness.max_length
             EvalPos = state.model.Pos if max_eval_length is None else state.model.Pos.resize(max_eval_length)
