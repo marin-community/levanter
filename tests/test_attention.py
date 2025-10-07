@@ -411,22 +411,6 @@ def test_segment_ids_are_respected(impl):
     assert_trees_all_close(result.array[3:, 1], 0.0, atol=1e-3, rtol=1e-3)
 
 
-def test_attention_mask_prefix_enables_forward_attention():
-    Pos = Axis("Pos", 4)
-    KPos = Pos.alias("KPos")
-
-    base_mask = AttentionMask.causal()
-
-    prefix_array = jnp.zeros((4, 4), dtype=bool)
-    prefix_array = prefix_array.at[0, 1].set(True)
-    prefix_mask = hax.named(prefix_array, (Pos, KPos))
-
-    combined = base_mask.with_prefix_mask(prefix_mask)
-    materialized = combined.materialize(Pos, KPos)
-
-    assert bool(materialized.array[0, 1]) is True
-    assert bool(materialized.array[2, 3]) is False
-
 
 # TODO: fix flash attention for offsets
 @pytest.mark.parametrize("impl", ["vanilla"])

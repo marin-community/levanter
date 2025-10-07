@@ -91,6 +91,35 @@ format:
 - Uses template to flatten messages into a single token sequence
 - Builds `loss_mask` so that only assistant spans are predicted
 
+### Style Prefix Tokens
+
+Levanter supports optional style/source prefix tokens on chat data that are prepended to each example and masked from the loss. This is configured via `style_prefix` on `ChatLmDatasetFormat` and is implemented entirely in the data pipeline (no inference/attention changes are required).
+
+Example configuration:
+
+```yaml
+format:
+  type: chat
+  chat_template: |
+    {%- for message in messages -%}
+    {{ message['role'] }}: {{ message['content'] }}
+    {%- endfor -%}
+    {%- if add_generation_prompt %}assistant:{% endif %}
+  mask_user_turns: false
+  style_prefix:
+    prefix_token: "<style>"
+    suffix_token: "</style>"
+    style_field: "style"
+```
+
+Behavior:
+- Prepends `prefix_token`, the optional style label (from `style_field` or `default_style`), and optional `suffix_token` to each sequence.
+- Zeros the training loss over the inserted prefix tokens; assistant spans remain supervised as usual.
+- If you use a Marin tokenizer family, Levanter will ensure the `<style>`/`</style>` tokens exist when loading the tokenizer.
+- Generation requires no special handling: include the style prefix in the prompt if desired.
+
+API reference: [levanter.data.text.ChatLmDatasetFormat][] with [levanter.data.text.StylePrefixConfig][].
+
 ### Chat Templates
 
 Chat templates are Jinja2 templates that format a list of messages into a single string.
