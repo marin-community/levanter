@@ -125,8 +125,6 @@ def microbatched(
                 # Accumulate loss (scalar)
                 new_loss = acc_loss + this_loss
 
-                # Accumulate metrics using top-level fold() - metrics_dict contains only Metric objects
-
                 new_metrics = jax.tree_util.tree_map(
                     lambda a, b: fold_metric(a, b),
                     acc_metrics,

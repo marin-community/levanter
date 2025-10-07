@@ -23,17 +23,14 @@ Batch = hax.Axis("batch", size=4)
 Embed = hax.Axis("embed", size=8)
 
 
-# === Basic Metric Tests ===
-
-
 @pytest.mark.parametrize(
     "reduction,value,count,expected",
     [
-        (ReductionType.MEAN, 30.0, 2.0, 15.0),  # sum=30, count=2 -> mean=15
-        (ReductionType.SUM, 30.0, 0.0, 30.0),  # sum=30
-        (ReductionType.MAX, 20.0, 0.0, 20.0),  # max=20
-        (ReductionType.MIN, 10.0, 0.0, 10.0),  # min=10
-        (ReductionType.LAST, 20.0, 0.0, 20.0),  # last=20
+        (ReductionType.MEAN, 30.0, 2.0, 15.0),
+        (ReductionType.SUM, 30.0, 0.0, 30.0),
+        (ReductionType.MAX, 20.0, 0.0, 20.0),
+        (ReductionType.MIN, 10.0, 0.0, 10.0),
+        (ReductionType.LAST, 20.0, 0.0, 20.0),
     ],
     ids=["mean", "sum", "max", "min", "last"],
 )
@@ -103,9 +100,6 @@ def test_metric_jit():
     assert jnp.allclose(result.value(), 30.0)
 
 
-# === Auto-inference Tests ===
-
-
 @pytest.mark.parametrize(
     "name,expected_reduction",
     [
@@ -158,9 +152,6 @@ def test_unwrap_metrics():
     assert jnp.allclose(result["num_tokens"], 1024)
     assert jnp.allclose(result["nested"]["max_logit"], 5.0)
     assert result["plain_value"] == 42.0
-
-
-# === Trainer Integration Tests ===
 
 
 class SimpleModel(eqx.Module):

@@ -61,7 +61,7 @@ from levanter.data import AsyncDataset, DataLoader
 from levanter.data.loader import _round_to_nearest_multiple
 from levanter.distributed import DistributedConfig, RayConfig
 from levanter.grad_accum import microbatched
-from levanter.metrics import Metric, auto_metric_from_name
+from levanter.metrics import Metric, auto_metric_from_name, unwrap_metrics
 from levanter.optim.model_averaging import ModelAveragingConfig
 from levanter.schedule import BatchSchedule, IntSchedule, ScheduleStep, value_at_step
 from levanter.tracker import TrackerConfig, capture_time
@@ -213,7 +213,7 @@ class WrappedLossFunction:
         self._mp = mp
         self._compute_axis_mapping = compute_axis_mapping
 
-    def __call__(self, model, *batch, **batch_kwargs) -> Tuple[Scalar, Dict[str, "levanter.metrics.Metric"]]:
+    def __call__(self, model, *batch, **batch_kwargs) -> Tuple[Scalar, Dict[str, Metric]]:
         """
         Call the loss function with model casting and axis mapping.
         Always returns (loss, wrapped_metrics) where metrics are Metric objects.
@@ -232,11 +232,10 @@ class WrappedLossFunction:
         if not isinstance(metrics, dict):
             raise ValueError(f"Expected metrics to be dict, got {type(metrics)}")
 
-        # Auto-wrap ALL plain values into Metric objects
+        # Auto-wrap plain values into Metric objects
         wrapped_metrics = {}
         for key, value in metrics.items():
             if isinstance(value, Metric):
-                # Already wrapped (unusual but allowed)
                 wrapped_metrics[key] = value
             else:
                 # Infer type from name and wrap
@@ -667,28 +666,24 @@ class Trainer:
                 jit_info: InsideJitInfo = InsideJitInfo(grads=grads, updates=updates)
                 hook_infos = self.hooks.run_jit_hooks(state, jit_info, force=False)
 
-        # Unwrap metrics ONLY at the final step before returning
-        from levanter.metrics import unwrap_metrics
-
+        # extract plain metrics and prefix their keys
         plain_metrics = unwrap_metrics(wrapped_metrics)
-
-        # Add train/ prefix to unwrapped values
         train_metrics = {f"train/{k}": v for k, v in plain_metrics.items()}
 
         result = TrainStepResult(
             loss=loss,
             new_state=new_state,
-            loss_metrics=train_metrics,  # Now plain floats
+            loss_metrics=train_metrics,
             hook_infos=hook_infos,
         )
         return hax.shard_with_axis_mapping(result, self.parameter_axis_mapping)
 
     def _compute_gradients_microbatched(
         self, loss_fn: WrappedLossFunction, model: M, *batch, **batch_kwargs
-    ) -> Tuple[Scalar, M, Dict[str, "levanter.metrics.Metric"]]:
+    ) -> Tuple[Scalar, M, Dict[str, Metric]]:
         """
         Compute gradients, optionally with microbatching.
-        Always returns (loss, grads, wrapped_metrics) where wrapped_metrics contains Metric objects.
+        Returns (loss, grads, dict[str, Metric]).
         """
         Batch = _resolve_axis_in_tree((batch, batch_kwargs), self.config.batch_axis)
 
@@ -697,7 +692,6 @@ class Trainer:
 
         mbs = self.config.microbatch_size
         if mbs is not None:
-            # Existing microbatched() handles tuple returns via tree operations
             grad_fn = microbatched(
                 grad_fn,
                 Batch,
