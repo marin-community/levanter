@@ -19,7 +19,6 @@ from levanter.tracker import log_optimizer_hyperparams
 from levanter.utils import flop_utils
 from levanter.utils.jax_utils import jnp_to_python
 
-
 logger = pylogging.getLogger(__name__)
 
 
@@ -176,3 +175,4 @@ def _tqdm_logging_one_time_setup():
         return
     _did_tqdm_logging_one_time_setup = True
     tqdm_logging.set_log_rate(timedelta(seconds=60))
+
