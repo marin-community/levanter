@@ -44,7 +44,7 @@ def test_pack_next_sequence_single_seq_boundary_at_last_token():
 @pytest.mark.parametrize("seq_ids", [[0, 1], [1, 0]])
 def test_pack_next_sequence_boundaries_between_sequences(seq_ids):
     # Two sequences back-to-back; boundaries at the last token of each sequence in the packed slice.
-    capacity = 6
+    capacity = 7
     tq = TokenQueue.init(capacity)
     seq1, seq2 = seq_ids
 
@@ -71,5 +71,5 @@ def test_pack_next_sequence_boundaries_between_sequences(seq_ids):
     bm = boundary_mask.array
     # Boundaries at positions 2 and 5
     assert bool(bm[2]) is True
-    assert bool(bm[5]) is True
+    assert bool(bm[6]) is True
     assert int(bm.sum()) == 2

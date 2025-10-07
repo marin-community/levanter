@@ -3,24 +3,22 @@
 
 import asyncio
 import json
+import logging
 import os
 import struct
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import fsspec
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import multihost_utils
 
 from levanter.utils.jax_utils import broadcast_one_to_all
 
-_DEFAULT_CHUNK_ENV = os.environ.get("LEVANTER_GCS_CHUNK_SIZE", None)
-try:
-    DEFAULT_CHUNK_SIZE_BYTES = int(_DEFAULT_CHUNK_ENV) if _DEFAULT_CHUNK_ENV else 2 * 1024**3
-except ValueError:
-    DEFAULT_CHUNK_SIZE_BYTES = 2 * 1024**3
+logger = logging.getLogger(__name__)
 
 
 _SAFETENSOR_DTYPE_MAP: Dict[str, np.dtype] = {
@@ -40,8 +38,21 @@ _SAFETENSOR_DTYPE_MAP: Dict[str, np.dtype] = {
 }
 
 
+@lru_cache(maxsize=1)
+def _default_chunk_size_bytes() -> int:
+    """Lazily resolve the default chunk size from the environment."""
+
+    raw = os.environ.get("LEVANTER_GCS_CHUNK_SIZE")
+    if not raw:
+        return 2 * 1024**3
+    try:
+        return int(raw)
+    except ValueError:
+        return 2 * 1024**3
+
+
 @dataclass(frozen=True)
-class TensorRecord:
+class _TensorRecord:
     key: str
     dtype: np.dtype
     shape: Tuple[int, ...]
@@ -55,12 +66,12 @@ class TensorRecord:
 
 
 @dataclass(frozen=True)
-class ChunkSpec:
+class _ChunkSpec:
     chunk_id: int
     file_path: str
     byte_start: int
     byte_end: int
-    tensors: Tuple[TensorRecord, ...]
+    tensors: Tuple[_TensorRecord, ...]
 
     @property
     def size(self) -> int:
@@ -118,13 +129,13 @@ class _AsyncFsspecReader:
             return data
 
 
-async def _read_metadata(reader: _AsyncFsspecReader) -> Dict[str, TensorRecord]:
+async def _read_metadata(reader: _AsyncFsspecReader) -> Dict[str, _TensorRecord]:
     header_len_bytes = await reader.read_range(0, 8)
     (header_len,) = struct.unpack("<Q", header_len_bytes)
     metadata_bytes = await reader.read_range(8, header_len)
     metadata = json.loads(metadata_bytes.decode("utf-8"))
 
-    tensors: Dict[str, TensorRecord] = {}
+    tensors: Dict[str, _TensorRecord] = {}
     data_offset_base = 8 + header_len
 
     for key, meta in metadata.items():
@@ -136,7 +147,7 @@ async def _read_metadata(reader: _AsyncFsspecReader) -> Dict[str, TensorRecord]:
             raise ValueError(f"Unsupported safetensors dtype: {dtype_name}")
 
         rel_start, rel_end = meta["data_offsets"]
-        tensors[key] = TensorRecord(
+        tensors[key] = _TensorRecord(
             key=key,
             dtype=dtype,
             shape=tuple(meta["shape"]),
@@ -148,14 +159,14 @@ async def _read_metadata(reader: _AsyncFsspecReader) -> Dict[str, TensorRecord]:
     return tensors
 
 
-def _build_chunks(tensors: Iterable[TensorRecord], chunk_limit: int) -> List[ChunkSpec]:
+def _build_chunks(tensors: Iterable[_TensorRecord], chunk_limit: int) -> List[_ChunkSpec]:
     if chunk_limit <= 0:
         raise ValueError("chunk_limit must be positive")
 
     sorted_tensors = sorted(tensors, key=lambda t: (t.file_path, t.byte_start))
-    chunks: List[ChunkSpec] = []
+    chunks: List[_ChunkSpec] = []
 
-    current_tensors: List[TensorRecord] = []
+    current_tensors: List[_TensorRecord] = []
     current_start = 0
     current_end = 0
     current_path = None
@@ -175,7 +186,7 @@ def _build_chunks(tensors: Iterable[TensorRecord], chunk_limit: int) -> List[Chu
         if (not same_file) or (proposed_size > chunk_limit):
             chunk_id = len(chunks)
             chunks.append(
-                ChunkSpec(
+                _ChunkSpec(
                     chunk_id=chunk_id,
                     file_path=current_path if current_path is not None else tensor.file_path,
                     byte_start=current_start,
@@ -194,7 +205,7 @@ def _build_chunks(tensors: Iterable[TensorRecord], chunk_limit: int) -> List[Chu
     if current_tensors:
         chunk_id = len(chunks)
         chunks.append(
-            ChunkSpec(
+            _ChunkSpec(
                 chunk_id=chunk_id,
                 file_path=current_path if current_path is not None else sorted_tensors[-1].file_path,
                 byte_start=current_start,
@@ -207,18 +218,24 @@ def _build_chunks(tensors: Iterable[TensorRecord], chunk_limit: int) -> List[Chu
 
 
 class SafetensorChunkLoader:
+    """Chunked safetensors loader that minimises remote round-trips."""
+
     def __init__(
         self,
         reader: _AsyncFsspecReader,
-        chunks: Tuple[ChunkSpec, ...],
-        tensors: Dict[str, TensorRecord],
+        chunks: Tuple[_ChunkSpec, ...],
+        tensors: Dict[str, _TensorRecord],
     ):
         self._reader = reader
         self._chunks = chunks
         self._tensors = tensors
         self._chunk_by_key = {tensor.key: chunk for chunk in chunks for tensor in chunk.tensors}
         self._chunk_buffers: Dict[int, np.ndarray] = {}
-        self._chunk_locks: Dict[int, asyncio.Lock] = {chunk.chunk_id: asyncio.Lock() for chunk in chunks}
+        self._chunk_events: Dict[int, asyncio.Event] = {}
+        self._chunk_order: Tuple[_ChunkSpec, ...] = chunks
+        self._next_chunk_index: int = 0
+        self._order_lock: asyncio.Lock | None = None
+        self._order_condition: asyncio.Condition | None = None
         self._process_index = jax.process_index()
         self._process_count = jax.process_count()
 
@@ -229,21 +246,36 @@ class SafetensorChunkLoader:
         *,
         chunk_size: Optional[int] = None,
     ) -> "SafetensorChunkLoader":
-        chunk_limit = chunk_size or DEFAULT_CHUNK_SIZE_BYTES
+        """Instantiate a loader for `path` with optional chunk sizing override."""
+
+        chunk_limit = chunk_size or _default_chunk_size_bytes()
         reader = _AsyncFsspecReader(path)
         tensors = await _read_metadata(reader)
         chunks = tuple(_build_chunks(tensors.values(), chunk_limit))
+        logger.info(
+            "Prepared safetensor chunks for %s: %d tensors across %d chunks (max chunk %.2f GiB)",
+            path,
+            len(tensors),
+            len(chunks),
+            chunk_limit / 1024**3,
+        )
         return cls(reader, chunks, tensors)
 
     @property
-    def chunk_specs(self) -> Tuple[ChunkSpec, ...]:
+    def chunk_specs(self) -> Tuple[_ChunkSpec, ...]:
+        """Return chunk metadata in the order chunks will be materialised."""
+
         return self._chunks
 
     @property
-    def tensor_records(self) -> Dict[str, TensorRecord]:
+    def tensor_records(self) -> Dict[str, _TensorRecord]:
+        """Return raw safetensors metadata keyed by tensor name."""
+
         return self._tensors
 
-    def chunk_for_key(self, key: str) -> ChunkSpec:
+    def chunk_for_key(self, key: str) -> _ChunkSpec:
+        """Return the chunk metadata for a given tensor key."""
+
         try:
             return self._chunk_by_key[key]
         except KeyError as exc:
@@ -251,13 +283,21 @@ class SafetensorChunkLoader:
 
     async def materialize_chunk(
         self,
-        chunk: ChunkSpec,
+        chunk: _ChunkSpec,
         *,
         dtype_override: Optional[jnp.dtype] = None,
     ) -> Dict[str, np.ndarray]:
+        """Materialise every tensor in `chunk` as a NumPy array."""
+
         buffer = await self._get_chunk_buffer(chunk)
         base = chunk.byte_start
         tensors: Dict[str, np.ndarray] = {}
+        logger.info(
+            "Process %d extracting %d tensors from chunk %d",
+            self._process_index,
+            len(chunk.tensors),
+            chunk.chunk_id,
+        )
 
         for tensor in chunk.tensors:
             start = tensor.byte_start - base
@@ -280,11 +320,26 @@ class SafetensorChunkLoader:
         *,
         dtype_override: Optional[jnp.dtype] = None,
     ) -> np.ndarray:
+        """Materialise a single tensor by key as a NumPy array.
+
+        Note that this still materialises the entire chunk that owns the
+        tensor, so repeated calls for different tensors in the same chunk are
+        cheap but the first call may load more than strictly necessary.
+        """
+
         chunk = self.chunk_for_key(key)
+        logger.info(
+            "Process %d materialising tensor %s via chunk %d",
+            self._process_index,
+            key,
+            chunk.chunk_id,
+        )
         tensors = await self.materialize_chunk(chunk, dtype_override=dtype_override)
         return tensors[key]
 
     async def read_all(self, *, dtype_override: Optional[jnp.dtype] = None) -> Dict[str, np.ndarray]:
+        """Materialise every tensor in the safetensors file."""
+
         result: Dict[str, np.ndarray] = {}
         for chunk in self._chunks:
             tensors = await self.materialize_chunk(chunk, dtype_override=dtype_override)
@@ -293,35 +348,105 @@ class SafetensorChunkLoader:
         return result
 
     def release_chunk(self, chunk_id: int) -> None:
-        self._chunk_buffers.pop(chunk_id, None)
+        """Drop any cached buffer for the provided chunk id."""
 
-    async def _get_chunk_buffer(self, chunk: ChunkSpec) -> np.ndarray:
+        if chunk_id in self._chunk_buffers:
+            logger.info("Process %d released chunk %d", self._process_index, chunk_id)
+            self._chunk_buffers.pop(chunk_id, None)
+            self._chunk_events.pop(chunk_id, None)
+
+    async def _get_chunk_buffer(self, chunk: _ChunkSpec) -> np.ndarray:
         existing = self._chunk_buffers.get(chunk.chunk_id)
         if existing is not None:
+            logger.debug(
+                "Process %d reusing cached chunk %d",
+                self._process_index,
+                chunk.chunk_id,
+            )
             return existing
 
-        lock = self._chunk_locks[chunk.chunk_id]
-        async with lock:
-            existing = self._chunk_buffers.get(chunk.chunk_id)
-            if existing is not None:
-                return existing
+        event = self._chunk_events.get(chunk.chunk_id)
+        if event is None:
+            event = asyncio.Event()
+            self._chunk_events[chunk.chunk_id] = event
 
-            is_owner = self._process_index == chunk.owner(self._process_count)
-            if is_owner:
-                raw = await self._reader.read_range(chunk.byte_start, chunk.size)
-                local_array = np.frombuffer(raw, dtype=np.uint8)
-            else:
-                local_array = np.empty(chunk.size, dtype=np.uint8)
-                local_array.fill(0)
-
-            if self._process_count > 1:
-                loop = asyncio.get_running_loop()
-                local_array = await loop.run_in_executor(
-                    None,
-                    lambda: broadcast_one_to_all(local_array, is_source=is_owner),
+        if chunk in self._chunk_order[: self._next_chunk_index]:
+            raise RuntimeError(
+                f"Chunk {chunk.chunk_id} has already been processed and cannot be materialised again"
+            )
+        if event.is_set():
+            logger.debug(
+                "Process %d observed completed chunk %d", self._process_index, chunk.chunk_id
+            )
+            buffer = self._chunk_buffers.get(chunk.chunk_id)
+            if buffer is None:
+                raise RuntimeError(
+                    f"Chunk {chunk.chunk_id} has been released and cannot be rematerialised"
                 )
-            self._chunk_buffers[chunk.chunk_id] = local_array
-            return local_array
+            return buffer
+
+        condition = self._ensure_condition()
+        async with condition:
+            while self._next_chunk_index < len(self._chunk_order) and self._chunk_order[self._next_chunk_index] != chunk:
+                if event.is_set():
+                    return self._chunk_buffers[chunk.chunk_id]
+                await condition.wait()
+
+            if event.is_set():
+                return self._chunk_buffers[chunk.chunk_id]
+
+            self._next_chunk_index += 1
+
+        is_owner = self._process_index == chunk.owner(self._process_count)
+        logger.info(
+            "Process %d materialising chunk %d (size %.2f MiB, owner=%d)",
+            self._process_index,
+            chunk.chunk_id,
+            chunk.size / 1024**2,
+            chunk.owner(self._process_count),
+        )
+        if is_owner:
+            raw = await self._reader.read_range(chunk.byte_start, chunk.size)
+            local_array = np.frombuffer(raw, dtype=np.uint8)
+            logger.info(
+                "Process %d read chunk %d (%d bytes) from %s",
+                self._process_index,
+                chunk.chunk_id,
+                chunk.size,
+                chunk.file_path,
+            )
+        else:
+            local_array = np.empty(chunk.size, dtype=np.uint8)
+            local_array.fill(0)
+
+        if self._process_count > 1:
+            logger.info(
+                "Process %d broadcasting chunk %d buffer (owner=%d)",
+                self._process_index,
+                chunk.chunk_id,
+                chunk.owner(self._process_count),
+            )
+            local_array = broadcast_one_to_all(local_array, is_source=is_owner)
+            multihost_utils.sync_global_devices()
+
+        logger.info(
+            "Process %d cached chunk %d (%.2f MiB)",
+            self._process_index,
+            chunk.chunk_id,
+            chunk.size / 1024**2,
+        )
+        self._chunk_buffers[chunk.chunk_id] = local_array
+        event.set()
+        condition = self._ensure_condition()
+        async with condition:
+            condition.notify_all()
+        return local_array
+
+    def _ensure_condition(self) -> asyncio.Condition:
+        if self._order_condition is None:
+            self._order_lock = asyncio.Lock()
+            self._order_condition = asyncio.Condition(self._order_lock)
+        return self._order_condition
 
 
 async def create_safetensor_chunk_loader(
@@ -329,4 +454,6 @@ async def create_safetensor_chunk_loader(
     *,
     chunk_size: Optional[int] = None,
 ) -> SafetensorChunkLoader:
+    """Convenience wrapper that forwards to :meth:`SafetensorChunkLoader.create`."""
+
     return await SafetensorChunkLoader.create(path, chunk_size=chunk_size)
