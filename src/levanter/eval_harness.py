@@ -637,8 +637,8 @@ class LevanterHarnessLM(TemplateLM):
                 max_stop_seqs = max(max_stop_seqs, num_stop_seqs)
                 max_stop_tokens = max(max_stop_tokens, num_stop_tokens)
 
-        # Memory-optimized configuration for HBM constraints
-        # Reduced from original values to fit within 31.25G HBM limit
+        # [ChiHeem,2025-10-06] TODO: Pass this from marin to allow users to 
+        # optimize the inference based on hardware and model. 
         engine_cfg = InferenceEngineConfig(
             max_stop_seqs=max_stop_seqs,
             max_stop_tokens=max_stop_tokens,
