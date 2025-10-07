@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 """src.levanter.main.eval_careless_lm
 ===================================
 On-the-fly suffix‐likelihood evaluation over a plain-text file.
@@ -232,7 +235,6 @@ def main(cfg: EvalCarelessLmConfig):
     RUN_START_TIME = time.time()
 
     levanter.initialize(cfg)
-
 
     # Append timestamp to output_base_path for GCS writes
     if cfg.output_base_path.startswith("gs://"):

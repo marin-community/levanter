@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 """Multi-book careless suffix likelihood evaluation.
 
 This script is a standalone variant of :mod:`eval_careless_lm` that evaluates
@@ -60,7 +63,8 @@ RUN_START_TIME = None
 def fsspec_exists(path: str) -> bool:
     """Check if a file exists using fsspec (works with local and GCS paths)."""
     try:
-        with fsspec.open(path, 'r') as f:
+        with fsspec.open(path, "r") as f:
+            f.close()
             return True
     except FileNotFoundError:
         return False
@@ -176,8 +180,8 @@ def save_plot_to_gcp(fig, output_path: str, filename: str, book_title: str, dpi:
         tmp_path = tmp_file.name
 
     # Copy to GCP using fsspec
-    with fsspec.open(full_path, 'wb') as f_out:
-        with open(tmp_path, 'rb') as f_in:
+    with fsspec.open(full_path, "wb") as f_out:
+        with open(tmp_path, "rb") as f_in:
             f_out.write(f_in.read())
 
     os.unlink(tmp_path)
@@ -197,8 +201,8 @@ def save_data_to_gcp(data, output_path: str, filename: str, book_title: str, **k
         tmp_path = tmp_file.name
 
     # Copy to GCP using fsspec
-    with fsspec.open(full_path, 'wb') as f_out:
-        with open(tmp_path, 'rb') as f_in:
+    with fsspec.open(full_path, "wb") as f_out:
+        with open(tmp_path, "rb") as f_in:
             f_out.write(f_in.read())
 
     os.unlink(tmp_path)
@@ -223,7 +227,7 @@ def evaluate_book(
     """Run careless evaluation on a single book using a pre-loaded model."""
 
     # Use fsspec to read text files (supports both local and remote paths like gs://)
-    with fsspec.open(cfg.txt_path, 'r') as f:
+    with fsspec.open(cfg.txt_path, "r") as f:
         raw_text = f.read()
 
     token_ids = None
@@ -369,8 +373,8 @@ def evaluate_book(
         if main_cfg.gcp_log:
             # Copy histogram to GCP using fsspec with book subfolder
             histogram_gcp_path = f"{main_cfg.output_base_path.rstrip('/')}/{cfg.book_title}/{cfg.histogram_path}"
-            with fsspec.open(histogram_gcp_path, 'wb') as f_out:
-                with open(temp_histogram_path, 'rb') as f_in:
+            with fsspec.open(histogram_gcp_path, "wb") as f_out:
+                with open(temp_histogram_path, "rb") as f_in:
                     f_out.write(f_in.read())
             logger.info(f"📊 Saved histogram to: {histogram_gcp_path}")
         else:
@@ -425,12 +429,12 @@ def evaluate_book(
             config_info=np.array(
                 [
                     cfg.chunk_size,
-                cfg.prompt_tokens,
-                cfg.cursor_inc_tokens if cfg.token_mode else cfg.cursor_inc_chars,
-                len(token_ids) if cfg.token_mode else len(raw_text),
-            ]
-        ),
-    )
+                    cfg.prompt_tokens,
+                    cfg.cursor_inc_tokens if cfg.token_mode else cfg.cursor_inc_chars,
+                    len(token_ids) if cfg.token_mode else len(raw_text),
+                ]
+            ),
+        )
     else:
         save_data_with_wandb(
             None,
@@ -616,10 +620,10 @@ def main(cfg: EvalSlidingTotalConfig):
                 "book_path": book_cfg.txt_path,
                 "completed_at": datetime.utcnow().isoformat(),
                 "elapsed_time_seconds": elapsed_time,
-                "status": "success"
+                "status": "success",
             }
 
-            with fsspec.open(success_file_path, 'w') as f:
+            with fsspec.open(success_file_path, "w") as f:
                 f.write(json.dumps(success_metadata, indent=2))
 
             logger.info(f"📝 Success marker written to: {success_file_path}")

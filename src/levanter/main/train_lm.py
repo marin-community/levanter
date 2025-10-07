@@ -25,6 +25,7 @@ from levanter.checkpoint import load_checkpoint
 from levanter.compat.hf_checkpoints import HFCompatConfig, save_hf_checkpoint_callback
 from levanter.data.text import LMMixtureDatasetConfig, SingleDatasetLMConfig, UrlSingleDatasetLMConfig
 from levanter.eval_harness import LmEvalHarnessConfig
+from levanter.eval_pz_innerloop import PzInnerLoopConfig, pz_eval_callback
 from levanter.models.llama import LlamaConfig
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, compute_next_token_loss
 from levanter.optim import AdamConfig, OptimizerConfig
@@ -66,6 +67,8 @@ class TrainLmConfig:
     epoch: int = 0
     eval_harness: Optional[LmEvalHarnessConfig] = None
     eval_harness_steps: int = 10000
+    pz_eval: Optional[PzInnerLoopConfig] = None
+    pz_eval_steps: int = 10000
 
     # TODO: really need to add callback framework
     log_entropy: bool = False
@@ -226,9 +229,26 @@ def main(config: TrainLmConfig):
             eval_harness = config.eval_harness
             trainer.add_hook(
                 levanter.eval_harness.lm_eval_harness(
-                    eval_harness, tokenizer, EvalBatch, compute_axis_mapping, trainer.mp
+                    eval_harness,
+                    tokenizer,
+                    EvalBatch,
+                    compute_axis_mapping,
+                    trainer.mp,
+                    data_config=config.data,
                 ),
                 every=config.eval_harness_steps,
+            )
+
+        if config.pz_eval is not None:
+            trainer.add_hook(
+                pz_eval_callback(
+                    config.pz_eval,
+                    tokenizer,
+                    compute_axis_mapping,
+                    trainer.mp,
+                    config.data,
+                ),
+                every=config.pz_eval_steps,
             )
 
         @named_jit(

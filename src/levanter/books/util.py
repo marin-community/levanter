@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 """
 levanter.books.util
 ===================
@@ -47,7 +50,9 @@ __all__ = [
 # -----------------------------------------------------------------------------
 # Core metric helpers ---------------------------------------------------------
 # -----------------------------------------------------------------------------
-def create_pz_histogram_linear(pz_list: List[float], threshold: float, save_path: str, book_title: str = "Book", model_name: str = "Unknown Model"):
+def create_pz_histogram_linear(
+    pz_list: List[float], threshold: float, save_path: str, book_title: str = "Book", model_name: str = "Unknown Model"
+):
     """
     Create a histogram of p_z values matching the style from the reference codebase.
     Uses dynamic bin calculation and styling similar to make_pz_dist_plot.

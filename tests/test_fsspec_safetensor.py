@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import tempfile
 
 import numpy as np
@@ -11,9 +14,9 @@ from levanter.compat.fsspec_safetensor import load_tensor_dict
 @pytest.mark.parametrize("dtype", ["float32", "int8", "uint64"])
 async def test_various_dtypes(tmp_path, dtype):
     data = {
-        "x": np.random.randint(0, 100, (4, 5)).astype(dtype)
-        if "int" in dtype
-        else np.random.randn(4, 5).astype(dtype),
+        "x": (
+            np.random.randint(0, 100, (4, 5)).astype(dtype) if "int" in dtype else np.random.randn(4, 5).astype(dtype)
+        ),
     }
 
     local_path = tmp_path / f"test_{dtype}.safetensors"

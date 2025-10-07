@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 """Multi-book careless suffix likelihood evaluation.
 
 This script is a standalone variant of :mod:`eval_careless_lm` that evaluates
@@ -424,6 +427,7 @@ def main(cfg: EvalSlidingTotalConfig):
     """
 
     import sys
+
     print("🔥 EVAL_SLIDING_TOTAL main: Function started!", flush=True)
     sys.stdout.flush()
 
