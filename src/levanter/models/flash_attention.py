@@ -68,50 +68,29 @@ def flash_attention(
     KPos = k.resolve_axis(KPos)
 
     if QPos.size < block_size or KPos.size < block_size:
-        if attn_sink is not None:
-            from levanter.layers.attention import dot_product_attention_with_sink
+        from levanter.layers.attention import dot_product_attention
 
-            return dot_product_attention_with_sink(
-                QPos,
-                KPos,
-                Key,
-                q,
-                k,
-                v,
-                attn_sink,
-                mask=mask,
-                bias=bias,
-                attention_dtype=dtype,
-                precision=precision,
-                use_flash=False,  # force VANILLA
-                attn_backend=None,
-                flash_block_size=block_size,
-                dropout=dropout,
-                logits_soft_cap=logits_soft_cap,
-                scaling_factor=scaling_factor,
-                inference=inference,
-                prng=key,
-            )
-        else:
-            from levanter.layers.attention import simple_attention_with_dropout
-
-            return simple_attention_with_dropout(
-                QPos,
-                KPos,
-                Key,
-                q,
-                k,
-                v,
-                mask=mask,
-                bias=bias,
-                inference=inference,
-                dropout=dropout,
-                attention_dtype=dtype,
-                precision=precision,
-                prng=key,
-                scaling_factor=scaling_factor,
-                logits_soft_cap=logits_soft_cap,
-            )
+        return dot_product_attention(
+            QPos,
+            KPos,
+            Key,
+            q,
+            k,
+            v,
+            mask=mask,
+            bias=bias,
+            attention_dtype=dtype,
+            precision=precision,
+            use_flash=False,  # force VANILLA
+            attn_backend=None,
+            flash_block_size=block_size,
+            dropout=dropout,
+            logits_soft_cap=logits_soft_cap,
+            scaling_factor=scaling_factor,
+            inference=inference,
+            prng=key,
+            attn_sink=attn_sink,
+        )
 
     if scaling_factor is None:
         if Key.size == 0:
@@ -232,8 +211,7 @@ def _flash_attention_forward(
         if attn_sink is not None:
             sink_prefix = attn_sink
             for ax in q_batch_axes:
-                if ax not in sink_prefix.axes:
-                    sink_prefix = sink_prefix.broadcast_axis(ax)
+                sink_prefix = sink_prefix.broadcast_axis(ax) if ax not in sink_prefix.axes else sink_prefix
             sink_block = sink_prefix.broadcast_axis(QPosBlock).astype(q.dtype)
             # Ensure axis order matches row_axes_block
             sink_block = sink_block.rearrange(row_axes_block)
@@ -417,7 +395,6 @@ def _flash_attention_backward(
             dV_ji = hax.dot(p_ij, dO_i, axis=QPos.name).astype(dV_j.dtype)
             dK_ji = hax.dot(dAttn_ij, q_i, axis=QPos.name).astype(dK_j.dtype)
 
-            # GQA-specific: eliminate unnecessary axes (e.g. 'q_heads_per_group')
             unnecessary_axes = hax.eliminate_axes(dV_ji.axes, _strip_sizes(v.axes))
             dV_ji = hax.sum(dV_ji, unnecessary_axes)
             dK_ji = hax.sum(dK_ji, unnecessary_axes)

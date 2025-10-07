@@ -27,7 +27,6 @@ from levanter.layers.attention import (
     _tpu_splash_attention,
     AttentionWithSink,
     dot_product_attention,
-    dot_product_attention_with_sink,
 )
 from test_utils import skip_if_module_missing, skip_if_no_torch, use_test_mesh
 
@@ -93,14 +92,14 @@ def test_attention_sink():
     v = hax.ones((Head, KeyPos, D))
     sink = hax.zeros((Head, QHead))
 
-    out = dot_product_attention_with_sink(
+    out = dot_product_attention(
         Pos.name,
         KeyPos.name,
         D.name,
         q,
         k,
         v,
-        sink,
+        attn_sink=sink,
     )
 
     expected = np.full((1, 1, 2, 1), 2.0 / 3)
@@ -591,19 +590,19 @@ def sink_attention(
         mask_arr &= pos_queries[:, None] - sliding_window + 1 <= pos_keys[None, :]
     mask = hax.named(mask_arr, (QPos, KPos))
 
-    out = dot_product_attention_with_sink(
+    out = dot_product_attention(
         QPos,
         KPos,
         D,
         q,
         k,
         v,
-        sink,
         mask=mask,
         scaling_factor=sm_scale,
         attn_backend=attn_backend,
         flash_block_size=block_size,
         inference=inference,
+        attn_sink=sink,
     )
 
     out_np = np.asarray(out.array, dtype=np.float32)

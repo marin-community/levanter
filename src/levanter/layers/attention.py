@@ -156,28 +156,26 @@ def dot_product_attention(
 
     match attn_backend:
         case AttentionBackend.NVTE:
-            if attn_sink is None:
-                attention_out = _try_te_attention(
-                    QPos,
-                    KPos,
-                    Key,
-                    query,
-                    key,
-                    value,
-                    mask,
-                    bias,
-                    dropout,
-                    inference,
-                    prng=prng,
-                    attention_dtype=attention_dtype,
-                    precision=precision,
-                    flash_block_size=flash_block_size,
-                    force_te=not was_default,
-                    scaling_factor=scaling_factor,
-                    logits_soft_cap=logits_soft_cap,
-                )
-            else:
-                attention_out = None  # fall through to JAX
+            attention_out = _try_te_attention(
+                QPos,
+                KPos,
+                Key,
+                query,
+                key,
+                value,
+                mask=mask,
+                bias=bias,
+                dropout=dropout,
+                inference=inference,
+                prng=prng,
+                attention_dtype=attention_dtype,
+                precision=precision,
+                flash_block_size=flash_block_size,
+                force_te=not was_default,
+                scaling_factor=scaling_factor,
+                logits_soft_cap=logits_soft_cap,
+                attn_sink=attn_sink,
+            )
 
         case AttentionBackend.SPLASH:
             if attn_sink is None:
@@ -360,54 +358,6 @@ def _materialize_sink_as_dummy_kv(
     return key, value, m, bias, KPosPlus
 
 
-def dot_product_attention_with_sink(
-    QPos: AxisSelector,
-    KPos: AxisSelection,
-    Key: AxisSelector,
-    query: NamedArray,
-    key: NamedArray,
-    value: NamedArray,
-    attn_sink: NamedArray,
-    mask: Optional[Union["AttentionMask", NamedArray]] = None,
-    bias: Optional[NamedArray] = None,
-    attention_dtype: Optional[jnp.dtype] = None,
-    precision: PrecisionLike = None,
-    use_flash: Optional[bool] = None,
-    attn_backend: Optional[AttentionBackend] = None,
-    flash_block_size: Optional[int] = None,
-    dropout: float = 0.0,
-    *,
-    logits_soft_cap: float | None = None,
-    scaling_factor: float | None = None,
-    inference: bool = True,
-    prng: PRNGKeyArray | None = None,
-):
-    """
-    Compatibility wrapper: forwards directly to `dot_product_attention` with `attn_sink=...`.
-    """
-    return dot_product_attention(
-        QPos=QPos,
-        KPos=KPos,
-        Key=Key,
-        query=query,
-        key=key,
-        value=value,
-        mask=mask,
-        bias=bias,
-        attention_dtype=attention_dtype,
-        precision=precision,
-        use_flash=use_flash,
-        attn_backend=attn_backend,
-        flash_block_size=flash_block_size,
-        dropout=dropout,
-        logits_soft_cap=logits_soft_cap,
-        scaling_factor=scaling_factor,
-        inference=inference,
-        prng=prng,
-        attn_sink=attn_sink,
-    )
-
-
 def simple_attention_with_dropout(
     QPos: AxisSelector,
     KPos: AxisSelector,
@@ -479,7 +429,20 @@ def _try_te_attention(
     force_te: bool,
     scaling_factor: float,
     logits_soft_cap: Optional[float] = None,
+    attn_sink: Optional[NamedArray] = None,  # NEW
 ):
+    """
+    Try NVTE fused attention. If unsupported, either raise (when forced) or warn and return None.
+    Also rejects `attn_sink` since NVTE doesn't support it yet. (Centralizing this logic
+    matches the review suggestion to keep the 'forced backend must raise' contract here.)
+    """
+    if attn_sink is not None:
+        msg = "NVTE fused attention does not support attention sinks; falling back to reference."
+        if force_te:
+            raise NotImplementedError("NVTE fused attention does not support attention sinks.")
+        warnings.warn(msg)
+        return None
+
     try:
         return _te_flash_attention(
             QPos,
@@ -535,7 +498,6 @@ def _try_te_attention(
 
             if force_te:
                 raise NotImplementedError(msg)
-
             warnings.warn(msg)
         else:
             raise
@@ -2392,14 +2354,13 @@ class AttentionWithSink(Attention):
         k = k.rename({"position": "key_position"})
         v = v.rename({"position": "key_position"})
 
-        attn_output = dot_product_attention_with_sink(
+        attn_output = dot_product_attention(
             "position",
             "key_position",
             "head_size",
             q,
             k,
             v,
-            self.sinks,
             mask,
             attention_dtype=jnp.float32 if self.config.upcast_attn else x.dtype,
             attn_backend=self.config.attn_backend,
@@ -2409,6 +2370,7 @@ class AttentionWithSink(Attention):
             dropout=0.0,
             inference=True,
             prng=key,
+            attn_sink=self.sinks,
         )
 
         attn_output = attn_output.flatten_axes(("kv_head", "q_heads_per_group"), "heads")
