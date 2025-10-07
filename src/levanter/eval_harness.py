@@ -86,6 +86,17 @@ from levanter.utils.tree_utils import inference_mode
 logger = logging.getLogger(__name__)
 
 
+class SafeJSONEncoder(json.JSONEncoder):
+    """Custom JSON encoder that handles non-serializable objects by converting them to strings."""
+    
+    def default(self, obj):
+        if callable(obj):
+            return f"<function: {obj.__name__ if hasattr(obj, '__name__') else str(obj)}>"
+        elif hasattr(obj, '__dict__'):
+            return str(obj)
+        return super().default(obj)
+
+
 @dataclass(frozen=True)
 class SampleLoggingConfig:
     """Configuration for controlling how many sample generations we keep per benchmark."""
@@ -1259,12 +1270,12 @@ def run_eval_harness_main(config: EvalHarnessMainConfig):
             # log the results as json
             logger.info("uploading artifacts...")
             with open("lm_eval_harness_results.json", "w") as f:
-                json.dump(outputs, f, indent=2)
+                json.dump(outputs, f, indent=2, cls=SafeJSONEncoder)
                 f.flush()
                 f_path = f.name
                 levanter.tracker.current_tracker().log_artifact(f_path, name="lm_eval_harness_results")
 
-            print(json.dumps(outputs, indent=2), flush=True)
+            print(json.dumps(outputs, indent=2, cls=SafeJSONEncoder), flush=True)
 
         return outputs
 
@@ -1323,7 +1334,7 @@ def lm_eval_harness(config: LmEvalHarnessConfig, tokenizer, EvalBatch, axis_reso
             with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as f:
                 import json
 
-                json.dump(outputs, f)
+                json.dump(outputs, f, cls=SafeJSONEncoder)
                 f.flush()
                 levanter.tracker.current_tracker().log_artifact(
                     f.name, name=f"lm_eval_harness_results.{step.step}.json", type="lm_eval_output"
