@@ -1464,7 +1464,7 @@ class AttentionConfig:
 
     def __post_init__(self):
         if self.use_mup and self.scaling_factor is None:
-            self.scaling_factor = 1 / self.head_dim
+            self.scaling_factor = 1 / self.head_size
 
         assert self.num_heads % self.num_kv_heads == 0, (
             f"num_heads={self.num_heads} not divisible by num_kv_heads={self.num_kv_heads}."
