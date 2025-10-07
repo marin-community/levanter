@@ -412,6 +412,15 @@ def broadcast_shard(x: T, out_axis_specs: Any, source: int = 0) -> T:
     if jax.process_count() == 1:
         return x
 
+    # Check if x contains globally sharded JAX arrays (not fully addressable)
+    # If so, return as-is since it's already distributed across all hosts
+    def is_global_array(leaf):
+        return isinstance(leaf, jax.Array) and not leaf.is_fully_addressable
+
+    if any(jax.tree.leaves(jax.tree.map(is_global_array, x))):
+        # Already globally distributed, return as-is
+        return x
+
     current_mesh: jax.sharding.Mesh = hax.partitioning._get_mesh()
 
     axis_names = current_mesh.axis_names
@@ -425,6 +434,10 @@ def broadcast_shard(x: T, out_axis_specs: Any, source: int = 0) -> T:
     )
 
     def pre_jit(x):
+        # If x is already a globally sharded JAX array, return it as-is
+        if isinstance(x, jax.Array) and not x.is_fully_addressable:
+            return x
+
         if jax.process_index() == source:
             inp = np.array(x)
         else:

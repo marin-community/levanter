@@ -55,6 +55,7 @@ class AttentionBackend(Enum):
     SPLASH = "splash"  # on TPU.
     JAX_FLASH = "jax_flash"  # Use the JAX reference implementation
     VANILLA = "vanilla"  # regular dot product attention
+    FLASH_META = "flash_meta"  # use the flash attention meta kernel
 
 
 def default_attention_type() -> AttentionBackend:
@@ -158,7 +159,7 @@ def dot_product_attention(
         scaling_factor = 1 / math.sqrt(query.resolve_axis(Key).size)
 
     attention_out = None
-    print(f"*** dot_product_attention > attn_backend: {attn_backend}", flush=True)
+    print(f"*** dot_product_attention > ATTN_BACKEND: {attn_backend}", flush=True)
 
     match attn_backend:
         case AttentionBackend.NVTE:
@@ -277,6 +278,26 @@ def dot_product_attention(
                     logits_soft_cap=logits_soft_cap,
                 )
 
+        case AttentionBackend.FLASH_META:
+            from levanter.models.flash_attention_new import flash_attention
+            return flash_attention(
+                QPos,
+                KPos,
+                Key,
+                query,
+                key,
+                value,
+                block_size=flash_block_size,
+                mask=mask,
+                bias=bias,
+                dropout=dropout,
+                inference=inference,
+                key=prng,
+                dtype=attention_dtype,
+                precision=precision,
+                scaling_factor=scaling_factor,
+                logits_soft_cap=logits_soft_cap,
+            )
         case _:
             attention_out = None
 
