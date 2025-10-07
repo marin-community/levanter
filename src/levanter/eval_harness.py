@@ -617,6 +617,19 @@ class LevanterHarnessLM(TemplateLM):
                 prompt_token_lists[i] = toks[-max_ctx_len:]
 
         # Process stop sequences for each request individually
+        # Merge per-task additional stop strings if available
+        task_name = getattr(self, "_current_task", None)
+        addl_stops_for_task: list[str] = []
+        if task_name is not None and hasattr(self.leader, "_task_additional_stops"):
+            addl_stops_for_task = self.leader._task_additional_stops.get(task_name, [])
+        if addl_stops_for_task:
+            for gen_kwargs in processed_kwargs_list:
+                existing_until = list(gen_kwargs.get("until") or [])
+                for s in addl_stops_for_task:
+                    if s and s not in existing_until:
+                        existing_until.append(s)
+                gen_kwargs["until"] = existing_until
+
         # Get EOS token for stop sequence handling
         eos = self.tokenizer.decode(self.eot_token_id)
 
@@ -805,6 +818,9 @@ class TaskConfig:
     doc_to_choice: str | None = None
     """Jinja2 template string to process a sample into a list of possible string choices for multiple_choice tasks. """
 
+    # Extra Levanter-only config to control generation stops per task
+    additional_stop_strings: list[str] | None = ['<|end_think|>']
+
     def to_dict(self):
         base_dict = dataclasses.asdict(self)
         return {k: v for k, v in base_dict.items() if v is not None}
@@ -875,6 +891,40 @@ class LmEvalHarnessConfig:
 
         logger.info(f"Loaded {len(this_tasks)} tasks")
         return this_tasks
+
+    def to_task_dict_and_stop_map(self) -> tuple[dict, dict[str, list[str]]]:
+        """Like to_task_dict, but also returns a mapping from final task names to additional stop strings."""
+        logger.info("Loading tasks (with stop map)...")
+        import lm_eval.tasks as tasks
+
+        manager = tasks.TaskManager()
+        this_tasks: dict = {}
+        stop_map: dict[str, list[str]] = {}
+        for task in tqdm(self.to_task_spec()):
+            try:
+                if isinstance(task, str):
+                    tdict = tasks.get_task_dict(task, manager)
+                    this_tasks.update(tdict)
+                else:
+                    our_name = task.get("task_alias", task["task"]) if isinstance(task, dict) else task
+                    our_name = our_name.replace(" ", "_")
+                    tasks_for_this_task_spec = self._get_task_and_rename(manager, our_name, task)
+                    # Record stop strings for each resulting child task name, if provided
+                    addl_stops = task.get("additional_stop_strings") or []
+                    child_names = self._get_child_tasks(tasks_for_this_task_spec)
+                    for name in child_names:
+                        if addl_stops:
+                            stop_map[name] = list(addl_stops)
+                    for k, v in tasks_for_this_task_spec.items():
+                        if k in this_tasks:
+                            raise ValueError(f"Task {k} already exists")
+                        this_tasks[k] = v
+            except Exception as e:
+                logger.exception(f"Failed to load task {task}")
+                raise ValueError(f"Failed to load task {task}") from e
+
+        logger.info(f"Loaded {len(this_tasks)} tasks")
+        return this_tasks, stop_map
 
     def _get_task_and_rename(self, manager, our_name, task: dict | str):
         """
@@ -1003,9 +1053,12 @@ def run_lm_eval_harness(
         - "averages": A dictionary with macro and micro averages for all metrics.
         Otherwise, returns None.
     """
-    tasks_to_run = config.to_task_dict()
+    # Build both the tasks and the per-task additional stop strings map
+    tasks_to_run, task_stop_map = config.to_task_dict_and_stop_map()
 
-    outputs = _actually_run_eval_harness(config, model, tasks_to_run, tokenizer, EvalBatch, axis_resources, mp)
+    outputs = _actually_run_eval_harness(
+        config, model, tasks_to_run, tokenizer, EvalBatch, axis_resources, mp, task_stop_map
+    )
 
     return outputs
 
@@ -1018,6 +1071,7 @@ def _actually_run_eval_harness(
     EvalBatch: haliax.Axis,
     axis_resources: ResourceMapping,
     mp: jmp.Policy | None,
+    task_stop_map: dict[str, list[str]],
 ) -> dict | None:
     """
     Actually run the LM Eval Harness on the given model and tasks. This is a separate function so that it can be used
@@ -1050,6 +1104,9 @@ def _actually_run_eval_harness(
         generation_kwargs=config.generation_kwargs,
         sample_logging_config=config.sample_logging,
     )
+
+    # Attach additional stop strings map to worker so the LM can consult by task name
+    worker._task_additional_stops = task_stop_map
 
     if jax.process_index() == 0:
         logger.info("Process 0 is running the eval harness.")
