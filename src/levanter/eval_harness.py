@@ -24,22 +24,20 @@ import dataclasses
 import json
 import logging
 import tempfile
-import pathlib
 import typing
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Iterator, List, Optional, Tuple, Union
 
 import equinox as eqx
+import haliax
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
 import jmp
 import numpy as np
-from jax.sharding import PartitionSpec
-
-import haliax
 from haliax import NamedArray
+from jax.sharding import PartitionSpec
 
 import levanter.tracker
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, load_tokenizer
@@ -49,14 +47,15 @@ from levanter.data.packing import (
     per_segment_correct,
     per_segment_loss,
 )
+from levanter.inference.engine import InferenceEngine, InferenceEngineConfig
+from levanter.inference.engine import Request as GenRequest
+from levanter.inference.jit_scheduler import SeqDecodingParams
+from levanter.inference.utils import INVALID
 from levanter.models.gpt2 import Gpt2Config
 from levanter.models.loss import next_token_loss
 from levanter.utils.background_iterable import BackgroundIterator
 from levanter.utils.hf_utils import HfTokenizer
 from levanter.utils.py_utils import set_global_rng_seeds
-from levanter.inference.engine import InferenceEngine, InferenceEngineConfig, Request as GenRequest
-from levanter.inference.jit_scheduler import SeqDecodingParams
-from levanter.inference.utils import INVALID
 
 try:
     from lm_eval import evaluator
@@ -70,10 +69,9 @@ except ImportError:
     handle_stop_sequences = None
     postprocess_generated_text = None
 
-from tqdm_loggable.auto import tqdm
-
 import haliax as hax
 from haliax.partitioning import ResourceMapping, round_axis_for_partitioning
+from tqdm_loggable.auto import tqdm
 
 import levanter.config
 from levanter.callbacks import StepInfo
@@ -84,16 +82,37 @@ from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
 from levanter.trainer import TrainerConfig
 from levanter.utils.jax_utils import broadcast_shard, use_cpu_device
 from levanter.utils.tree_utils import inference_mode
-from levanter.books.util import (
-    create_pz_histogram,
-    create_pz_histogram_linear,
-)
-
-# Custom eval task support (Pz)
-from levanter.data.text import LMMixtureDatasetConfig, SingleDatasetLMConfigBase
-
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SampleLoggingConfig:
+    """Configuration for controlling how many sample generations we keep per benchmark."""
+
+    log_all: bool = False
+    """If True, keep every sample that the harness sees."""
+    max_samples_per_benchmark: int | None = None
+    """Optional cap on the number of samples to store for each benchmark."""
+
+    def __post_init__(self):
+        if self.max_samples_per_benchmark is not None and self.max_samples_per_benchmark < 0:
+            raise ValueError("max_samples_per_benchmark must be non-negative or None")
+
+    def should_log(self) -> bool:
+        """Return True if any sample logging should occur."""
+        if self.log_all:
+            return True
+        return self.max_samples_per_benchmark is not None and self.max_samples_per_benchmark > 0
+
+    def allow_more(self, current_count: int) -> bool:
+        """Return True if we should store another sample for the benchmark."""
+        if not self.should_log():
+            return False
+        if self.log_all:
+            return True
+        assert self.max_samples_per_benchmark is not None
+        return current_count < self.max_samples_per_benchmark
 
 
 # OK, so LM-Eval-Harness is not deterministic. This means we can't just run it on different workers and expect the
@@ -124,6 +143,7 @@ class _LmEvalHarnessWorker:
         mp,
         max_packed_segments,
         generation_kwargs=None,
+        sample_logging_config: SampleLoggingConfig | None = None,
     ):
         self.tokenizer = tokenizer
         self.max_packed_segments = max_packed_segments
@@ -134,6 +154,7 @@ class _LmEvalHarnessWorker:
         self.mp = mp
         self.max_packed_segments = max_packed_segments
         self._generation_kwargs = generation_kwargs or {"max_gen_toks": 256, "temperature": 0.0, "n": 1, "seed": None}
+        self.sample_logging_config = sample_logging_config or SampleLoggingConfig()
 
         self._dummy_batch = _make_dummy_batch(EvalBatch, EvalPos)
 
@@ -280,6 +301,7 @@ class LevanterHarnessLM(TemplateLM):
         self.leader = leader
         # Storage for prompts and generations to include in outputs
         self.sample_outputs: dict[str, list[dict]] = {}
+        self.sample_logging_config = leader.sample_logging_config
 
     tokenizer = property(lambda self: self.leader.tokenizer)
     EvalBatch = property(lambda self: self.leader.EvalBatch)
@@ -350,7 +372,7 @@ class LevanterHarnessLM(TemplateLM):
     def set_current_task(self, task_name: str):
         """Set the current task name for organizing sample outputs."""
         self._current_task = task_name
-        if task_name not in self.sample_outputs:
+        if self.sample_logging_config.should_log() and task_name not in self.sample_outputs:
             self.sample_outputs[task_name] = []
 
     def get_sample_outputs(self) -> dict[str, list[dict]]:
@@ -360,6 +382,16 @@ class LevanterHarnessLM(TemplateLM):
     def clear_sample_outputs(self):
         """Clear all stored sample outputs."""
         self.sample_outputs.clear()
+
+    def _prepare_bucket(self, task_name: str) -> list[dict[str, str]] | None:
+        if not self.sample_logging_config.should_log():
+            return None
+
+        bucket = self.sample_outputs.setdefault(task_name, [])
+        if self.sample_logging_config.allow_more(len(bucket)):
+            return bucket
+
+        return None
 
     def _loglikelihood_tokens(self, requests, disable_tqdm: bool = False):
         raise NotImplementedError("_loglikelihood_tokens is not yet supported")
@@ -374,18 +406,17 @@ class LevanterHarnessLM(TemplateLM):
             logger.warning("No pad token set. Setting to eos token.")
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        # Store prompt-continuation pairs for output logging
         current_task = getattr(self, "_current_task", "loglikelihood_task")
-        if current_task not in self.sample_outputs:
-            self.sample_outputs[current_task] = []
-
         for request in requests:
+            bucket = self._prepare_bucket(current_task)
+            if bucket is None:
+                break
             prompt = request.args[0]
             continuation = request.args[1]
-            self.sample_outputs[current_task].append(
+            bucket.append(
                 {
                     "prompt": prompt,
-                    "generation": continuation,  # For loglikelihood, the "generation" is the continuation being evaluated
+                    "generation": continuation,
                 }
             )
 
@@ -676,19 +707,16 @@ class LevanterHarnessLM(TemplateLM):
                 text = ""
                 outputs.append(text)
 
-            # Store prompt and generation for output logging
             current_task = getattr(self, "_current_task", "generation_task")
-            if current_task not in self.sample_outputs:
-                self.sample_outputs[current_task] = []
-            # Decode the prompt for storage
-            prompt_text = self.tokenizer.decode(toks, skip_special_tokens=False)
-            self.sample_outputs[current_task].append(
-                {
-                    "prompt": prompt_text,
-                    "generation": text,
-                }
-            )
-
+            bucket = self._prepare_bucket(current_task)
+            if bucket is not None:
+                prompt_text = self.tokenizer.decode(toks, skip_special_tokens=False)
+                bucket.append(
+                    {
+                        "prompt": prompt_text,
+                        "generation": text,
+                    }
+                )
         # print(f'{outputs=}')
 
         return outputs
@@ -791,6 +819,7 @@ class LmEvalHarnessConfig:
     bootstrap_iters: int = 0
     apply_chat_template: bool = False
     fewshot_as_multiturn: bool = False
+    sample_logging: SampleLoggingConfig = dataclasses.field(default_factory=SampleLoggingConfig)
     generation_kwargs: dict = dataclasses.field(
         default_factory=lambda: {"max_gen_toks": 256, "temperature": 0.0, "n": 1, "seed": None}
     )
@@ -830,9 +859,6 @@ class LmEvalHarnessConfig:
         this_tasks = {}
         for task in tqdm(self.to_task_spec()):
             try:
-                # Skip custom eval_pz tasks here; handled separately
-                if isinstance(task, dict) and task.get("task") == "eval_pz":
-                    continue
                 if isinstance(task, str):
                     this_tasks.update(tasks.get_task_dict(task, manager))
                 else:
@@ -978,24 +1004,8 @@ def run_lm_eval_harness(
         Otherwise, returns None.
     """
     tasks_to_run = config.to_task_dict()
-    # Extract custom eval_pz specs (if any)
-    pz_specs = []
-    for spec in config.to_task_spec():
-        if isinstance(spec, dict) and spec.get("task") == "eval_pz":
-            pz_specs.append(spec)
 
-    outputs = _actually_run_eval_harness(
-        config,
-        model,
-        tasks_to_run,
-        tokenizer,
-        EvalBatch,
-        axis_resources,
-        mp,
-        pz_specs=pz_specs,
-        data_config=None,
-        decode_once_state=None,
-    )
+    outputs = _actually_run_eval_harness(config, model, tasks_to_run, tokenizer, EvalBatch, axis_resources, mp)
 
     return outputs
 
@@ -1008,10 +1018,6 @@ def _actually_run_eval_harness(
     EvalBatch: haliax.Axis,
     axis_resources: ResourceMapping,
     mp: jmp.Policy | None,
-    *,
-    pz_specs: Optional[list[dict]] = None,
-    data_config: Optional[Union[LMMixtureDatasetConfig, SingleDatasetLMConfigBase]] = None,
-    decode_once_state: Optional[dict] = None,
 ) -> dict | None:
     """
     Actually run the LM Eval Harness on the given model and tasks. This is a separate function so that it can be used
@@ -1042,6 +1048,7 @@ def _actually_run_eval_harness(
         mp,
         max_packed_segments=64,
         generation_kwargs=config.generation_kwargs,
+        sample_logging_config=config.sample_logging,
     )
 
     if jax.process_index() == 0:
@@ -1054,48 +1061,33 @@ def _actually_run_eval_harness(
         # Clear any previous sample outputs
         harness.clear_sample_outputs()
 
-        outputs: dict = {"results": {}, "n-samples": {}}
-
-        if len(tasks_to_run) > 0:
-            with set_global_rng_seeds(0):
-                lm_outputs = evaluator.evaluate(
-                    harness,
-                    tasks_to_run,
-                    limit=max_examples,
-                    log_samples=config.log_samples,
-                    bootstrap_iters=config.bootstrap_iters,
-                    apply_chat_template=config.apply_chat_template,
-                    fewshot_as_multiturn=config.fewshot_as_multiturn,
-                )
-            worker.stop()
-
-            if lm_outputs is not None:
-                # Merge core outputs except results/n-samples which we merge explicitly
-                for k, v in lm_outputs.items():
-                    if k in ("results", "n-samples"):
-                        continue
-                    outputs[k] = v
-                outputs["results"].update(lm_outputs.get("results", {}))
-                outputs["n-samples"].update(lm_outputs.get("n-samples", {}))
-
-        # Run custom eval_pz tasks if requested
-        if pz_specs:
-            pz_results, pz_counts = _run_eval_pz_tasks(
-                model=model,
-                tokenizer=tokenizer,
-                axis_resources=axis_resources,
-                mp=mp,
-                data_config=data_config,
-                specs=pz_specs,
-                decode_once_state=decode_once_state,
+        with set_global_rng_seeds(0):
+            outputs = evaluator.evaluate(
+                harness,
+                tasks_to_run,
+                limit=max_examples,
+                log_samples=config.log_samples,
+                bootstrap_iters=config.bootstrap_iters,
+                apply_chat_template=config.apply_chat_template,
+                fewshot_as_multiturn=config.fewshot_as_multiturn,
             )
-            outputs["results"].update(pz_results)
-            outputs["n-samples"].update(pz_counts)
 
-        # Calculate averages for LM-Eval tasks only (skip eval_pz)
-        if len(outputs.get("results", {})) > 0:
-            averages = _compute_averages(outputs)
-            outputs["averages"] = averages
+        worker.stop()
+
+        averages = _compute_averages(outputs)
+        outputs["averages"] = averages
+
+        # Get the collected sample outputs and add them to the results
+        sample_outputs = harness.get_sample_outputs()
+        if config.sample_logging.should_log() and sample_outputs:
+            # Add outputs to each benchmark in results
+            for task_name in outputs.get("results", {}):
+                # Get all sample outputs for this task (since we don't track individual tasks yet)
+                all_samples = []
+                for samples in sample_outputs.values():
+                    all_samples.extend(samples)
+                if all_samples:
+                    outputs["results"][task_name]["outputs"] = all_samples
 
         return outputs
     else:
@@ -1105,213 +1097,6 @@ def _actually_run_eval_harness(
         logger.info("Finished running eval harness.")
 
         return None
-
-
-def _run_eval_pz_tasks(
-    *,
-    model: LmHeadModel,
-    tokenizer: HfTokenizer,
-    axis_resources: ResourceMapping,
-    mp: jmp.Policy | None,
-    data_config: Optional[Union[LMMixtureDatasetConfig, SingleDatasetLMConfigBase]],
-    specs: list[dict],
-    decode_once_state: Optional[dict] = None,
-) -> tuple[dict, dict]:
-    """Execute custom eval_pz specs and return (results, n-samples) dicts to merge into LM-Eval outputs."""
-    results: dict = {}
-    n_samples: dict = {}
-
-    if data_config is None:
-        logger.warning("eval_pz tasks specified but no data_config provided; skipping.")
-        return results, n_samples
-
-    # Build caches and access the input_ids store
-    try:
-        caches = data_config.build_caches("train", monitors=False)
-    except Exception:
-        logger.exception("Failed to build caches for eval_pz; skipping eval_pz tasks.")
-        return results, n_samples
-
-    cmapping = axis_resources
-    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-
-    def _compute_logprob_for_tokens(tokens_1d: np.ndarray, prompt_len: int) -> float:
-        N = int(tokens_1d.shape[0])
-        Pos = model.Pos.resize(N)
-        toks_named = haliax.named(np.array(tokens_1d, dtype=np.int32), Pos)
-        ex = LmExample.from_prompt_and_completion(Pos, toks_named, prompt_length=int(prompt_len), ignore_id=pad_id)
-
-        m = model
-        if mp is not None:
-            m = mp.cast_to_compute(m)
-
-        with haliax.axis_mapping(cmapping):
-            logits = m(ex.tokens, attn_mask=ex.attn_mask)
-            logits = logits.astype(jnp.float32)
-            nll = next_token_loss(
-                Pos=Pos, Vocab=m.Vocab, logits=logits, true_ids=ex.tokens, loss_mask=ex.loss_mask, reduction=None
-            )
-            total_nll = haliax.sum(nll, axis=Pos).array
-        return -float(np.array(total_nll))
-
-    for spec in specs:
-        if not (isinstance(spec, dict) and spec.get("task") == "eval_pz"):
-            continue
-        alias = spec.get("task_alias")
-        datasets = spec.get("datasets")
-        doc_tokens = spec.get("doc_tokens")  # None or int
-        chunk_size = int(spec.get("chunk_size", 0))
-        if chunk_size <= 0:
-            logger.warning(f"eval_pz missing/invalid chunk_size: {spec}")
-            continue
-        prompt_tokens = int(spec.get("prompt_tokens", chunk_size // 2))
-        suffix_tokens = chunk_size - prompt_tokens
-        cursor_inc_tokens = int(spec.get("cursor_inc_tokens", 1))
-        histogram = bool(spec.get("histogram", False))
-        histogram_linear = bool(spec.get("histogram_linear", True))
-        pz_threshold = float(spec.get("pz_threshold", 1e-4))
-        pz_npz = bool(spec.get("pz_npz", False))
-        decode_preview = spec.get("decode_preview")
-        verify_treecache = bool(spec.get("verify_treecache", False))
-
-        # Select dataset names
-        if datasets is None:
-            selected = list(caches.keys())
-        else:
-            selected = [name for name in datasets if name in caches]
-            missing = [name for name in datasets if name not in caches]
-            for m in missing:
-                logger.warning(f"eval_pz requested dataset '{m}' not found in caches; skipping.")
-        if not selected:
-            continue
-
-        for ds_name in selected:
-            task_key = alias or f"eval_pz/{ds_name}"
-            if alias and len(selected) > 1:
-                task_key = f"eval_pz/{alias}/{ds_name}"
-
-            cache = caches[ds_name]
-            try:
-                input_store = cache.store.tree["input_ids"]  # type: ignore[index]
-            except Exception:
-                logger.warning(f"Dataset '{ds_name}' cache missing input_ids; skipping.")
-                continue
-            try:
-                first_ids = np.asarray(input_store[0], dtype=np.int32).reshape(-1)
-            except Exception as e:
-                logger.warning(f"Failed reading first document for '{ds_name}': {e}")
-                continue
-
-            # Determine document slice length
-            if doc_tokens is None:
-                eval_len = int(first_ids.shape[0])
-            else:
-                eval_len = int(min(int(doc_tokens), int(first_ids.shape[0])))
-            doc_slice = first_ids[:eval_len]
-
-            # Build sliding windows across the document slice
-            pz_values: list[float] = []
-            span_ranges: list[tuple[int, int]] = []
-            if eval_len == 0:
-                logger.warning(f"Dataset '{ds_name}' first document is empty; skipping eval_pz.")
-                continue
-
-            starts = list(range(0, max(eval_len - chunk_size, 0) + 1, max(1, cursor_inc_tokens)))
-            if not starts:
-                starts = [0]
-
-            for s in starts:
-                window = doc_slice[s : s + chunk_size]
-                if window.shape[0] < chunk_size:
-                    pad_len = chunk_size - window.shape[0]
-                    window = np.concatenate([window, np.full((pad_len,), pad_id, dtype=np.int32)], axis=0)
-                logprob = _compute_logprob_for_tokens(window, prompt_tokens)
-                try:
-                    prob = float(np.exp(logprob))
-                except OverflowError:
-                    prob = 0.0
-                pz_values.append(prob)
-                span_ranges.append((s, min(s + chunk_size - 1, eval_len - 1)))
-
-            # Aggregate metrics
-            if len(pz_values) == 0:
-                mean_pz = median_pz = max_pz = 0.0
-            else:
-                arr = np.asarray(pz_values, dtype=np.float64)
-                mean_pz = float(np.mean(arr))
-                median_pz = float(np.median(arr))
-                max_pz = float(np.max(arr))
-
-            results[task_key] = {
-                "num_windows": int(len(pz_values)),
-                "mean_pz": mean_pz,
-                "median_pz": median_pz,
-                "max_pz": max_pz,
-                "chunk_size": int(chunk_size),
-                "prompt_tokens": int(prompt_tokens),
-                "suffix_tokens": int(suffix_tokens),
-                "cursor_inc_tokens": int(cursor_inc_tokens),
-                "doc_len": int(eval_len),
-            }
-            n_samples[task_key] = len(pz_values)
-
-            # Histogram artifact (optional)
-            if histogram and len(pz_values) > 0 and jax.process_index() == 0:
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
-                    temp_hist_path = tmp_file.name
-                title = f"{ds_name} - P(z) over first doc"
-                if histogram_linear:
-                    _ = create_pz_histogram_linear(
-                        pz_list=np.asarray(pz_values),
-                        threshold=pz_threshold,
-                        save_path=temp_hist_path,
-                        book_title=title,
-                    )
-                else:
-                    _ = create_pz_histogram(
-                        pz_list=np.asarray(pz_values),
-                        threshold=pz_threshold,
-                        save_path=temp_hist_path,
-                        book_title=title,
-                    )
-                # log artifact
-                levanter.tracker.current_tracker().log_artifact(
-                    temp_hist_path, name=f"pz_hist_{ds_name}.png", type="plot"
-                )
-                pathlib.Path(temp_hist_path).unlink(missing_ok=True)
-
-            # NPZ artifact (optional)
-            if pz_npz and len(pz_values) > 0 and jax.process_index() == 0:
-                with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp_npz:
-                    np.savez(
-                        tmp_npz.name,
-                        pz_values=np.asarray(pz_values, dtype=np.float32),
-                        span_ranges=np.asarray(span_ranges, dtype=np.int32),
-                        config_info=np.asarray(
-                            [chunk_size, prompt_tokens, cursor_inc_tokens, eval_len], dtype=np.int32
-                        ),
-                    )
-                    tmp_npz_path = tmp_npz.name
-                levanter.tracker.current_tracker().log_artifact(
-                    tmp_npz_path, name=f"pz_values_{ds_name}.npz", type="data"
-                )
-                pathlib.Path(tmp_npz_path).unlink(missing_ok=True)
-
-            # Decode preview once
-            if decode_preview and decode_once_state is not None:
-                state_key = f"{task_key}__decoded"
-                if not decode_once_state.get(state_key, False):
-                    preview_len = int(min(int(decode_preview), eval_len))
-                    preview_ids = doc_slice[:preview_len].tolist()
-                    preview_text = tokenizer.decode(preview_ids, skip_special_tokens=False)
-                    results[task_key]["preview_text"] = preview_text
-                    results[task_key]["preview_token_sum"] = int(sum(preview_ids))
-                    if verify_treecache:
-                        results[task_key]["verify_treecache"] = True
-                        results[task_key]["first_doc_len"] = int(first_ids.shape[0])
-                    decode_once_state[state_key] = True
-
-    return results, n_samples
 
 
 def _compute_averages(outputs):
@@ -1331,10 +1116,8 @@ def _compute_averages(outputs):
     averages = {}
     metric_keys = set()
 
-    # Collect all possible metrics across tasks, skipping custom eval_pz entries
-    for task_name, task_results in outputs["results"].items():
-        if str(task_name).startswith("eval_pz"):
-            continue
+    # Collect all possible metrics across tasks
+    for task_results in outputs["results"].values():
         metric_keys.update(k for k in task_results.keys() if "stderr" not in k and k != "alias")
 
     # Compute macro and micro averages
@@ -1368,7 +1151,7 @@ def run_eval_harness_main(config: EvalHarnessMainConfig):
     compute_axis_mapping = config.trainer.compute_axis_mapping
     parameter_axis_mapping = config.trainer.parameter_axis_mapping
 
-    with config.trainer.device_mesh, hax.axis_mapping(parameter_axis_mapping):
+    with config.trainer.use_device_mesh(), hax.axis_mapping(parameter_axis_mapping):
         key = jax.random.PRNGKey(0)
 
         vocab_size = len(tokenizer)
@@ -1451,21 +1234,8 @@ def log_report_to_tracker(prefix: str, report: dict, tracker: Optional[levanter.
     tracker.log(to_log, step=None)
 
 
-def lm_eval_harness(
-    config: LmEvalHarnessConfig,
-    tokenizer,
-    EvalBatch,
-    axis_resources,
-    mp: jmp.Policy | None,
-    data_config: Optional[Union[LMMixtureDatasetConfig, SingleDatasetLMConfigBase]] = None,
-):
+def lm_eval_harness(config: LmEvalHarnessConfig, tokenizer, EvalBatch, axis_resources, mp: jmp.Policy | None):
     tasks_to_run = config.to_task_dict()
-    pz_specs: list[dict] = [
-        spec for spec in config.to_task_spec() if isinstance(spec, dict) and spec.get("task") == "eval_pz"
-    ]
-
-    # track decode-once behavior across invocations
-    decode_once_state: dict = {}
 
     def lm_eval_harness(step: StepInfo, force=False):
         if step.step == 0 and not force:
@@ -1481,9 +1251,6 @@ def lm_eval_harness(
             EvalBatch,
             axis_resources,
             mp,
-            pz_specs=pz_specs,
-            data_config=data_config,
-            decode_once_state=decode_once_state,
         )
         logger.info("Finished running eval harness.")
 
