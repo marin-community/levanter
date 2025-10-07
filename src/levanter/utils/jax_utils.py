@@ -350,26 +350,68 @@ def create_fsdp_mesh(
     return Mesh(devices, (ResourceAxis.REPLICA, ResourceAxis.DATA, ResourceAxis.MODEL))
 
 
-def estimated_free_device_memory(device) -> Optional[float]:
+def estimated_free_device_memory(device=None) -> Optional[float]:
     """
-    Returns free memory in GB. If the device doesn't support memory stats, returns None.
+    Returns free memory in GiB. If the device doesn't support memory stats, returns None. If no device is provided,
+    sums across all devices.
     Args:
-        device:
+        device: if None, sums all devices
 
     Returns:
 
     """
-    stats = device.memory_stats()
-    if stats is None:
-        return None
+    if device is not None:
+        devices = [device]
     else:
-        limit = stats.get("bytes_limit", None)
-        if limit is None:
+        devices = jax.devices()
+
+    total = 0.0
+    for device in devices:
+        stats = device.memory_stats()
+        if stats is None:
             return None
+        else:
+            limit = stats.get("bytes_limit", None)
+            if limit is None:
+                return None
 
-        in_use = stats.get("bytes_in_use", 0)
+            in_use = stats.get("bytes_in_use", 0)
 
-        return (limit - in_use) // (1024.0**3)
+            total += (limit - in_use) // (1024.0**3)
+
+    return total
+
+
+def estimated_free_memory_by_device_buffers() -> dict[jax.Device, float]:
+    """
+    Returns a mapping of device name to estimated free memory in GiB, based on total memory minus memory in use by
+    device buffers. This is a more conservative estimate than using the memory stats, since it only counts memory
+    that is actually allocated to device buffers.
+    """
+    free = {}
+    for device in jax.devices():
+        stats = device.memory_stats()
+        if stats is None:
+            free[device] = None
+        else:
+            free[device] = estimated_free_device_memory(device)
+
+    return free
+
+
+def in_use_memory_by_device_buffers() -> dict[jax.Device, float]:
+    """
+    Returns a mapping of device name to memory in use by device buffers, in GiB.
+    """
+    usage = {}
+    for device in jax.devices():
+        total = 0.0
+        for buffer in device.live_buffers():
+            total += buffer.nbytes
+
+        usage[device] = total / (1024.0**3)
+
+    return usage
 
 
 def zeros_like_tree(tree: T, axis_mapping: Optional[ResourceMapping] = None, dtype: Optional[jnp.dtype] = None) -> T:

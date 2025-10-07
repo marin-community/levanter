@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 import equinox as eqx
+import fsspec
 import haliax as hax
 import haliax.haxtyping as ht
 import jax
@@ -30,6 +31,8 @@ from levanter.inference.utils import INVALID, is_valid
 from levanter.layers.attention import KvPageCache
 from levanter.layers.sampler import Sampler
 from levanter.models.lm_model import LmHeadModel
+from levanter.utils.jax_utils import estimated_free_device_memory, in_use_memory_by_device_buffers, \
+    estimated_free_memory_by_device_buffers
 
 logger = logging.getLogger(__name__)
 
@@ -742,7 +745,7 @@ class InferenceEngine:
 
         def cache_bytes(num_pages: int) -> int:
             table = PageTable.init(num_pages, config.max_seqs, config.page_size, config.max_pages_per_seq)
-            cache_shape = jax.eval_shape(model.initial_cache, table, dtype=config.compute_dtype)
+            cache_shape = eqx.filter_eval_shape(model.initial_cache, table, dtype=config.compute_dtype)
             return _tree_byte_size(cache_shape)
 
         bytes_one = cache_bytes(1)
@@ -789,10 +792,19 @@ class InferenceEngine:
         sampler: Sampler,
         config: InferenceEngineConfig,
     ) -> None:
+        """
+        Args:
+            model: Language model with :meth:`decode` and :meth:`initial_cache`.
+            tokenizer: Tokenizer with `encode` and `decode` methods.
+            cache: Pre-allocated KV cache matching the model and page table. **DONATED**
+            decode_state: Initial decode state matching the cache's page table. **DONATED**
+            sampler: Sampler instance for decoding.
+            config: Engine configuration with sizing and decode parameters.
+        """
         self.model = model
         self.tokenizer = tokenizer
         self.sampler = sampler
-        self.gen_state: GenState = hax.named_jit(GenState)(cache=cache, decode_state=decode_state)
+        self.gen_state: GenState = GenState(cache=cache, decode_state=decode_state)
         self._initial_decode_state = decode_state
         # Impute max_prefill_size if not set
         if config.max_prefill_size is None:
@@ -1254,6 +1266,19 @@ class InferenceEngine:
             fake_submit_done = time.time()
 
             submit_start = iter_start
+            traced = _run_generation_loop.trace(
+                self.gen_state,
+                self.model,
+                self.sampler,
+                # TODO: tune max_tokens_per_round
+                self.config.imputed_max_tokens_per_round,
+                self.config.max_rounds,
+            )
+            with fsspec.open("gs://marin-us-central2/scratch/dlwh/gen_loop.jaxpr.txt.gz", "w", compression="infer") as f:
+                f.write(str(traced.jaxpr))
+            with fsspec.open("gs://marin-us-central2/scratch/dlwh/gen_loop.hlo.txt.gz", "w", compression="infer") as f:
+                f.write(traced.lower().as_text())
+            print("Written")
             future_state, decode_outputs = _run_generation_loop(
                 self.gen_state,
                 self.model,

@@ -26,6 +26,7 @@ from typing import Callable, Dict, Optional
 import equinox as eqx
 import haliax as hax
 import jax.random as jrandom
+import jmp
 from haliax import Axis
 from haliax.partitioning import round_axis_for_partitioning
 from prompt_toolkit import prompt
@@ -138,6 +139,7 @@ class InferenceReplConfig:
             tensor_parallel_axes=["mlp", "kv_head"],
             fsdp_axis="embed",
             batch_axis="batch",
+            mp=jmp.get_policy("p=f32,c=f32"),
         )
     )
     # bad
@@ -153,7 +155,7 @@ class InferenceReplConfig:
     server: InferenceServerConfig = field(
         default_factory=lambda: InferenceServerConfig(
             service=InferenceEngineConfig(
-                max_pages=None,
+                max_pages=16,
                 max_seqs=64,
                 page_size=8,
                 max_pages_per_seq=8,
@@ -162,6 +164,8 @@ class InferenceReplConfig:
                 max_prefill_size=64,
                 max_tokens_per_round=16,
                 max_rounds=8,
+                # TODO: fix
+                hbm_utilization=0.7
             ),
         )
     )
@@ -249,6 +253,11 @@ class ReplContext:
 
             self.server.reload(_reload)
         else:
+            from levanter.utils.jax_utils import in_use_memory_by_device_buffers, estimated_free_device_memory, estimated_free_memory_by_device_buffers
+            console.print(f"Free memory: {estimated_free_device_memory():.2f} GB")
+            console.print(f"Used memory by device: {in_use_memory_by_device_buffers()}")
+            console.print(f"Estimated free memory by device buffers: {estimated_free_memory_by_device_buffers()} GB")
+
             self.server = InferenceServer.create(self.config.server, model=model, tokenizer=tokenizer)
 
         console.print(f"[green]✓ Loaded {path}[/green]")
