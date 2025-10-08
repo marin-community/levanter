@@ -1687,12 +1687,9 @@ class Attention(eqx.Module):
         key_q, key_k, key_v = maybe_rng_split(key, 3)
 
         # Linear projections
-        print(x.dtype)
         q = self.q_proj(x, key=key_q)
         k = self.k_proj(x, key=key_k)
         v = self.v_proj(x, key=key_v)
-
-        print("q dtype:", q.dtype)
 
         # Optional QK layer-norm
         if self.config.qk_norm is not None:
@@ -1812,7 +1809,6 @@ def ragged_paged_attention(
 
     if _tpu_rpa_available():
         try:
-            print(q.dtype, kv_pages.dtype, kv_lens.dtype, page_indices.dtype, cu_q_lens.dtype)
             out = _do_tpu_ragged_paged_attention(
                 q,
                 kv_pages,
@@ -1823,7 +1819,6 @@ def ragged_paged_attention(
                 sm_scale=sm_scale,
                 soft_cap=soft_cap,
             )
-            print(out.dtype)
             return out
         except Exception:  # pragma: no cover - fall back if kernel fails
             warnings.warn("TPU ragged paged attention failed. Falling back to reference implementation.")
