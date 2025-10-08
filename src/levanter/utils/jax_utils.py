@@ -382,13 +382,13 @@ def estimated_free_device_memory(device=None) -> Optional[float]:
     return total
 
 
-def estimated_free_memory_by_device_buffers() -> dict[jax.Device, float]:
+def estimated_free_memory_by_device_buffers() -> dict[jax.Device, float | None]:
     """
     Returns a mapping of device name to estimated free memory in GiB, based on total memory minus memory in use by
     device buffers. This is a more conservative estimate than using the memory stats, since it only counts memory
     that is actually allocated to device buffers.
     """
-    free = {}
+    free: dict[jax.Device, float | None] = {}
     for device in jax.devices():
         stats = device.memory_stats()
         if stats is None:
