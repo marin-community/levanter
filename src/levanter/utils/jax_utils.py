@@ -5,6 +5,7 @@ import contextlib
 import functools
 import json
 import warnings
+import zlib
 from dataclasses import fields
 from typing import Any, Callable, Optional, TypeVar
 
@@ -13,6 +14,7 @@ import haliax.partitioning
 import jax
 import numpy as np
 from jax import numpy as jnp
+from jax._src.mesh import get_concrete_mesh
 from jax.experimental import mesh_utils
 from jax.experimental.multihost_utils import host_local_array_to_global_array
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -283,7 +285,8 @@ def best_effort_sharding(shape, *, devices=None, mesh=None):
         devices = jax.devices()
 
     if mesh is None:
-        mesh = jax.sharding.get_abstract_mesh()
+        # TODO: we shouldn't be getting a concrete mesh here. Need to fix/remove this whole function
+        mesh = get_concrete_mesh()
         if mesh is not None and mesh.shape == ():
             mesh = None
 
@@ -307,8 +310,7 @@ def best_effort_sharding(shape, *, devices=None, mesh=None):
         return sharding
     else:
         # get the existing mesh and find the FSDP axis
-        fsdp_axis = mesh.axis_names.index(hax.partitioning.ResourceAxis.DATA)
-        num_devices = mesh.devices.shape[fsdp_axis]
+        num_devices = mesh.shape[hax.partitioning.ResourceAxis.DATA]
 
         for i in range(len(shape) - 1, -1, -1):
             shape_i = shape[i]
@@ -529,3 +531,16 @@ def broadcast_one_to_all(in_tree: Any, is_source: bool | None = None) -> Any:
         in_tree = jax.tree.map(pre_jit, in_tree)
         out_tree = jax.jit(_psum, out_shardings=jax.sharding.NamedSharding(global_mesh, PartitionSpec()))(in_tree)
         return jax.tree.map(post_jit, out_tree)
+
+
+def assert_equal(in_tree, fail_message: str = ""):
+    """Verifies that all the hosts have the same tree of values."""
+    expected = broadcast_one_to_all(in_tree)
+    if not jax.tree_util.tree_all(jax.tree_util.tree_map(lambda *x: np.all(np.equal(*x)), in_tree, expected)):
+        raise AssertionError(f"{fail_message} Expected: {expected}; got: {in_tree}.")
+
+
+def sync_global_devices(name: str):
+    """Creates a barrier across all hosts/devices."""
+    h = np.uint32(zlib.crc32(name.encode()))
+    assert_equal(h, f"sync_global_devices name mismatch ('{name}')")
