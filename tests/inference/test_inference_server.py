@@ -7,8 +7,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import haliax as hax
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
+from optax import softmax_cross_entropy_with_integer_labels
 
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, load_tokenizer
 from levanter.models.llama import LlamaConfig
@@ -36,7 +38,9 @@ def trainer_config():
 @pytest.fixture(scope="module")
 def baby_llama_config():
     return InferenceServerConfig(
-        service=InferenceEngineConfig(max_seqs=2, page_size=4, max_pages_per_seq=4, max_queued_tokens=8),
+        service=InferenceEngineConfig(
+            max_seqs=2, page_size=4, max_pages_per_seq=4, max_queued_tokens=64, max_seqs_in_prefill=4
+        ),
         temperature=0.7,
         seed=42,
     )
@@ -412,3 +416,151 @@ def test_reload_with_zeros_clears_outputs(test_client):
     completion3 = Completion.model_validate(response3.json())
     restored_text = completion3.choices[0].text
     assert restored_text == original_text
+
+
+def test_tokens_endpoint(test_client):
+    """Test the tokens endpoint for tokenizing chat messages."""
+    client, server = test_client
+
+    response = client.post(
+        "/v1/tokens",
+        json={
+            "model": "timinar/baby-llama-58m",
+            "message_list": [
+                [{"role": "user", "content": "Hello, how are you?"}],
+                [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "What is 2+2?"},
+                ],
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+
+    assert "results" in result
+    assert isinstance(result["results"], list)
+    assert len(result["results"]) == 2
+
+    # Check that each result has tokens
+    for token_list in result["results"]:
+        assert "tokens" in token_list
+        assert isinstance(token_list["tokens"], list)
+        assert len(token_list["tokens"]) > 0
+        assert all(isinstance(t, int) for t in token_list["tokens"])
+
+    print(f"Tokenization results: {result['results']}")
+
+
+@pytest.mark.slow
+def test_logprobs_match_base_model(test_client, loaded_model, trainer_config):
+    """Test that logprobs from inference server match those computed from base model."""
+    client, server = test_client
+    model, tokenizer = loaded_model
+
+    # Step 1: Get prompt tokens using the /v1/tokens endpoint
+    messages = [{"role": "user", "content": "The capital of France is"}]
+
+    tokens_response = client.post(
+        "/v1/tokens",
+        json={
+            "model": "timinar/baby-llama-58m",
+            "message_list": [messages],
+        },
+    )
+
+    assert tokens_response.status_code == 200
+    prompt_tokens = tokens_response.json()["results"][0]["tokens"]
+    print(f"Prompt tokens from /v1/tokens: {prompt_tokens}")
+
+    # Step 2: Get logprobs from inference server using chat completions
+    chat_response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "timinar/baby-llama-58m",
+            "messages": messages,
+            "max_tokens": 8,
+            "temperature": 0.0,  # deterministic
+            "logprobs": True,
+            "seed": 42,
+        },
+    )
+
+    assert chat_response.status_code == 200
+    chat_completion = ChatCompletion.model_validate(chat_response.json())
+    choice = chat_completion.choices[0]
+
+    assert choice.logprobs is not None
+    assert len(choice.logprobs.content) > 0
+
+    # Extract generated token IDs and logprobs from server response
+    server_logprobs = []
+    generated_token_ids = []
+
+    print(f"Server returned {len(choice.logprobs.content)} tokens:")
+    for i, token_logprob in enumerate(choice.logprobs.content):
+        token_str = token_logprob.token
+        # Encode the token string to get the ID
+        token_ids = tokenizer.encode(token_str, add_special_tokens=False)
+        print(f"  Token {i}: '{token_str}' -> {token_ids}, logprob={token_logprob.logprob}")
+        if len(token_ids) == 1:
+            generated_token_ids.append(token_ids[0])
+            server_logprobs.append(token_logprob.logprob)
+
+    print(f"Generated {len(generated_token_ids)} tokens: {generated_token_ids}")
+    print(f"Server logprobs: {server_logprobs}")
+
+    # Step 3: Compute logprobs from base model
+    # Prepare full sequence: prompt + generated tokens
+    full_sequence = prompt_tokens + generated_token_ids
+
+    print(f"Full sequence ({len(full_sequence)} tokens): {full_sequence}")
+
+    # Create NamedArrays for model input
+    Pos = hax.Axis("position", len(full_sequence))
+    input_ids = hax.named(jnp.array(full_sequence, dtype=jnp.int32), Pos)
+
+    # Run model forward pass
+    with trainer_config.use_device_mesh(), hax.axis_mapping(trainer_config.compute_axis_mapping):
+        logits = model(input_ids=input_ids, attn_mask=None, pos_ids=None, key=None)
+
+        # Extract logits for generated tokens
+        # logits[i] predicts token[i+1], so logits[n-1] predicts first generated token
+        n_prompt = len(prompt_tokens)
+        m_generated = len(generated_token_ids)
+
+        print(f"Extracting logits from positions {n_prompt-1}:{n_prompt+m_generated-1}")
+        print(f"These logits predict tokens {generated_token_ids}")
+
+        # Get logits at positions [n-1, n, ..., n+m-2] for tokens [g0, g1, ..., gm-1]
+        logits_for_generated = logits.array[n_prompt-1:n_prompt+m_generated-1]
+        target_ids = jnp.array(generated_token_ids, dtype=jnp.int32)
+
+        # Check the first token's logit and compute its logprob manually
+        first_logits = logits_for_generated[0].astype(jnp.float32)
+        first_token_logit = first_logits[target_ids[0]]
+        log_z = jax.nn.logsumexp(first_logits)
+        manual_logprob = first_token_logit - log_z
+        print(f"First token {target_ids[0]}: logit={first_token_logit:.6f}, log_z={log_z:.6f}, logprob={manual_logprob:.6f}")
+
+        # Compute logprobs using same method as reference code
+        token_loss = softmax_cross_entropy_with_integer_labels(
+            logits_for_generated.astype(jnp.float32),
+            target_ids
+        )
+        model_logprobs = -token_loss
+
+    print(f"Model logprobs: {model_logprobs}")
+
+    # Step 4: Compare logprobs
+    assert len(server_logprobs) == len(model_logprobs), \
+        f"Length mismatch: server has {len(server_logprobs)}, model has {len(model_logprobs)}"
+
+    for i, (server_lp, model_lp) in enumerate(zip(server_logprobs, model_logprobs)):
+        diff = abs(float(server_lp) - float(model_lp))
+        print(f"Token {i}: server={server_lp:.6f}, model={model_lp:.6f}, diff={diff:.6f}")
+        assert diff < 1e-4, \
+            f"Logprob mismatch at token {i}: server={server_lp}, model={model_lp}, diff={diff}"
+
+    print("All logprobs match successfully!")
