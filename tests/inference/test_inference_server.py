@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from optax import softmax_cross_entropy_with_integer_labels
 
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, load_tokenizer
 from levanter.models.llama import LlamaConfig
@@ -452,6 +451,7 @@ def test_tokens_endpoint(test_client):
 
     print(f"Tokenization results: {result['results']}")
 
+
 @pytest.mark.slow
 def test_logprobs_match_full_forward_pass(test_client, loaded_model, trainer_config):
     """Test that logprobs from inference server match those computed from a single full forward pass."""
@@ -549,15 +549,15 @@ def test_logprobs_match_full_forward_pass(test_client, loaded_model, trainer_con
     print(f"Model logprobs: {model_logprobs}")
 
     # Step 4: Compare logprobs
-    assert len(server_logprobs) == len(model_logprobs), \
-        f"Length mismatch: server has {len(server_logprobs)}, model has {len(model_logprobs)}"
+    assert len(server_logprobs) == len(
+        model_logprobs
+    ), f"Length mismatch: server has {len(server_logprobs)}, model has {len(model_logprobs)}"
 
     for i, (server_lp, model_lp) in enumerate(zip(server_logprobs, model_logprobs)):
         diff = abs(float(server_lp) - float(model_lp))
         print(f"Token {i}: server={server_lp:.6f}, model={model_lp:.6f}, diff={diff:.6f}")
         # Allow larger tolerance due to accumulated bfloat16 precision errors in KV cache
         # The errors accumulate as we process more tokens auto-regressively
-        assert diff < 3e-3, \
-            f"Logprob mismatch at token {i}: server={server_lp}, model={model_lp}, diff={diff}"
+        assert diff < 3e-3, f"Logprob mismatch at token {i}: server={server_lp}, model={model_lp}, diff={diff}"
 
     print("All logprobs match successfully!")

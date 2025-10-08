@@ -114,7 +114,7 @@ class TokensRequest(BaseModel):
     """Request tokens from the given prompts after system prompt injection and encoding."""
 
     model: str = "marin-default"
-    message_list: list[list[ChatMessage]] # List of messages dicts representing prompts
+    message_list: list[list[ChatMessage]]  # List of messages dicts representing prompts
 
 
 class TokenList(BaseModel):
@@ -740,7 +740,7 @@ class InferenceServer:
         @app.post("/v1/completions", response_model=Completion)
         async def create_completion(request: CompletionRequest) -> Completion:
             return await _create_completion(inference_context, request)
-        
+
         @app.post("/v1/tokens", response_model=TokensResponse)
         async def fetch_tokens(request: TokensRequest) -> TokensResponse:
             return await _fetch_tokens(inference_context, request)
