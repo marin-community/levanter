@@ -32,7 +32,7 @@ from levanter.inference.utils import INVALID, is_valid
 from levanter.layers.attention import KvPageCache
 from levanter.layers.sampler import Sampler
 from levanter.models.lm_model import LmHeadModel
-from levanter.utils.jax_utils import memory_info_string, sharded_tree_size
+from levanter.utils.jax_utils import sharded_tree_size
 
 logger = logging.getLogger(__name__)
 
@@ -798,7 +798,6 @@ class InferenceEngine:
             max_queued_tokens=config.max_queued_tokens,
             enable_logprobs=config.enable_logprobs,
         )
-        print("memory post init:", memory_info_string(False))
         vocab_axis = model.Vocab
         sampler = Sampler(vocab_axis)
         return cls(
@@ -1374,8 +1373,6 @@ class InferenceEngine:
         """Infer a KV-page budget using HBM utilization targets."""
 
         max_pages_per_seq = config.max_pages_per_seq
-
-        print("before hbm calc" + memory_info_string(False))
 
         try:
             budget = _available_hbm_budget_bytes(config.hbm_utilization)
