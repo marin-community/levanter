@@ -155,7 +155,7 @@ class InferenceReplConfig:
     server: InferenceServerConfig = field(
         default_factory=lambda: InferenceServerConfig(
             service=InferenceEngineConfig(
-                max_pages=16,
+                max_pages=128,
                 max_seqs=64,
                 page_size=8,
                 max_seq_len=1024,
