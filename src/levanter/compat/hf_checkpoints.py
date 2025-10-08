@@ -1273,6 +1273,7 @@ def _should_use_cpu_for_checkpoint_loading():
 
     return False
 
+
 def _is_hf_hub_model(ref: RepoRef):
     api = HfApi()
 

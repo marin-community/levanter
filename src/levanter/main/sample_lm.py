@@ -41,7 +41,7 @@ class SampleLmConfig:
     tokenizer: str | None = None
 
     # Inference service/memory layout configuration
-    engine: InferenceEngineConfig = field(default_factory=InferenceEngineConfig)
+    engine: InferenceEngineConfig = field(default_factory=lambda: InferenceEngineConfig(max_seq_len=1024))
 
     prompts: list[str] | str | tuple[str, ...] = (
         "What is the square root of 17?",
