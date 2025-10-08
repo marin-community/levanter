@@ -61,6 +61,8 @@ class SampleLmConfig:
     # Optional JAX profiling
     profile: bool = False
 
+    log_kernel_jaxprs_path: Optional[str] = None
+
 
 def _load_model(config: SampleLmConfig, Vocab: Axis, *, key) -> LmHeadModel:
     """Load a model either from a checkpoint or HF repo."""
@@ -121,6 +123,9 @@ def main(config: SampleLmConfig):
 
         # Initialize a reusable generation service with capacity from config
         service = InferenceEngine.from_model_with_config(model=model, tokenizer=tokenizer, config=config.engine)
+
+        if config.log_kernel_jaxprs_path:
+            service.write_kernel_jaxprs(config.log_kernel_jaxprs_path)
 
         # -------------------------------- Scheduler-based generation --------------------------------
 
