@@ -82,6 +82,15 @@ def test_sharded_tree_size_shape_dtype_struct_with_named_sharding():
     assert per_device_bytes == (8 * 4 * jnp.dtype(jnp.float32).itemsize) // 4
 
 
+def test_sharded_tree_size_shape_dtype_struct_without_sharding():
+    mesh = jax.sharding.AbstractMesh((4,), ("data",))
+    struct = jax.ShapeDtypeStruct((8, 4), jnp.float32)
+
+    per_device_bytes = sharded_tree_size(struct, mesh=mesh)
+
+    assert per_device_bytes == (8 * 4 * jnp.dtype(jnp.float32).itemsize)
+
+
 def test_sharded_tree_size_tuple_axis_partition_spec():
     mesh = jax.sharding.AbstractMesh((2, 2), ("data", "model"))
     spec = jax.sharding.PartitionSpec(("data", "model"), None)

@@ -688,16 +688,21 @@ def sharded_tree_size(
             else:
                 return x_a.size * x_a.dtype.itemsize // num_shards
         elif is_jax_array_like(x):
-            if hasattr(x, "sharding"):
-                pspec = x.sharding.spec
-                num_shards = _shards_for_pspec(pspec)
-                # ShapeDtypeStruct doesn't have nbytes
-                if hasattr(x, "nbytes"):
-                    return x.nbytes // num_shards
-                else:
-                    return x.size * x.dtype.itemsize // num_shards
+            sharding = getattr(x, "sharding", None)
+            pspec = getattr(sharding, "spec", None) if sharding is not None else None
+            num_shards = _shards_for_pspec(pspec)
+
+            # ShapeDtypeStruct doesn't have nbytes
+            if hasattr(x, "nbytes"):
+                total = x.nbytes
             else:
-                return x.nbytes
+                shape = getattr(x, "shape", None)
+                dtype = getattr(x, "dtype", None)
+                if shape is None or dtype is None:
+                    raise ValueError("Unable to determine byte size for JAX array-like leaf without shape/dtype")
+                total = int(np.prod(shape)) * np.dtype(dtype).itemsize
+
+            return total // num_shards if num_shards > 0 else total
         else:
             assert jnp.isscalar(x)
             return jnp.dtype(type(x)).itemsize
