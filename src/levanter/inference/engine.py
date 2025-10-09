@@ -1389,9 +1389,13 @@ class InferenceEngine:
             )
             return int(config.max_seqs * max_pages_per_seq)
 
+        @functools.lru_cache(maxsize=None)
         def cache_bytes(num_pages: int) -> int:
-            def initial_cache(num_pages: int) -> int:
-                table = PageTable.init(num_pages, config.max_seqs, config.page_size, max_pages_per_seq)
+            if num_pages <= 0:
+                raise ValueError("num_pages must be positive when sizing the KV cache.")
+
+            def initial_cache(pages: int) -> int:
+                table = PageTable.init(pages, config.max_seqs, config.page_size, max_pages_per_seq)
                 cache_shape = model.initial_cache(table, dtype=config.compute_dtype)
                 return cache_shape
 
@@ -1400,28 +1404,57 @@ class InferenceEngine:
             return _tree_byte_size(cache_shape)
 
         bytes_one = cache_bytes(1)
-        bytes_two = cache_bytes(2)
-        per_page = bytes_two - bytes_one
-        if per_page <= 0:
-            raise ValueError("Unable to infer KV cache page size: non-positive slope between 1 and 2 pages.")
-
-        base_bytes = max(bytes_one - per_page, 0)
-        usable_budget = max(budget - base_bytes, 0)
-        max_pages = usable_budget // per_page
-
-        if max_pages <= 0:
+        if bytes_one > budget:
             raise ValueError(
                 "HBM budget insufficient to allocate even a single KV cache page. "
                 "Provide `max_pages` explicitly or increase `hbm_utilization`."
             )
 
+        # Use the previous heuristic as the initial guess before expanding.
+        guess = max(int(config.max_seqs * max_pages_per_seq), 1)
+
+        low = 1
+        high = guess
+        high_bytes = cache_bytes(high)
+
+        if high_bytes <= budget:
+            low = high
+            while True:
+                high *= 2
+                if high > (1 << 31):
+                    raise ValueError(
+                        "Unable to infer KV cache size: search exceeded 2^31 pages. " "Provide `max_pages` explicitly."
+                    )
+                high_bytes = cache_bytes(high)
+                if high_bytes > budget:
+                    break
+                low = high
+
+        # Binary search between the known-good lower bound and the first oversized bound.
+        while low + 1 < high:
+            mid = (low + high) // 2
+            mid_bytes = cache_bytes(mid)
+            if mid_bytes <= budget:
+                low = mid
+            else:
+                high = mid
+
+        max_pages = low
+
+        bytes_at_max = cache_bytes(max_pages)
+        next_bytes = cache_bytes(high)
+        per_page = bytes_at_max if max_pages == 1 else bytes_at_max - cache_bytes(max_pages - 1)
+        base_bytes = max(bytes_at_max - per_page * max_pages, 0)
+
         import humanfriendly as hly
 
         logger.info(
-            "Auto-computed KV cache budget: base=%s, per_page=%s, budget=%s -> max_pages=%d",
+            "Auto-computed KV cache budget: base=%s, per_page=%s, budget=%s, used=%s, next=%s -> max_pages=%d",
             hly.format_size(base_bytes),
             hly.format_size(per_page),
             hly.format_size(budget),
+            hly.format_size(bytes_at_max),
+            hly.format_size(next_bytes),
             max_pages,
         )
 
