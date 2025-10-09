@@ -1173,15 +1173,15 @@ class InferenceEngine:
             # Host time is everything except the device execution wait
             host_time = max(iter_time - device_time, 0.0)
             submit_time = submit_done - submit_start
-            if iter_time > 0:
-                tps_total = new_tokens / iter_time
-                logger.info(
-                    f"Decode iter: total {iter_time:.3f}s (device {device_time:.3f}s, host {host_time:.3f}s, "
-                    f"submit {submit_time:.3f}s), "
-                    f"fake_submit {fake_submit_done - fake_submit_start:.3f}s, "
-                    f"{tps_total:.2f} tok/s, {new_tokens} new"
-                    f" (extract {extract_time:.3f}s, release {release_time:.3f}s)"
-                )
+            # if iter_time > 0:
+            #     tps_total = new_tokens / iter_time
+            #     logger.info(
+            #         f"Decode iter: total {iter_time:.3f}s (device {device_time:.3f}s, host {host_time:.3f}s, "
+            #         f"submit {submit_time:.3f}s), "
+            #         f"fake_submit {fake_submit_done - fake_submit_start:.3f}s, "
+            #         f"{tps_total:.2f} tok/s, {new_tokens} new"
+            #         f" (extract {extract_time:.3f}s, release {release_time:.3f}s)"
+            #     )
 
             decode_iteration += 1
 
