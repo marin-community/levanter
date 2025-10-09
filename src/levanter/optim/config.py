@@ -471,6 +471,14 @@ class AdamConfig(OptimizerConfig):
                 if self.adamc_weight_decay:
                     max_lr = self.learning_rate
                     weight_decay = self.weight_decay * (learning_rate / max_lr)
+                elif self.decoupled_weight_decay:
+                    # Implements Loshchilov & Hutter (2019) "independent" weight decay
+                    # (see: https://arxiv.org/abs/2309.14322 for discussion)
+                    # Because we scale all updates by the current learning rate (schedule * max_lr),
+                    # we divide by the max LR here so that th decay scales only
+                    # with the LR schedule and not with the learning rate hyperparameter.
+                    max_lr = self.learning_rate
+                    weight_decay = self.weight_decay / max_lr
                 else:
                     weight_decay = self.weight_decay
                 components.append(optax.add_decayed_weights(weight_decay, self.build_weight_decay_mask()))
