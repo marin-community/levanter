@@ -1500,10 +1500,6 @@ class AttentionConfig:
             return default_attention_type() != AttentionBackend.VANILLA
         return self.attn_backend != AttentionBackend.VANILLA
 
-    # ---------------------------------------------------------------------------------
-    # KV-cache helper (paged only)
-    # ---------------------------------------------------------------------------------
-
 
 class Attention(eqx.Module):
     """A multi-head attention layer that uses dot product attention.
