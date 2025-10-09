@@ -445,6 +445,15 @@ class AdamConfig(OptimizerConfig):
     (2025, https://arxiv.org/abs/2506.02285v2).
     """
 
+    decoupled_weight_decay: bool = False
+    """
+    If set, use decoupled weight decay, which keeps
+    ``weight_decay`` constant across ``max_lr``.
+
+    This follows suggestions from muP works and stability works
+    https://openreview.net/forum?id=P7KRIiLM8T and https://arxiv.org/abs/2309.14322
+    """
+
     use_mup: bool = False
     """If set, apply MuP per-parameter learning rate scaling."""
 
@@ -472,7 +481,7 @@ class AdamConfig(OptimizerConfig):
                     max_lr = self.learning_rate
                     weight_decay = self.weight_decay * (learning_rate / max_lr)
                 elif self.decoupled_weight_decay:
-                    # Implements Loshchilov & Hutter (2019) "independent" weight decay
+                    # Implements Loshchilov & Hutter (2019) "decoupled" weight decay
                     # (see: https://arxiv.org/abs/2309.14322 for discussion)
                     # Because we scale all updates by the current learning rate (schedule * max_lr),
                     # we divide by the max LR here so that th decay scales only
