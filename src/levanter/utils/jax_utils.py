@@ -383,22 +383,7 @@ def estimated_free_device_memory(device=None) -> Optional[float]:
     return total
 
 
-def in_use_memory_by_device_buffers() -> dict[jax.Device, float]:
-    """
-    Returns a mapping of device name to memory in use by device buffers, in GiB.
-    """
-    usage = {}
-    for device in jax.devices():
-        total = 0.0
-        for buffer in device.live_buffers():
-            total += buffer.nbytes
-
-        usage[device] = total / (1024.0**3)
-
-    return usage
-
-
-def memory_info_string(color: bool) -> str:
+def memory_info_string() -> str:
     """
     Returns a string with memory usage information for all devices.
     """
@@ -430,29 +415,6 @@ def memory_info_string(color: bool) -> str:
             in_use_str = "unknown"
         else:
             in_use_str = humanfriendly.format_size(in_use_mem)
-
-        if color:
-            if free_mem is None:
-                color_code = "\033[33m"  # yellow
-            elif free_mem < 2.0:
-                color_code = "\033[31m"  # red
-            elif free_mem < 5.0:
-                color_code = "\033[33m"  # yellow
-            else:
-                color_code = "\033[32m"  # green
-            reset_code = "\033[0m"
-            free_str = f"{color_code}{free_str}{reset_code}"
-
-            if in_use_mem is None:
-                color_code = "\033[33m"  # yellow
-            elif in_use_mem < 2.0:
-                color_code = "\033[31m"  # red
-            elif in_use_mem < 5.0:
-                color_code = "\033[33m"  # yellow
-            else:
-                color_code = "\033[32m"  # green
-            reset_code = "\033[0m"
-            in_use_str = f"{color_code}{in_use_str}{reset_code}"
 
         lines.append(
             f"Device {device.id} ({device.platform}, {device.device_kind}): Free {free_str}, In use {in_use_str}"
@@ -690,6 +652,10 @@ def sharded_tree_size(
         elif is_jax_array_like(x):
             sharding = getattr(x, "sharding", None)
             pspec = getattr(sharding, "spec", None) if sharding is not None else None
+            if pspec is None and sharding is not None:
+                warnings.warn(
+                    f"{x} has sharding {sharding} but no spec. Assuming unsharded. If you see this, please report a bug."
+                )
             num_shards = _shards_for_pspec(pspec)
 
             # ShapeDtypeStruct doesn't have nbytes
