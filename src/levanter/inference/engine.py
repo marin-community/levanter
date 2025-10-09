@@ -32,7 +32,7 @@ from levanter.inference.utils import INVALID, is_valid
 from levanter.layers.attention import KvPageCache
 from levanter.layers.sampler import Sampler
 from levanter.models.lm_model import LmHeadModel
-from levanter.utils.jax_utils import sharded_tree_size
+from levanter.utils.jax_utils import estimated_free_device_memory, sharded_tree_size
 
 logger = logging.getLogger(__name__)
 
@@ -54,19 +54,12 @@ def _available_hbm_budget_bytes(hbm_utilization: float) -> int:
         raise RuntimeError("No JAX devices available for inference.")
 
     budgets: list[int] = []
+    bytes_per_gib = 1024**3
     for device in devices:
-        memory_stats = getattr(device, "memory_stats", None)
-        if memory_stats is None:
+        free_gib = estimated_free_device_memory(device)
+        if free_gib is None:
             raise RuntimeError(f"Device {device} does not expose memory statistics.")
-        stats = memory_stats()
-        if not stats:
-            raise RuntimeError(f"Device {device} returned empty memory statistics.")
-
-        limit = stats.get("bytes_limit")
-        if limit is None:
-            raise RuntimeError(f"Device {device} memory stats missing 'bytes_limit'.")
-        in_use = stats.get("bytes_in_use", 0)
-        free_bytes = max(int(limit) - int(in_use), 0)
+        free_bytes = max(int(free_gib * bytes_per_gib), 0)
         budgets.append(int(free_bytes * hbm_utilization))
 
     if not budgets:
