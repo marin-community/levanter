@@ -406,13 +406,13 @@ class LlamaTransformer(eqx.Module):
     @named_call
     def decode(
         self,
-        kv_cache: KvPageCache,
+        kv_cache: list[KvPageCache],
         x: NamedArray,
         batch_info: PageBatchInfo,
         pos_ids: NamedArray,
         *,
         key=None,
-    ) -> tuple[NamedArray, KvPageCache]:
+    ) -> tuple[NamedArray, list[KvPageCache]]:
         keys = maybe_rng_split(key, self.config.num_layers) if key is not None else None
 
         # Unfortunately, JAX does not seem to want to intelligently reuse memory here, so we manually unroll the loop
@@ -425,13 +425,14 @@ class LlamaTransformer(eqx.Module):
         # )
         # x = self.norm(x)
         # return x, kv_cache
+        out_cache = []
 
         for i in range(self.config.num_layers):
             with jax.named_scope("slice layer"):
                 layer = hax.tree_util.tree_map(lambda l: l["layer", i], self.layers.stacked)  # type: ignore
             with jax.named_scope("slice cache"):
-                this_cache = hax.tree_util.tree_map(lambda c: c["layer", i], kv_cache)
-                haliax.debug.visualize_shardings(this_cache)
+                # this_cache = hax.tree_util.tree_map(lambda c: c["layer", i], kv_cache)
+                this_cache = kv_cache[i]
             x, this_cache = layer.decode(
                 x,
                 this_cache,
@@ -440,19 +441,22 @@ class LlamaTransformer(eqx.Module):
                 key=keys[i] if keys is not None else None,
             )
             with jax.named_scope("update cache"):
-                haliax.debug.visualize_shardings(this_cache)
-                kv_cache = hax.tree_util.tree_map(lambda c, nc: c.at["layer", i].set(nc), kv_cache, this_cache)  # type: ignore
+                # haliax.debug.visualize_shardings(this_cache)
+                # kv_cache = hax.tree_util.tree_map(lambda c, nc: c.at["layer", i].set(nc), kv_cache, this_cache)  # type: ignore
+                out_cache.append(this_cache)
 
         x = self.norm(x)
 
-        return x, kv_cache
+        return x, out_cache
 
-    def initial_cache(self, page_table: PageTable, *, dtype) -> KvPageCache:
+    def initial_cache(self, page_table: PageTable, *, dtype) -> list[KvPageCache]:
         """
         Creates an empty page cache for this transformer. Note that in order to create a decoder state, you
         need to couple the KvPageCache to the PageTable's state with a BatchInfo object.
         """
-        return self.layers.vmap_via(LlamaDecoderLayer.initial_cache)(page_table, dtype=dtype)
+        # sadly this is too cute/smart for XLA to handle aliasing correctly
+        # return self.layers.vmap_via(LlamaDecoderLayer.initial_cache)(page_table, dtype=dtype)
+        return [layer.initial_cache(page_table, dtype=dtype) for layer in self.layers.unstacked()]
 
 
 class LlamaEmbedding(ModuleWithStateDictSerialization, eqx.Module):

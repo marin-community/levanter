@@ -183,7 +183,7 @@ class GenState(eqx.Module):
     sharing fully used pages.
     """
 
-    cache: KvPageCache
+    cache: list[KvPageCache]
     decode_state: DecodeState
 
     def clone_sequence(
@@ -262,7 +262,8 @@ def _clone_sequence(
         last_idx = (src_len + page_size - 1) // page_size - 1
         src_page = page_table.page_indices["seq", parent_local_id, "page", last_idx].scalar()
         dst_page = page_table.page_indices["seq", child_local_id, "page", last_idx].scalar()
-        return state.cache.copy_page(src_page, dst_page)
+        # return state.cache.copy_page(src_page, dst_page)
+        return [c.copy_page(src_page, dst_page) for c in state.cache]
 
     def _identity(_):
         return state.cache
@@ -572,7 +573,8 @@ def _handle_clones(
         def _copy(_):
             src_page = page_table.page_indices["seq", src_slot_id, "page", last_idx].scalar()
             dst_page = page_table.page_indices["seq", dst_slot_id, "page", last_idx].scalar()
-            return cache.copy_page(src_page, dst_page)
+            # return cache.copy_page(src_page, dst_page)
+            return [c.copy_page(src_page, dst_page) for c in cache]
 
         def _identity(_):
             return cache
