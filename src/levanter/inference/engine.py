@@ -20,7 +20,7 @@ import numpy as np
 from haliax import NamedArray
 from haliax.jax_utils import is_jax_array_like
 
-import levanter
+import levanter.tracker
 from levanter.inference.jit_scheduler import (
     DecodeState,
     SeqDecodingParams,
