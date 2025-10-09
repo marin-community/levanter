@@ -89,7 +89,7 @@ serve = [
 ]
 
 lm_eval = [
-  "lm-eval@git+https://github.com/stanford-crfm/lm-evaluation-harness.git@23244d1db19dc14077c11c4fe42eae355161fd1b",
+  "lm-eval@git+https://github.com/stanford-crfm/lm-evaluation-harness.git,
 ]
 
 gcp = [
