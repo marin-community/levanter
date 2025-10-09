@@ -14,7 +14,7 @@ from typing import Optional, Union, overload
 import equinox as eqx
 import jax
 import jax.random as jrandom
-from jax import numpy as jnp
+from jax import numpy as jnp, lax
 
 from ..inference.utils import is_valid
 
@@ -1746,26 +1746,34 @@ class KvPageCache(eqx.Module):
 
         page_size = self.kv_pages.array.shape[1]
 
-        assert page_size == batch_info.page_size, (
-            f"Page size mismatch: {page_size} != {batch_info.page_size}. "
-            "Ensure that the page size in batch_info matches the kv_pages."
-        )
-
-        t_pages, t_slots = batch_info.pages_and_slots()
-
-        # jax.debug.print("Updating kv_pages at pages {t_pages} and slots {t_slots}",
-        #                 t_pages=t_pages, t_slots=t_slots)
-
-        new_k = new_k.astype(self.kv_pages.dtype)
-        new_v = new_v.astype(self.kv_pages.dtype)
-        # kv_pages = eqx.error_if(self.kv_pages, hax.any(hax.isnan(self.kv_pages)).scalar(), "NaN in kv_pages pre")
-        kv_pages = self.kv_pages
-        kv_pages = kv_pages.at["page", t_pages, "slot", t_slots, "kv_head", 0::2].set(new_k, mode="drop")
-        kv_pages = kv_pages.at["page", t_pages, "slot", t_slots, "kv_head", 1::2].set(new_v, mode="drop")
+        # assert page_size == batch_info.page_size, (
+        #     f"Page size mismatch: {page_size} != {batch_info.page_size}. "
+        #     "Ensure that the page size in batch_info matches the kv_pages."
+        # )
+        #
+        # t_pages, t_slots = batch_info.pages_and_slots()
+        #
+        # new_k = new_k.astype(self.kv_pages.dtype)
+        # new_v = new_v.astype(self.kv_pages.dtype)
+        # # kv_pages = eqx.error_if(self.kv_pages, hax.any(hax.isnan(self.kv_pages)).scalar(), "NaN in kv_pages pre")
+        # kv_pages = self.kv_pages
+        # kv_pages = kv_pages.at["page", t_pages, "slot", t_slots, "kv_head", 0::2].set(new_k, mode="drop")
+        # kv_pages = kv_pages.at["page", t_pages, "slot", t_slots, "kv_head", 1::2].set(new_v, mode="drop")
 
         # kv_pages = eqx.error_if(kv_pages, hax.any(hax.isnan(kv_pages)).scalar(), "NaN in kv_pages")
 
-        return dataclasses.replace(self, kv_pages=kv_pages)
+        K = jnp.asarray(batch_info.num_new_tokens, jnp.int32)
+        t_pages, t_slots = batch_info.pages_and_slots()  # [T] int32 (first K valid)
+
+        updated = kv_update_unified_prefix(
+            self.kv_pages.array,
+            t_pages.astype(jnp.int32).array,
+            t_slots.astype(jnp.int32).array,
+            new_k.array, new_v.array,
+            K,
+        )
+        updated = NamedArray(updated, self.kv_pages.axes)
+        return dataclasses.replace(self, kv_pages=updated)
 
     def copy_page(self, src_page: int, dst_page: int) -> "KvPageCache":
         """Copy the entire contents of page ``src_page`` into ``dst_page``.
@@ -1774,6 +1782,32 @@ class KvPageCache(eqx.Module):
         """
         new_k = self.kv_pages.at["page", dst_page].set(self.kv_pages["page", src_page])
         return dataclasses.replace(self, kv_pages=new_k)
+
+
+def _interleave_kv(new_k, new_v):
+    # [T, H, D] x2 -> [T, 2H, D] with (k0,v0,k1,v1,...) along heads
+    T, H, D = new_k.shape
+    return jnp.stack([new_k, new_v], axis=2).reshape(T, 2 * H, D)
+
+
+@functools.partial(jax.jit, donate_argnums=(0,))
+def kv_update_unified_prefix(kv_pages, t_pages, t_slots, new_k, new_v, K):
+    """
+    kv_pages: [P, S, 2H, D]  (unified K/V buffer, donated)
+    t_pages, t_slots: [T] int32  (only first K are valid)
+    new_k, new_v: [T, H, D]
+    K: int32 scalar = number of valid updates (num_new_tokens)
+    """
+    # interleave so we can do a single update
+    kv_ev = _interleave_kv(new_k.astype(kv_pages.dtype), new_v.astype(kv_pages.dtype))  # [T, 2H, D]
+
+    def body(i, buf):
+        p = t_pages[i]        # scalar
+        s = t_slots[i]        # scalar
+        ins = kv_ev[i][None, None, :, :]   # [1, 1, 2H, D]
+        return lax.dynamic_update_slice(buf, ins, (p, s, 0, 0))
+
+    return lax.fori_loop(0, K, body, kv_pages)
 
 
 @named_call

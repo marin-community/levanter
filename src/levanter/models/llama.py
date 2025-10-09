@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Type, Union
 
 import equinox as eqx
+import haliax.debug
+import jax
 import jax.random as jrandom
 from jaxtyping import PRNGKeyArray
 
@@ -422,10 +424,14 @@ class LlamaTransformer(eqx.Module):
         #     key=keys,
         # )
         # x = self.norm(x)
+        # return x, kv_cache
 
         for i in range(self.config.num_layers):
-            layer = hax.tree_util.tree_map(lambda l: l["layer", i], self.layers.stacked)  # type: ignore
-            this_cache = hax.tree_util.tree_map(lambda c: c["layer", i], kv_cache)
+            with jax.named_scope("slice layer"):
+                layer = hax.tree_util.tree_map(lambda l: l["layer", i], self.layers.stacked)  # type: ignore
+            with jax.named_scope("slice cache"):
+                this_cache = hax.tree_util.tree_map(lambda c: c["layer", i], kv_cache)
+                haliax.debug.visualize_shardings(this_cache)
             x, this_cache = layer.decode(
                 x,
                 this_cache,
@@ -433,7 +439,9 @@ class LlamaTransformer(eqx.Module):
                 pos_ids=pos_ids,
                 key=keys[i] if keys is not None else None,
             )
-            kv_cache = hax.tree_util.tree_map(lambda c, nc: c.at["layer", i].set(nc), kv_cache, this_cache)
+            with jax.named_scope("update cache"):
+                haliax.debug.visualize_shardings(this_cache)
+                kv_cache = hax.tree_util.tree_map(lambda c, nc: c.at["layer", i].set(nc), kv_cache, this_cache)  # type: ignore
 
         x = self.norm(x)
 
