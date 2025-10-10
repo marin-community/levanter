@@ -857,12 +857,9 @@ class InferenceEngine:
         if not self.request_queue:
             return None
 
-        page_table = self.gen_state.decode_state.page_table
         sim_slots = len(self.free_slots)
         sim_pages = self._free_page_count()
-        max_prefill_size = int(self.config.max_prefill_size or page_table.max_len_per_seq)
-        max_seq_len_capacity = int(page_table.max_len_per_seq)
-        total_pages = int(page_table.num_pages)
+        max_prefill_size = int(self.config.max_prefill_size or self.gen_state.decode_state.page_table.max_len_per_seq)
         max_seqs_in_prefill = int(self.config.max_seqs_in_prefill)
         sim_tokens = 0
         primaries_in_batch = 0
@@ -870,42 +867,20 @@ class InferenceEngine:
         batch: list[Request] = []
         while self.request_queue:
             nxt = self.request_queue[0]
-            prompt_len = len(nxt.prompt_tokens)
             need_slots = int(nxt.n_generations)
-            need_pages = self._pages_needed_for_prompt(prompt_len)
-
-            if prompt_len > max_seq_len_capacity:
-                raise RuntimeError(
-                    "Request "
-                    f"{nxt.request_id} has a prompt length of {prompt_len} tokens, which exceeds the configured "
-                    f"max_seq_len ({max_seq_len_capacity}). Increase max_seq_len or shorten the prompt."
-                )
-
-            if prompt_len > max_prefill_size:
-                raise RuntimeError(
-                    "Request "
-                    f"{nxt.request_id} has a prompt length of {prompt_len} tokens, which exceeds the engine's "
-                    f"prefill capacity ({max_prefill_size}). Increase max_prefill_size or shorten the prompt."
-                )
-
-            if need_pages > total_pages:
-                raise RuntimeError(
-                    "Request "
-                    f"{nxt.request_id} requires {need_pages} KV pages for its prompt, but the engine only "
-                    f"has {total_pages} pages available. Increase max_pages (or hbm_utilization) or shorten the prompt."
-                )
+            need_pages = self._pages_needed_for_prompt(len(nxt.prompt_tokens))
             # Check capacity constraints: slots (including clones), pages, token buffer, prefill batch size
             if (
                 sim_slots < need_slots
                 or sim_pages < need_pages
-                or sim_tokens + prompt_len > max_prefill_size
+                or sim_tokens + len(nxt.prompt_tokens) > max_prefill_size
                 or primaries_in_batch >= max_seqs_in_prefill
             ):
                 break
             batch.append(self.request_queue.popleft())
             sim_slots -= need_slots
             sim_pages -= need_pages
-            sim_tokens += prompt_len
+            sim_tokens += len(nxt.prompt_tokens)
             primaries_in_batch += 1
 
         if not batch:
