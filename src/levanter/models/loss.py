@@ -70,6 +70,10 @@ def maybe_fused_next_token_loss(
     not_last_loss_mask = 1 - hax.nn.one_hot(-1, Pos, dtype=jnp.float32)  # type: ignore
     if loss_mask is not None:
         loss_mask = loss_mask * not_last_loss_mask
+        # Guard against all-zero masks, which would yield NaN means.
+        # If no tokens are selected, fall back to the default causal mask.
+        has_any = hax.sum(loss_mask) > 0
+        loss_mask = hax.where(has_any, loss_mask, not_last_loss_mask)
     else:
         loss_mask = not_last_loss_mask
 
@@ -125,6 +129,9 @@ def next_token_loss(
     not_last_loss_mask = 1 - hax.nn.one_hot(-1, Pos, dtype=jnp.float32)  # type: ignore
     if loss_mask is not None:
         loss_mask = loss_mask * not_last_loss_mask
+        # Guard against all-zero masks by falling back to the default mask.
+        has_any = hax.sum(loss_mask) > 0
+        loss_mask = hax.where(has_any, loss_mask, not_last_loss_mask)
     else:
         loss_mask = not_last_loss_mask
 
