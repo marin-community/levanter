@@ -69,7 +69,13 @@ def test_pack_next_sequence_boundaries_between_sequences(seq_ids):
 
     boundary_mask = packed.pos_ids == (seq_lens_after - 1)
     bm = boundary_mask.array
-    # Boundaries at positions 2 and 5
-    assert bool(bm[2]) is True
-    assert bool(bm[6]) is True
+    if seq1 == 0:
+        # Boundaries at positions 2 and 6
+        assert bool(bm[2]) is True
+        assert bool(bm[6]) is True
+    else:
+        # Boundaries at positions 2 and 5
+        assert bool(bm[3]) is True
+        assert bool(bm[6]) is True
+
     assert int(bm.sum()) == 2

@@ -26,6 +26,7 @@ from typing import Callable, Dict, Optional
 import equinox as eqx
 import haliax as hax
 import jax.random as jrandom
+import jmp
 from haliax import Axis
 from haliax.partitioning import round_axis_for_partitioning
 from prompt_toolkit import prompt
@@ -41,9 +42,11 @@ from levanter.inference.engine import InferenceEngineConfig
 from levanter.inference.openai import (
     ChatCompletionRequest,
     ChatMessage,
+    CompletionRequest,
     InferenceServer,
     InferenceServerConfig,
     _create_chat_completion,
+    _create_completion,
 )
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.trainer import TrainerConfig
@@ -136,21 +139,32 @@ class InferenceReplConfig:
             tensor_parallel_axes=["mlp", "kv_head"],
             fsdp_axis="embed",
             batch_axis="batch",
+            mp=jmp.get_policy("p=f32,c=f32"),
         )
     )
-
+    # bad
+    #                 max_pages=32,
+    #                 max_seqs=2,
+    #                 page_size=8,
+    #                 max_pages_per_seq=8,
+    #                 max_queued_tokens=4,
+    #                 max_seqs_in_prefill=2,
+    #                 max_prefill_size=64,
+    #                 max_tokens_per_round=16,
+    #                 max_rounds=8,
     server: InferenceServerConfig = field(
         default_factory=lambda: InferenceServerConfig(
             service=InferenceEngineConfig(
-                max_pages=32,
-                max_seqs=2,
+                max_pages=128,
+                max_seqs=64,
                 page_size=8,
-                max_pages_per_seq=8,
-                max_queued_tokens=4,
-                max_seqs_in_prefill=2,
+                max_seq_len=1024,
+                max_queued_tokens=64,
+                max_seqs_in_prefill=4,
                 max_prefill_size=64,
                 max_tokens_per_round=16,
                 max_rounds=8,
+                hbm_utilization=0.7,
             ),
         )
     )
@@ -181,6 +195,7 @@ class ReplContext:
             "load": self.load,
             "unload": self.unload,
             "chat": self.chat,
+            "complete": self.complete,
             "batch": self.batch,
             "help": self.show_help,
             "serve": self.serve,
@@ -270,6 +285,7 @@ class ReplContext:
   load <path|hf:model>      Load model (e.g., load meta-llama/Llama-3.2-1B)
   unload                    Unload current model
   chat [text]               Chat with model (interactive if no text)
+  complete <prompt>         Generate text completion for prompt
   batch <file.json|json>    Submit batch of requests from JSON
   help                      Show this help
         """
@@ -316,6 +332,10 @@ class ReplContext:
         Args:
             batch_input: Either a JSON file path or inline JSON string
         """
+        if not self.server:
+            console.print("[red]No model loaded. Use 'load' command first[/red]")
+            return
+
         # Try to load as file first
         if Path(batch_input).exists():
             with open(batch_input, "r") as f:
@@ -334,6 +354,7 @@ class ReplContext:
 
         start_time = time.time()
 
+        server = self.server
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
@@ -349,7 +370,7 @@ class ReplContext:
                     model=req_data.get("model", "<default model>"),
                     messages=messages,
                     max_tokens=req_data.get("max_tokens", self.config.max_tokens),
-                    temperature=req_data.get("temperature", server_config.temperature),
+                    temperature=req_data.get("temperature", self.config.server.temperature),
                     n=req_data.get("n", 1),
                     logprobs=req_data.get("logprobs", False),
                     stop=req_data.get("stop"),
@@ -373,6 +394,31 @@ class ReplContext:
                     console.print(f"[red]Error: {response}[/red]")
                 else:
                     self._print_completion_response(response)
+        finally:
+            loop.close()
+
+    def complete(self, prompt_text: str):
+        """Generate a completion for a single string prompt."""
+        if not self.server:
+            console.print("[red]No model loaded. Use 'load' command first[/red]")
+            return
+
+        if not prompt_text:
+            console.print("[red]Usage: complete <prompt>[/red]")
+            return
+
+        request = CompletionRequest(
+            model=self.model_name or "model",
+            prompt=prompt_text,
+            max_tokens=self.config.max_tokens,
+            temperature=self.config.server.temperature,
+        )
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            response = loop.run_until_complete(_create_completion(self.server.inference_context, request))
+            self._print_completion_response(response)
         finally:
             loop.close()
 
@@ -470,6 +516,12 @@ def repl_mode(config: InferenceReplConfig, commands: ReplContext):
             elif cmd == "chat":
                 message = " ".join(args) if args else None
                 commands.execute("chat", message)
+            elif cmd == "complete":
+                if not args:
+                    console.print("[red]Usage: complete <prompt>[/red]")
+                    continue
+                prompt_text = " ".join(args)
+                commands.execute("complete", prompt_text)
             elif cmd in commands.commands:
                 commands.execute(cmd)
             else:

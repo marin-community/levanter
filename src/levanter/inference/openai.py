@@ -34,6 +34,7 @@ from openai.types.chat.chat_completion_message import ChatCompletionMessage
 from openai.types.chat.chat_completion_token_logprob import ChatCompletionTokenLogprob
 from openai.types.completion_choice import CompletionChoice, Logprobs
 from pydantic import BaseModel, Field
+from transformers import PreTrainedTokenizer
 
 from levanter.inference.engine import InferenceEngine, InferenceEngineConfig, Request
 from levanter.inference.jit_scheduler import SeqDecodingParams
@@ -109,6 +110,25 @@ class CompletionRequest(BaseModel):
     user: Optional[str] = None
 
 
+class TokensRequest(BaseModel):
+    """Request tokens from the given prompts after system prompt injection and encoding."""
+
+    model: str = "marin-default"
+    message_list: list[list[ChatMessage]]  # List of messages dicts representing prompts
+
+
+class TokenList(BaseModel):
+    """List of token IDs."""
+
+    tokens: list[int]
+
+
+class TokensResponse(BaseModel):
+    """Response containing tokenized prompts."""
+
+    results: list[TokenList]
+
+
 @dataclass
 class InferenceServerConfig:
     """Configuration for OpenAI-compatible inference server."""
@@ -117,7 +137,7 @@ class InferenceServerConfig:
     tokenizer: str | None = None
 
     # Inference service/memory layout configuration
-    service: InferenceEngineConfig = field(default_factory=InferenceEngineConfig)
+    service: InferenceEngineConfig = field(default_factory=lambda: InferenceEngineConfig(4096))
 
     # Default generation parameters for API
     temperature: float = 0.7
@@ -126,7 +146,7 @@ class InferenceServerConfig:
     batch_timeout: float = 0.1  # seconds to wait for more requests before processing batch
 
     host: str = "localhost"
-    port: int = 10243
+    port: int = 0  # auto-assign port
 
 
 @dataclass
@@ -284,8 +304,8 @@ class InferenceContext:
                 continue
 
             batch = InferenceBatch()
-            max_tokens_per_seq = self.engine.config.max_pages_per_seq * self.engine.config.page_size
-            max_tokens_per_batch = self.engine.config.imputed_max_pages * self.engine.config.page_size
+            max_tokens_per_seq = self.engine.config.max_seq_len
+            max_tokens_per_batch = self.engine.config.page_size * self.engine.config.max_pages  # type: ignore
             logger.info(f"Max tokens per seq: {max_tokens_per_seq}, per batch: {max_tokens_per_batch}")
 
             for r in requests:
@@ -508,7 +528,8 @@ async def _create_completion(ctx: InferenceContext, request: CompletionRequest) 
                     token_logprobs = []
                     if generation.logprobs:
                         for token_id, lp in zip(generated_tokens, generation.logprobs):
-                            token_str = ctx.tokenizer.decode([token_id], skip_special_tokens=False)
+                            # Use convert_ids_to_tokens to preserve BPE format
+                            token_str = ctx.tokenizer.convert_ids_to_tokens(token_id)
                             tokens.append(token_str)
                             token_logprobs.append(float(lp))
 
@@ -548,20 +569,37 @@ async def _create_completion(ctx: InferenceContext, request: CompletionRequest) 
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _compute_tokens(messages: list[ChatMessage], tokenizer: PreTrainedTokenizer) -> List[int]:
+    try:
+        dict_messages = [msg.model_dump(exclude_none=True) for msg in messages]
+        return tokenizer.apply_chat_template(dict_messages, tokenize=True, add_generation_prompt=True)
+    except Exception as e:
+        # Fallback: simple concatenation if template fails
+        logger.warning(f"Chat template failed, using fallback: {e}", exc_info=True)
+        prompt_text = "\n".join([f"{msg.role}: {msg.content}" for msg in messages])
+        return tokenizer.encode(prompt_text, add_special_tokens=True)
+
+
+async def _fetch_tokens(ctx: InferenceContext, request: TokensRequest) -> TokensResponse:
+    """Fetch tokenized prompts after system prompt injection and encoding."""
+    try:
+        results = []
+        for messages in request.message_list:
+            token_ids = _compute_tokens(messages, ctx.tokenizer)
+            results.append(TokenList(tokens=token_ids))
+
+        return TokensResponse(results=results)
+
+    except Exception as e:
+        logger.error("Error in tokenization.", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 async def _create_chat_completion(ctx: InferenceContext, request: ChatCompletionRequest) -> ChatCompletion:
     """Create a chat completion using OpenAI API format."""
     try:
         # Convert Pydantic models to dicts for tokenizer
-        messages_dict = [msg.model_dump(exclude_none=True) for msg in request.messages]
-
-        # Apply chat template
-        try:
-            prompt_tokens = ctx.tokenizer.apply_chat_template(messages_dict, tokenize=True, add_generation_prompt=True)
-        except Exception as e:
-            # Fallback: simple concatenation if template fails
-            logger.warning(f"Chat template failed, using fallback: {e}", exc_info=True)
-            prompt_text = "\n".join([f"{msg.role}: {msg.content}" for msg in request.messages])
-            prompt_tokens = ctx.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+        prompt_tokens = _compute_tokens(request.messages, ctx.tokenizer)
 
         # Process stop sequences
         stop_tokens = None
@@ -607,7 +645,9 @@ async def _create_chat_completion(ctx: InferenceContext, request: ChatCompletion
                 content_logprobs = []
                 assert generation.logprobs is not None, "Logprobs requested but missing in generation result"
                 for token_id, lp in zip(generated_tokens, generation.logprobs, strict=True):
-                    token_str = ctx.tokenizer.decode([token_id], skip_special_tokens=False)
+                    # Use convert_ids_to_tokens to preserve BPE format (e.g., Ġ for spaces)
+                    # This allows the client to round-trip: convert_tokens_to_ids(token_str) == token_id
+                    token_str = ctx.tokenizer.convert_ids_to_tokens(token_id)
                     content_logprobs.append(
                         ChatCompletionTokenLogprob(
                             token=token_str,
@@ -654,6 +694,11 @@ class InferenceServer:
     Provides OpenAI compatible endpoints for text and chat completions.
     """
 
+    _server: uvicorn.Server | None
+    app: FastAPI
+    config: InferenceServerConfig
+    inference_context: InferenceContext
+
     def __init__(self, config: InferenceServerConfig, inference_context: InferenceContext, app: FastAPI):
         """Initialize the inference server with pre-built components.
 
@@ -662,6 +707,7 @@ class InferenceServer:
         self.config = config
         self.inference_context = inference_context
         self.app = app
+        self._server = None
 
     @staticmethod
     def create(config: InferenceServerConfig, model: LmHeadModel, tokenizer: HfTokenizer) -> "InferenceServer":
@@ -698,6 +744,10 @@ class InferenceServer:
         async def create_completion(request: CompletionRequest) -> Completion:
             return await _create_completion(inference_context, request)
 
+        @app.post("/v1/tokens", response_model=TokensResponse)
+        async def fetch_tokens(request: TokensRequest) -> TokensResponse:
+            return await _fetch_tokens(inference_context, request)
+
         return app
 
     def unload(self):
@@ -712,10 +762,36 @@ class InferenceServer:
         """
         self.inference_context.reload(weight_callback)
 
+    def address(self):
+        """Get the full address the server is running on."""
+        for server in self._server.servers:
+            for sock in server.sockets:
+                addr = sock.getsockname()
+                host, port = addr[0], addr[1]
+                # handle weird ipv6 localhost address which confuses clients
+                if host == "::1" or host == ":1":
+                    host = "localhost"
+                return f"{host}:{port}"
+        return None
+
+    def port(self):
+        """Get the port the server is running on."""
+        if self.config.port > 0:
+            return self.config.port
+
+        # query the uvicorn server socket list for the port
+        for server in self._server.servers:
+            for sock in server.sockets:
+                addr = sock.getsockname()
+                return addr[1]
+
+        return None
+
     def serve(self):
         try:
             logger.info(f"Starting Levanter inference server on {self.config.host}:{self.config.port}")
-            uvicorn.run(self.app, host=self.config.host, port=self.config.port)
+            self._server = uvicorn.Server(uvicorn.Config(self.app, host=self.config.host, port=self.config.port))
+            self._server.run()
         finally:
             self.shutdown()
 
@@ -723,8 +799,8 @@ class InferenceServer:
         try:
             logger.info(f"Starting Levanter inference server on {self.config.host}:{self.config.port}")
             config = uvicorn.Config(self.app, host=self.config.host, port=self.config.port)
-            server = uvicorn.Server(config)
-            await server.serve()
+            self._server = uvicorn.Server(config)
+            await self._server.serve()
         finally:
             self.shutdown()
 
