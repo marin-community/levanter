@@ -6,6 +6,7 @@ import functools
 import logging
 import os
 import time
+import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
@@ -1421,10 +1422,13 @@ class InferenceEngine:
             low = high
             while True:
                 high *= 2
-                if high > (1 << 31):
-                    raise ValueError(
-                        "Unable to infer KV cache size: search exceeded 2^31 pages. " "Provide `max_pages` explicitly."
+                if high > (1 << 20):
+                    warnings.warn(
+                        "KV cache size exceeded 1M pages during budget inference; "
+                        "aborting search and using current estimate."
                     )
+                    high = 1 << 20
+                    break
                 high_bytes = cache_bytes(high)
                 if high_bytes > budget:
                     break
