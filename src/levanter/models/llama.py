@@ -21,7 +21,8 @@ from haliax.state_dict import ModuleWithStateDictSerialization
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, HFCompatConfig
 from levanter.inference.page_table import PageBatchInfo, PageTable
 from levanter.layers import LayerNormConfigBase, RmsNormConfig
-from levanter.layers.attention import Attention, AttentionBackend, AttentionConfig, AttentionMask, KvPageCache
+from levanter.layers.attention import Attention, AttentionBackend, AttentionConfig, AttentionMask
+from levanter.layers.kv_cache import KvPageCache, ListCache
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.utils.activation import ActivationFunctionEnum
@@ -406,13 +407,13 @@ class LlamaTransformer(eqx.Module):
     @named_call
     def decode(
         self,
-        kv_cache: list[KvPageCache],
+        kv_cache: ListCache[KvPageCache],
         x: NamedArray,
         batch_info: PageBatchInfo,
         pos_ids: NamedArray,
         *,
         key=None,
-    ) -> tuple[NamedArray, list[KvPageCache]]:
+    ) -> tuple[NamedArray, ListCache[KvPageCache]]:
         keys = maybe_rng_split(key, self.config.num_layers) if key is not None else None
 
         # Unfortunately, JAX does not seem to want to intelligently reuse memory here, so we manually unroll the loop
@@ -425,14 +426,14 @@ class LlamaTransformer(eqx.Module):
         # )
         # x = self.norm(x)
         # return x, kv_cache
-        out_cache = []
+        caches = list(kv_cache)
+        updated_caches: list[KvPageCache] = []
 
         for i in range(self.config.num_layers):
             with jax.named_scope("slice layer"):
                 layer = hax.tree_util.tree_map(lambda l: l["layer", i], self.layers.stacked)  # type: ignore
             with jax.named_scope("slice cache"):
-                # this_cache = hax.tree_util.tree_map(lambda c: c["layer", i], kv_cache)
-                this_cache = kv_cache[i]
+                this_cache = caches[i]
             x, this_cache = layer.decode(
                 x,
                 this_cache,
@@ -441,22 +442,21 @@ class LlamaTransformer(eqx.Module):
                 key=keys[i] if keys is not None else None,
             )
             with jax.named_scope("update cache"):
-                # haliax.debug.visualize_shardings(this_cache)
-                # kv_cache = hax.tree_util.tree_map(lambda c, nc: c.at["layer", i].set(nc), kv_cache, this_cache)  # type: ignore
-                out_cache.append(this_cache)
+                updated_caches.append(this_cache)
 
         x = self.norm(x)
 
-        return x, out_cache
+        return x, ListCache(updated_caches)
 
-    def initial_cache(self, page_table: PageTable, *, dtype) -> list[KvPageCache]:
+    def initial_cache(self, page_table: PageTable, *, dtype) -> ListCache[KvPageCache]:
         """
         Creates an empty page cache for this transformer. Note that in order to create a decoder state, you
         need to couple the KvPageCache to the PageTable's state with a BatchInfo object.
         """
         # sadly this is too cute/smart for XLA to handle aliasing correctly
         # return self.layers.vmap_via(LlamaDecoderLayer.initial_cache)(page_table, dtype=dtype)
-        return [layer.initial_cache(page_table, dtype=dtype) for layer in self.layers.unstacked()]
+        caches = [layer.initial_cache(page_table, dtype=dtype) for layer in self.layers.unstacked()]
+        return ListCache(caches)
 
 
 class LlamaEmbedding(ModuleWithStateDictSerialization, eqx.Module):
@@ -605,7 +605,7 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
     def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
         return {"transformer": "model", "embeddings": None}
 
-    def initial_cache(self, page_table: PageTable, *, dtype) -> KvPageCache:
+    def initial_cache(self, page_table: PageTable, *, dtype) -> ListCache[KvPageCache]:
         """
         Creates an initial cache for this model. Note that in order to create a decoder state, you
         need to couple the KvPageCache to the PageTable's state with a BatchInfo object.
@@ -616,19 +616,19 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
     def decode(
         self,
         input_ids: NamedArray,  # token IDs for *this* step (shape {Pos} or {Batch, Pos})
-        kv_cache: KvPageCache,
+        kv_cache: ListCache[KvPageCache],
         batch_info: PageBatchInfo,
         pos_ids: NamedArray,
         *,
         key=None,
-    ) -> tuple[NamedArray, KvPageCache]:
+    ) -> tuple[NamedArray, ListCache[KvPageCache]]:
         """Run one decode / pre-fill step with an existing paged-KV *state*.
 
         Parameters
         ----------
         input_ids : NamedArray
             Token IDs for the positions being decoded **this call**.
-        kv_cache : KvPageCache
+        kv_cache : ListCache[KvPageCache]
             Current paged-KV cache (one per layer). Obtain the initial value via
             ``self.initial_cache`` and update with the returned *new_state* each step.
         pos_ids : NamedArray
@@ -641,7 +641,7 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
         -------
         logits : NamedArray
             Logits for the provided tokens (axes match *input_ids* + ``Vocab``).
-        new_state : KvPageCache
+        new_state : ListCache[KvPageCache]
             Updated cache to pass into the next decode call.
         """
 
