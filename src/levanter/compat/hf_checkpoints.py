@@ -27,7 +27,6 @@ import mergedeep
 import numpy as np
 import safetensors
 import safetensors.numpy
-import tensorstore as ts
 import transformers.utils.hub
 from fsspec import AbstractFileSystem
 from haliax._src.state_dict import flatten_modules_for_export, to_state_dict
@@ -200,7 +199,7 @@ def _load_torch(path, dtype):
     for k, v in tqdm(state_dict.items(), total=len(state_dict), desc="Loading weights"):
         v = _convert_to_jnp(v, dtype)
         if v is not None:
-            v = _maybe_shard_best_effort(v, dtype)
+            v = _shard_best_effort(v, dtype)
         d[k] = v
 
     return d
@@ -212,7 +211,7 @@ def _load_safe_tensors(path, dtype):
         keys = list(f.keys())
         for key in tqdm(keys, total=len(keys), desc="Loading weights"):
             tensor_slice = f.get_slice(key)
-            d[key] = _maybe_shard_best_effort(tensor_slice, dtype)
+            d[key] = _shard_best_effort(tensor_slice, dtype)
 
     return d
 
@@ -1247,23 +1246,9 @@ def _shard_hf_checkpoint(
     return shards, index
 
 
-def _maybe_shard_best_effort(array_or_slice, dtype) -> jax.Array:
-    """Shards an array to non-cpu devices if we have more than one device, otherwise just stays on cpu"""
-    # We do this to not waste memory on the target device if it's not going to help us save memory/io
-    if jax.device_count() > 1 or True:
-        return _shard_best_effort(array_or_slice, dtype)
-    else:
-        with use_cpu_device():
-            if hasattr(array_or_slice, "get_shape"):
-                # this is a PySafeSlice
-                return jnp.array(array_or_slice[:], dtype=dtype)
-            elif isinstance(array_or_slice, ts.TensorStore):
-                return jnp.array(array_or_slice.read(), dtype=dtype)
-            else:
-                return jnp.array(array_or_slice, dtype=dtype)
-
-
 def _shard_best_effort(array_or_slice, dtype) -> jax.Array:
+    # get_shape is for safetensors, shape is for numpy arrays
+    # (there's no exported type for the safetensors array, so we just duck type)
     if hasattr(array_or_slice, "get_shape"):
         shape = array_or_slice.get_shape()
     else:
@@ -1271,23 +1256,12 @@ def _shard_best_effort(array_or_slice, dtype) -> jax.Array:
 
     sharding = best_effort_sharding(shape)
 
-    if isinstance(array_or_slice, ts.TensorStore):
+    def get_slice(indices):
+        arr = array_or_slice[indices]
+        if dtype is not None:
+            arr = arr.astype(dtype)
 
-        def get_slice(indices):
-            arr = array_or_slice[indices].read()
-            if dtype is not None:
-                arr = arr.astype(dtype)
-
-            return arr
-
-    else:
-
-        def get_slice(indices):
-            arr = array_or_slice[indices]
-            if dtype is not None:
-                arr = arr.astype(dtype)
-
-            return arr
+        return arr
 
     return jax.make_array_from_callback(tuple(shape), sharding, get_slice)
 
