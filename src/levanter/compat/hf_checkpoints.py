@@ -515,11 +515,10 @@ class HFCheckpointConverter(Generic[LevConfig]):
 
         id, rev = self._get_ref(ref)
 
-        # Handle GCS paths directly
-        if id.startswith("gs://"):
+        if "://" in id:
             if rev is not None:
-                raise ValueError("Revisions not supported for GCS paths")
-            return self._load_from_gcs(id, dtype)
+                raise ValueError("Revisions not supported for explicit URLs")
+            return self._load_from_remote(id, dtype)
 
         for index_file in [SAFE_TENSORS_INDEX_NAME, PYTORCH_WEIGHTS_INDEX_NAME]:
             try:
@@ -577,41 +576,33 @@ class HFCheckpointConverter(Generic[LevConfig]):
 
         return final_state_dict
 
-    def _load_from_gcs(self, gcs_path: str, dtype: Optional[jnp.dtype] = None) -> dict:
-        """Load a state dict from a GCS path"""
+    def _load_from_remote(self, url: str, dtype: Optional[jnp.dtype] = None) -> dict:
+        """Load a state dict from a remote URL understood by fsspec."""
 
         final_state_dict = {}
 
         fs: AbstractFileSystem
-        fs, path = fsspec.core.url_to_fs(gcs_path)
+        fs, path = fsspec.core.url_to_fs(url)
 
         shard_files, loader = self._locate_shard_files(fs, path)
 
         if not shard_files:
-            raise FileNotFoundError(f"No HF-ish checkpoint files found in {gcs_path}")
+            raise FileNotFoundError(f"No HF-ish checkpoint files found in {url}")
 
         for shard_file in shard_files:
             shard_path = os.path.join(path, shard_file)
             if not fs.exists(shard_path):
                 raise FileNotFoundError(f"Shard file {shard_path} not found")
 
-            # Download shard to temporary file
-            with tempfile.NamedTemporaryFile() as tmp:
-                fs.get(shard_path, tmp.name)
-                assert loader is not None
-                shard_state_dict = loader(tmp.name, dtype)
+            if loader is _load_safe_tensors:
+                shard_state_dict = asyncio.run(_sharded_load_tensorstore_async(shard_path, dtype, fs=fs))
+            else:
+                with tempfile.NamedTemporaryFile() as tmp:
+                    fs.get(shard_path, tmp.name)
+                    assert loader is not None
+                    shard_state_dict = loader(tmp.name, dtype)
 
-                # compare the new _sharded_load_tensorstore_async
-                comparison = asyncio.run(_sharded_load_tensorstore_async(shard_path, dtype, fs=fs))
-
-                # compare the two dicts (in jit)
-                @jax.jit
-                def tree_equal(a, b):
-                    return jax.tree_util.tree_map(jnp.array_equal, a, b)
-
-                assert jax.tree_util.tree_all(tree_equal(comparison, shard_state_dict))
-
-                final_state_dict.update(shard_state_dict)
+            final_state_dict.update(shard_state_dict)
 
         return final_state_dict
 

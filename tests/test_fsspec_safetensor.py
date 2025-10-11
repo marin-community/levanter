@@ -7,8 +7,8 @@ import fsspec
 import numpy as np
 import pytest
 from safetensors.numpy import load_file, save_file
-
 from levanter.compat.fsspec_safetensor import SafetensorChunkLoader
+from levanter.compat.hf_checkpoints import HFCheckpointConverter
 
 
 @pytest.mark.asyncio
@@ -98,3 +98,45 @@ async def test_chunk_loader_with_custom_fs(tmp_path):
     tensors = await loader.read_all()
     np.testing.assert_array_equal(tensors["foo"], data["foo"])
     np.testing.assert_array_equal(tensors["bar"], data["bar"])
+
+
+def test_load_from_remote_file_url(tmp_path, monkeypatch):
+    data = {
+        "foo": np.random.randn(4, 4).astype(np.float32),
+        "bar": np.random.randn(3, 2).astype(np.float32),
+    }
+    path = tmp_path / "model.safetensors"
+    save_file(data, path)
+
+    expected = load_file(str(path))
+
+    monkeypatch.setattr("levanter.compat.hf_checkpoints.best_effort_sharding", lambda shape: None)
+
+    def _jit_stub(fn, *args, **kwargs):
+        def _wrapped(x):
+            return fn(x)
+
+        return _wrapped
+
+    monkeypatch.setattr("levanter.compat.hf_checkpoints.jax.jit", _jit_stub)
+    monkeypatch.setattr("levanter.compat.hf_checkpoints.jax.lax.with_sharding_constraint", lambda x, _: x)
+
+    converter = HFCheckpointConverter.__new__(HFCheckpointConverter)
+    converter.__dict__.update(
+        {
+            "LevConfigClass": None,
+            "reference_checkpoint": None,
+            "HfConfigClass": None,
+            "tokenizer": None,
+            "feature_extractor": None,
+            "config_overrides": None,
+            "trust_remote_code": False,
+            "ignore_prefix": None,
+        }
+    )
+
+    remote_state = converter._load_from_remote(f"file://{tmp_path}", dtype=None)
+
+    assert set(remote_state.keys()) == set(expected.keys())
+    for key in expected:
+        np.testing.assert_array_equal(np.array(remote_state[key]), expected[key])
