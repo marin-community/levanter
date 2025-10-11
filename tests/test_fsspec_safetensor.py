@@ -1,6 +1,9 @@
 # Copyright 2025 The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
+
+import fsspec
 import numpy as np
 import pytest
 from safetensors.numpy import load_file, save_file
@@ -59,3 +62,39 @@ async def test_materialize_single_tensor(tmp_path):
     tensor = await loader.materialize_tensor("b")
 
     np.testing.assert_array_equal(tensor, data["b"])
+
+
+@pytest.mark.asyncio
+async def test_out_of_order_chunk_access(tmp_path):
+    # Force multiple chunks by setting a small chunk size relative to tensor payloads.
+    data = {
+        "first": np.random.randn(128).astype(np.float32),
+        "second": np.random.randn(64).astype(np.float32),
+    }
+    path = tmp_path / "out_of_order.safetensors"
+    save_file(data, path)
+
+    loader = await SafetensorChunkLoader.create(f"file://{path}", chunk_size=256)
+
+    second = await asyncio.wait_for(loader.materialize_tensor("second"), timeout=1.0)
+    np.testing.assert_array_equal(second, data["second"])
+
+    first = await asyncio.wait_for(loader.materialize_tensor("first"), timeout=1.0)
+    np.testing.assert_array_equal(first, data["first"])
+
+
+@pytest.mark.asyncio
+async def test_chunk_loader_with_custom_fs(tmp_path):
+    data = {
+        "foo": np.random.randn(4, 4).astype(np.float32),
+        "bar": np.random.randn(4, 4).astype(np.float32),
+    }
+    path = tmp_path / "custom_fs.safetensors"
+    save_file(data, path)
+
+    fs = fsspec.filesystem("file")
+    loader = await SafetensorChunkLoader.create(str(path), chunk_size=128, fs=fs)
+
+    tensors = await loader.read_all()
+    np.testing.assert_array_equal(tensors["foo"], data["foo"])
+    np.testing.assert_array_equal(tensors["bar"], data["bar"])

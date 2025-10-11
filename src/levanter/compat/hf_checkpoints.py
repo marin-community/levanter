@@ -217,12 +217,12 @@ def _load_safe_tensors(path, dtype):
     return d
 
 
-async def _sharded_load_tensorstore_async(path, dtype):
+async def _sharded_load_tensorstore_async(path, dtype, fs: Optional[AbstractFileSystem] = None):
     """Stream a safetensors shard from remote storage and return JAX arrays."""
 
     from levanter.compat.fsspec_safetensor import SafetensorChunkLoader
 
-    loader = await SafetensorChunkLoader.create(path)
+    loader = await SafetensorChunkLoader.create(path, fs=fs)
     arrays: dict[str, jax.Array] = {}
 
     for chunk in loader.chunk_specs:
@@ -602,7 +602,7 @@ class HFCheckpointConverter(Generic[LevConfig]):
                 shard_state_dict = loader(tmp.name, dtype)
 
                 # compare the new _sharded_load_tensorstore_async
-                comparison = asyncio.run(_sharded_load_tensorstore_async(tmp.name, dtype))
+                comparison = asyncio.run(_sharded_load_tensorstore_async(shard_path, dtype, fs=fs))
 
                 # compare the two dicts (in jit)
                 @jax.jit

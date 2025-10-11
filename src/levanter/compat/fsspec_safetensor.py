@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import inspect
 import json
 import logging
 import os
 import struct
 from dataclasses import dataclass
-from functools import lru_cache, partial
+from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import fsspec
@@ -15,6 +16,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental import multihost_utils
+from fsspec import AbstractFileSystem
+from tqdm_loggable.auto import tqdm
 
 from levanter.utils.jax_utils import broadcast_one_to_all
 
@@ -36,6 +39,10 @@ _SAFETENSOR_DTYPE_MAP: Dict[str, np.dtype] = {
     "U64": np.dtype("uint64"),
     "BOOL": np.dtype("bool"),
 }
+
+
+_PBAR_THRESHOLD_BYTES = 256 * 1024**2
+_PBAR_READ_STEP_BYTES = 64 * 1024**2
 
 
 @lru_cache(maxsize=1)
@@ -84,21 +91,51 @@ class _ChunkSpec:
 
 
 class _AsyncFsspecReader:
-    def __init__(self, path: str, *, cache_size: int = 32):
+    def __init__(
+        self,
+        path: str,
+        *,
+        fs: Optional[AbstractFileSystem] = None,
+        cache_size: int = 32,
+    ):
         protocol, fs_path = fsspec.core.split_protocol(path)
-        if protocol is None:
-            protocol = "file"
-        if protocol == "gs":
-            protocol = "gcs"
-        self._fs = fsspec.filesystem(protocol, asynchronous=True, anon=False)
-        self._path = fs_path
+        if fs is None:
+            if protocol is None:
+                protocol = "file"
+            if protocol == "gs":
+                protocol = "gcs"
+            filesystem = fsspec.filesystem(protocol, asynchronous=True, anon=False)
+            resolved_path = fs_path
+            async_mode = True
+        else:
+            filesystem = fs
+            resolved_path = fs_path if protocol is not None else path
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            fs_loop = getattr(filesystem, "loop", None)
+            async_flag = bool(getattr(filesystem, "asynchronous", False))
+            async_mode = async_flag and (fs_loop is None or fs_loop is current_loop)
+
+        self._fs: AbstractFileSystem = filesystem
+        self._path = resolved_path
         self._cache_size = cache_size
         self._cache: Dict[Tuple[int, int], bytes] = {}
         self._locks: Dict[Tuple[int, int], asyncio.Lock] = {}
+        self._async_mode = async_mode
 
     @property
     def path(self) -> str:
         return self._path
+
+    @property
+    def filesystem(self) -> AbstractFileSystem:
+        return self._fs
+
+    @property
+    def async_mode(self) -> bool:
+        return self._async_mode
 
     async def read_range(self, start: int, length: int) -> bytes:
         key = (start, length)
@@ -113,14 +150,23 @@ class _AsyncFsspecReader:
                 return cached
 
             end = start + length
-            if hasattr(self._fs, "_cat_file"):
-                data = await self._fs._cat_file(self._path, start=start, end=end)
+            if self._async_mode and hasattr(self._fs, "_cat_file"):
+                data = self._fs._cat_file(self._path, start=start, end=end)
+                if inspect.isawaitable(data):
+                    data = await data
+            elif self._async_mode:
+                data = self._fs.cat_file(self._path, start=start, end=end)
+                if inspect.isawaitable(data):
+                    data = await data
             else:
                 loop = asyncio.get_running_loop()
-                data = await loop.run_in_executor(
-                    None,
-                    partial(self._fs.cat_file, self._path, start=start, end=end),
-                )
+
+                def _read_sync() -> bytes:
+                    with self._fs.open(self._path, "rb") as f:  # type: ignore[arg-type]
+                        f.seek(start)
+                        return f.read(length)
+
+                data = await loop.run_in_executor(None, _read_sync)
 
             if len(self._cache) >= self._cache_size:
                 self._cache.pop(next(iter(self._cache)))
@@ -232,10 +278,7 @@ class SafetensorChunkLoader:
         self._chunk_by_key = {tensor.key: chunk for chunk in chunks for tensor in chunk.tensors}
         self._chunk_buffers: Dict[int, np.ndarray] = {}
         self._chunk_events: Dict[int, asyncio.Event] = {}
-        self._chunk_order: Tuple[_ChunkSpec, ...] = chunks
-        self._next_chunk_index: int = 0
-        self._order_lock: asyncio.Lock | None = None
-        self._order_condition: asyncio.Condition | None = None
+        self._chunk_locks: Dict[int, asyncio.Lock] = {}
         self._process_index = jax.process_index()
         self._process_count = jax.process_count()
 
@@ -245,11 +288,12 @@ class SafetensorChunkLoader:
         path: str,
         *,
         chunk_size: Optional[int] = None,
+        fs: Optional[AbstractFileSystem] = None,
     ) -> "SafetensorChunkLoader":
         """Instantiate a loader for `path` with optional chunk sizing override."""
 
         chunk_limit = chunk_size or _default_chunk_size_bytes()
-        reader = _AsyncFsspecReader(path)
+        reader = _AsyncFsspecReader(path, fs=fs)
         tensors = await _read_metadata(reader)
         chunks = tuple(_build_chunks(tensors.values(), chunk_limit))
         logger.info(
@@ -354,6 +398,7 @@ class SafetensorChunkLoader:
             logger.info("Process %d released chunk %d", self._process_index, chunk_id)
             self._chunk_buffers.pop(chunk_id, None)
             self._chunk_events.pop(chunk_id, None)
+            self._chunk_locks.pop(chunk_id, None)
 
     async def _get_chunk_buffer(self, chunk: _ChunkSpec) -> np.ndarray:
         existing = self._chunk_buffers.get(chunk.chunk_id)
@@ -370,90 +415,137 @@ class SafetensorChunkLoader:
             event = asyncio.Event()
             self._chunk_events[chunk.chunk_id] = event
 
-        if chunk in self._chunk_order[: self._next_chunk_index]:
-            raise RuntimeError(
-                f"Chunk {chunk.chunk_id} has already been processed and cannot be materialised again"
-            )
-        if event.is_set():
-            logger.debug(
-                "Process %d observed completed chunk %d", self._process_index, chunk.chunk_id
-            )
-            buffer = self._chunk_buffers.get(chunk.chunk_id)
-            if buffer is None:
-                raise RuntimeError(
-                    f"Chunk {chunk.chunk_id} has been released and cannot be rematerialised"
-                )
+        if not event.is_set():
+            lock = self._chunk_locks.setdefault(chunk.chunk_id, asyncio.Lock())
+            async with lock:
+                existing = self._chunk_buffers.get(chunk.chunk_id)
+                if existing is not None:
+                    return existing
+
+                if not event.is_set():
+                    is_owner = self._process_index == chunk.owner(self._process_count)
+                    logger.info(
+                        "Process %d materialising chunk %d (size %.2f MiB, owner=%d)",
+                        self._process_index,
+                        chunk.chunk_id,
+                        chunk.size / 1024**2,
+                        chunk.owner(self._process_count),
+                    )
+                    if is_owner:
+                        raw = await self._read_chunk_bytes(chunk)
+                        local_array = np.frombuffer(raw, dtype=np.uint8)
+                        logger.info(
+                            "Process %d read chunk %d (%d bytes) from %s",
+                            self._process_index,
+                            chunk.chunk_id,
+                            chunk.size,
+                            chunk.file_path,
+                        )
+                    else:
+                        local_array = np.empty(chunk.size, dtype=np.uint8)
+                        local_array.fill(0)
+
+                    if self._process_count > 1:
+                        logger.info(
+                            "Process %d broadcasting chunk %d buffer (owner=%d)",
+                            self._process_index,
+                            chunk.chunk_id,
+                            chunk.owner(self._process_count),
+                        )
+                        local_array = broadcast_one_to_all(local_array, is_source=is_owner)
+                        multihost_utils.sync_global_devices()
+
+                    logger.info(
+                        "Process %d cached chunk %d (%.2f MiB)",
+                        self._process_index,
+                        chunk.chunk_id,
+                        chunk.size / 1024**2,
+                    )
+                    self._chunk_buffers[chunk.chunk_id] = local_array
+                    event.set()
+                    return local_array
+
+        await event.wait()
+        buffer = self._chunk_buffers.get(chunk.chunk_id)
+        if buffer is None:
+            raise RuntimeError(f"Chunk {chunk.chunk_id} has been released and cannot be rematerialised")
+        logger.debug(
+            "Process %d observed completed chunk %d",
+            self._process_index,
+            chunk.chunk_id,
+        )
+        return buffer
+
+    async def _read_chunk_bytes(self, chunk: _ChunkSpec) -> bytes | bytearray:
+        if self._reader.async_mode:
+            if chunk.size < _PBAR_THRESHOLD_BYTES:
+                return await self._reader.read_range(chunk.byte_start, chunk.size)
+
+            step = max(min(_PBAR_READ_STEP_BYTES, chunk.size), 1)
+            buffer = bytearray(chunk.size)
+            desc = f"Reading safetensor chunk {chunk.chunk_id}"
+
+            with tqdm(total=chunk.size, unit="B", unit_scale=True, unit_divisor=1024, desc=desc) as pbar:
+                offset = 0
+                while offset < chunk.size:
+                    length = min(step, chunk.size - offset)
+                    part = await self._reader.read_range(chunk.byte_start + offset, length)
+                    if len(part) != length:
+                        raise IOError(
+                            f"Short read while fetching chunk {chunk.chunk_id}: expected {length} bytes got {len(part)}"
+                        )
+                    buffer[offset : offset + length] = part
+                    offset += length
+                    pbar.update(length)
+
             return buffer
 
-        condition = self._ensure_condition()
-        async with condition:
-            while self._next_chunk_index < len(self._chunk_order) and self._chunk_order[self._next_chunk_index] != chunk:
-                if event.is_set():
-                    return self._chunk_buffers[chunk.chunk_id]
-                await condition.wait()
+        loop = asyncio.get_running_loop()
+        buffer = bytearray(chunk.size)
 
-            if event.is_set():
-                return self._chunk_buffers[chunk.chunk_id]
+        def _read_sync(target: bytearray, with_progress: bool) -> None:
+            desc = f"Reading safetensor chunk {chunk.chunk_id}"
+            reader = self._reader
+            filesystem = reader.filesystem
+            with filesystem.open(reader.path, "rb") as f:  # type: ignore[arg-type]
+                f.seek(chunk.byte_start)
+                remaining = chunk.size
+                offset = 0
+                if with_progress:
+                    with tqdm(
+                        total=chunk.size,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc=desc,
+                    ) as pbar:
+                        while remaining > 0:
+                            length = min(_PBAR_READ_STEP_BYTES, remaining)
+                            data = f.read(length)
+                            if len(data) != length:
+                                raise IOError(
+                                    f"Short read while fetching chunk {chunk.chunk_id}: expected {length} bytes"
+                                )
+                            target[offset : offset + length] = data
+                            offset += length
+                            remaining -= length
+                            pbar.update(length)
+                else:
+                    data = f.read(chunk.size)
+                    if len(data) != chunk.size:
+                        raise IOError(f"Short read while fetching chunk {chunk.chunk_id}: expected {chunk.size} bytes")
+                    target[:] = data
 
-            self._next_chunk_index += 1
-
-        is_owner = self._process_index == chunk.owner(self._process_count)
-        logger.info(
-            "Process %d materialising chunk %d (size %.2f MiB, owner=%d)",
-            self._process_index,
-            chunk.chunk_id,
-            chunk.size / 1024**2,
-            chunk.owner(self._process_count),
-        )
-        if is_owner:
-            raw = await self._reader.read_range(chunk.byte_start, chunk.size)
-            local_array = np.frombuffer(raw, dtype=np.uint8)
-            logger.info(
-                "Process %d read chunk %d (%d bytes) from %s",
-                self._process_index,
-                chunk.chunk_id,
-                chunk.size,
-                chunk.file_path,
-            )
-        else:
-            local_array = np.empty(chunk.size, dtype=np.uint8)
-            local_array.fill(0)
-
-        if self._process_count > 1:
-            logger.info(
-                "Process %d broadcasting chunk %d buffer (owner=%d)",
-                self._process_index,
-                chunk.chunk_id,
-                chunk.owner(self._process_count),
-            )
-            local_array = broadcast_one_to_all(local_array, is_source=is_owner)
-            multihost_utils.sync_global_devices()
-
-        logger.info(
-            "Process %d cached chunk %d (%.2f MiB)",
-            self._process_index,
-            chunk.chunk_id,
-            chunk.size / 1024**2,
-        )
-        self._chunk_buffers[chunk.chunk_id] = local_array
-        event.set()
-        condition = self._ensure_condition()
-        async with condition:
-            condition.notify_all()
-        return local_array
-
-    def _ensure_condition(self) -> asyncio.Condition:
-        if self._order_condition is None:
-            self._order_lock = asyncio.Lock()
-            self._order_condition = asyncio.Condition(self._order_lock)
-        return self._order_condition
+        await loop.run_in_executor(None, _read_sync, buffer, chunk.size >= _PBAR_THRESHOLD_BYTES)
+        return buffer
 
 
 async def create_safetensor_chunk_loader(
     path: str,
     *,
     chunk_size: Optional[int] = None,
+    fs: Optional[AbstractFileSystem] = None,
 ) -> SafetensorChunkLoader:
     """Convenience wrapper that forwards to :meth:`SafetensorChunkLoader.create`."""
 
-    return await SafetensorChunkLoader.create(path, chunk_size=chunk_size)
+    return await SafetensorChunkLoader.create(path, chunk_size=chunk_size, fs=fs)
