@@ -336,7 +336,7 @@ class SafetensorChunkLoader:
         buffer = await self._get_chunk_buffer(chunk)
         base = chunk.byte_start
         tensors: Dict[str, np.ndarray] = {}
-        logger.info(
+        logger.debug(
             "Process %d extracting %d tensors from chunk %d",
             self._process_index,
             len(chunk.tensors),
@@ -372,7 +372,7 @@ class SafetensorChunkLoader:
         """
 
         chunk = self.chunk_for_key(key)
-        logger.info(
+        logger.debug(
             "Process %d materialising tensor %s via chunk %d",
             self._process_index,
             key,
@@ -395,7 +395,7 @@ class SafetensorChunkLoader:
         """Drop any cached buffer for the provided chunk id."""
 
         if chunk_id in self._chunk_buffers:
-            logger.info("Process %d released chunk %d", self._process_index, chunk_id)
+            logger.debug("Process %d released chunk %d", self._process_index, chunk_id)
             self._chunk_buffers.pop(chunk_id, None)
             self._chunk_events.pop(chunk_id, None)
             self._chunk_locks.pop(chunk_id, None)
