@@ -23,14 +23,6 @@ class PageTableSpec:
     page_size: int
 
 
-def _relative_positions(seg_ids: jnp.ndarray):
-    idx = jnp.arange(seg_ids.shape[0])
-    is_start = jnp.concatenate([jnp.array([True]), seg_ids[1:] != seg_ids[:-1]])
-    start_idx = idx * is_start.astype(idx.dtype)
-    seg_start = jax.lax.associative_scan(jnp.maximum, start_idx)
-    return idx - seg_start  # 0,1,2,… inside each segment
-
-
 class PageTable(eqx.Module):
     """
     Tracks which pages are allocated to which sequences.
