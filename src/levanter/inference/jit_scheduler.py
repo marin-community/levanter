@@ -110,11 +110,56 @@ class DecodeState(eqx.Module):
     prng_keys: jaxtyping.PRNGKeyArray
     """one per sequence, used for sampling. This is a JAX PRNG key, so it can be split to get new keys."""
 
-    # Token queue for pending decode work
     tqueue: "TokenQueue"
+    """token queue for pending decode work"""
 
     # Cached finished flags per sequence (updated when tokens are enqueued)
     finished: ht.bool_[NamedArray, "seq"]
+
+    @staticmethod
+    def init(
+        page_table: PageTable,
+        pad_token_id: int = INVALID,
+        max_stop_seqs: int = 0,
+        max_stop_tokens: int = 16,
+        max_queued_tokens: int = 0,
+        enable_logprobs: bool = False,
+    ) -> "DecodeState":
+        """
+        Initialize a DecodeState with empty buffers.
+        """
+        max_seqs = page_table.max_seqs
+        pages_per_seq = page_table.pages_per_seq
+        page_size = page_table.page_size
+        max_seq_len = page_table.max_len_per_seq
+
+        return DecodeState(
+            kv_pages=hax.full({"seq": max_seqs, "page": pages_per_seq}, INVALID, dtype=jnp.int32),
+            page_size=page_size,
+            page_table=page_table,
+            tokens=hax.full({"seq": max_seqs, "position": max_seq_len}, pad_token_id, dtype=jnp.int32),
+            logprobs=(
+                None
+                if not enable_logprobs
+                else hax.full({"seq": max_seqs, "position": max_seq_len}, jnp.nan, dtype=jnp.float32)
+            ),
+            seq_lens=hax.zeros({"seq": max_seqs}, dtype=jnp.int32),
+            clone_sources=hax.full({"seq": max_seqs}, INVALID, dtype=jnp.int32),
+            max_num_tokens=hax.full({"seq": max_seqs}, 0, dtype=jnp.int32),
+            stop_tokens=(
+                hax.full(
+                    {"seq": max_seqs, "stop_seq": max_stop_seqs, "position": max_stop_tokens},
+                    INVALID,
+                    dtype=jnp.int32,
+                )
+                if max_stop_tokens > 0
+                else None
+            ),
+            temperature=hax.ones({"seq": max_seqs}, dtype=jnp.float32),
+            prng_keys=jax.vmap(jax.random.PRNGKey, axis_size=max_seqs, in_axes=None)(0),
+            tqueue=TokenQueue.init(max_queued_tokens),
+            finished=hax.zeros({"seq": max_seqs}, dtype=bool),
+        )
 
     @eqx.filter_jit(donate="all")
     def invalidate_finished(self) -> "DecodeState":
@@ -200,6 +245,14 @@ class DecodeState(eqx.Module):
 
         new_map = jax.lax.fori_loop(0, num_targets, body, clone_map)
         return dataclasses.replace(self, clone_sources=new_map)
+
+    def clone_pages_from(self, src, dest) -> "DecodeState":
+        """
+        Clone kv_pages from src slot to dest slot.
+        """
+        # new_kv_pages = self.kv_pages.at["seq", dest].set(self.kv_pages["seq", src])
+        new_page_table = self.page_table.clone_pages_from(src, dest)
+        return dataclasses.replace(self, page_table=new_page_table)
 
     @property
     def empty_queue_space(self) -> jnp.ndarray:
@@ -399,51 +452,6 @@ max_num_tokens: {max_num_tokens}
             kv_pages=self.kv_pages,
             logprobs=self.logprobs if self.logprobs is not None else "None",
             max_num_tokens=self.max_num_tokens,
-        )
-
-    @staticmethod
-    def init(
-        page_table: PageTable,
-        pad_token_id: int = INVALID,
-        max_stop_seqs: int = 0,
-        max_stop_tokens: int = 16,
-        max_queued_tokens: int = 0,
-        enable_logprobs: bool = False,
-    ) -> "DecodeState":
-        """
-        Initialize a DecodeState with empty buffers.
-        """
-        max_seqs = page_table.max_seqs
-        pages_per_seq = page_table.pages_per_seq
-        page_size = page_table.page_size
-        max_seq_len = page_table.max_len_per_seq
-
-        return DecodeState(
-            kv_pages=hax.full({"seq": max_seqs, "page": pages_per_seq}, INVALID, dtype=jnp.int32),
-            page_size=page_size,
-            page_table=page_table,
-            tokens=hax.full({"seq": max_seqs, "position": max_seq_len}, pad_token_id, dtype=jnp.int32),
-            logprobs=(
-                None
-                if not enable_logprobs
-                else hax.full({"seq": max_seqs, "position": max_seq_len}, jnp.nan, dtype=jnp.float32)
-            ),
-            seq_lens=hax.zeros({"seq": max_seqs}, dtype=jnp.int32),
-            clone_sources=hax.full({"seq": max_seqs}, INVALID, dtype=jnp.int32),
-            max_num_tokens=hax.full({"seq": max_seqs}, 0, dtype=jnp.int32),
-            stop_tokens=(
-                hax.full(
-                    {"seq": max_seqs, "stop_seq": max_stop_seqs, "position": max_stop_tokens},
-                    INVALID,
-                    dtype=jnp.int32,
-                )
-                if max_stop_tokens > 0
-                else None
-            ),
-            temperature=hax.ones({"seq": max_seqs}, dtype=jnp.float32),
-            prng_keys=jax.vmap(jax.random.PRNGKey, axis_size=max_seqs, in_axes=None)(0),
-            tqueue=TokenQueue.init(max_queued_tokens),
-            finished=hax.zeros({"seq": max_seqs}, dtype=bool),
         )
 
 
