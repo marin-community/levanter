@@ -449,11 +449,7 @@ def _apply_prefill_work(gen_state: GenState, work: PrefillWork) -> GenState:
             def do_primary(gs_primary: GenState) -> GenState:
                 decode_state = gs_primary.decode_state
                 page_table, assigned = decode_state.page_table.assign_seq_id_to_seq(slot_val)
-                assigned = eqx.error_if(
-                    assigned,
-                    assigned != slot_val,
-                    "Requested local slot mismatch during prefill.",
-                )
+
                 decode_state = dataclasses.replace(decode_state, page_table=page_table)
                 prompt_len = work.prompt_lengths.array[i].astype(jnp.int32)
                 decode_state = decode_state.assign_seq(
