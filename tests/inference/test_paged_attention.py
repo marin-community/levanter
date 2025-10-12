@@ -230,7 +230,7 @@ def test_attention_paged_decode_matches_full_ar():
 
     pt = PageTable.init(max_pages=4, max_seqs=2, page_size=4, max_pages_per_seq=4)
     pt, seq_id = pt.assign_seq_id_to_seq()
-    kv_cache = attn.empty_page_cache(pt, dtype=jnp.float32)
+    kv_cache = attn.empty_page_cache(pt.spec(), dtype=jnp.float32)
     out_chunks = []
     for i in range(Pos.size):
         # Compute pos_ids for this allocation using current seq_lens before allocation
@@ -270,7 +270,7 @@ def test_attention_paged_decode_matches_full_prefill():
     causal = AttentionMask.causal().with_segment_ids(seg_ids)
     full_out = attn(x, causal, key=jrandom.PRNGKey(1))
 
-    kv_cache = attn.empty_page_cache(pt, dtype=jnp.float32)
+    kv_cache = attn.empty_page_cache(pt.spec(), dtype=jnp.float32)
 
     # Compute absolute pos ids for this batch from current seq_lens
     def _relative_positions(seg_ids):
@@ -315,7 +315,7 @@ def test_attention_paged_decode_prefill_in_chunks(prefix_size, chunk_size, seq_i
     pt, _seq2 = pt.assign_seq_id_to_seq(seq2)
     assert _seq1 == seq1
     assert _seq2 == seq2
-    kv_cache = attn.empty_page_cache(pt, dtype=jnp.float32)
+    kv_cache = attn.empty_page_cache(pt.spec(), dtype=jnp.float32)
 
     x = hax.random.normal(x_key, (Pos, Embed)) * 0.2
     x0 = x["position", hax.dslice(0, Pos.size)]
@@ -391,7 +391,7 @@ def test_attention_paged_decode_ragged_fill_in_chunks():
     pt = PageTable.init(max_pages=8, max_seqs=2, page_size=4, max_pages_per_seq=4)
     pt, seq1 = pt.assign_seq_id_to_seq()
     pt, seq2 = pt.assign_seq_id_to_seq()
-    kv_cache = attn.empty_page_cache(pt, dtype=jnp.float32)
+    kv_cache = attn.empty_page_cache(pt.spec(), dtype=jnp.float32)
 
     x0 = x[B, 0]
     x1 = x[B, 1]

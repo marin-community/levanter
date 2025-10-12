@@ -10,9 +10,17 @@ import haliax as hax
 import haliax.haxtyping as ht
 from haliax import NamedArray
 
-__all__ = ["PageTable", "PageBatchInfo"]
-
 from levanter.inference.utils import INVALID, is_invalid, is_valid, get_unique_in_order
+
+__all__ = ["PageTable", "PageTableSpec", "PageBatchInfo"]
+
+
+@dataclasses.dataclass(frozen=True)
+class PageTableSpec:
+    """Lightweight description of the layout required for allocating paged KV caches."""
+
+    num_pages: int
+    page_size: int
 
 
 def _relative_positions(seg_ids: jnp.ndarray):
@@ -66,6 +74,10 @@ class PageTable(eqx.Module):
     def max_Seq(self) -> hax.Axis:
         """Axis representing the maximum number of sequences."""
         return hax.Axis("seq", self.max_seqs)
+
+    def spec(self) -> PageTableSpec:
+        """Return the cache sizing parameters used when allocating KV memory."""
+        return PageTableSpec(num_pages=self.num_pages, page_size=self.page_size)
 
     # ------------------------------------------------------------------
     # Constructors

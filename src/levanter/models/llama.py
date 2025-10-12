@@ -17,7 +17,7 @@ from haliax.nn.scan import ScanCheckpointPolicy, Stacked
 from haliax.state_dict import ModuleWithStateDictSerialization
 
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, HFCompatConfig
-from levanter.inference.page_table import PageBatchInfo, PageTable
+from levanter.inference.page_table import PageBatchInfo, PageTableSpec
 from levanter.layers import LayerNormConfigBase, RmsNormConfig
 from levanter.layers.attention import Attention, AttentionBackend, AttentionConfig, AttentionMask, KvPageCache
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
@@ -362,12 +362,12 @@ class LlamaDecoderLayer(eqx.Module):
         output = residual + mlp_output
         return output, kv_cache
 
-    def initial_cache(self, page_table: PageTable, *, dtype) -> KvPageCache:
+    def initial_cache(self, spec: PageTableSpec, *, dtype) -> KvPageCache:
         """
         Creates an empty page cache for this layer. Note that in order to create a decoder state, you
         need to couple the KvPageCache to the PageTable's state with a BatchInfo object.
         """
-        return self.self_attn.empty_page_cache(page_table, dtype=dtype)
+        return self.self_attn.empty_page_cache(spec, dtype=dtype)
 
 
 class LlamaTransformer(eqx.Module):
@@ -439,12 +439,12 @@ class LlamaTransformer(eqx.Module):
 
         return x, kv_cache
 
-    def initial_cache(self, page_table: PageTable, *, dtype) -> KvPageCache:
+    def initial_cache(self, spec: PageTableSpec, *, dtype) -> KvPageCache:
         """
         Creates an empty page cache for this transformer. Note that in order to create a decoder state, you
         need to couple the KvPageCache to the PageTable's state with a BatchInfo object.
         """
-        return self.layers.vmap_via(LlamaDecoderLayer.initial_cache)(page_table, dtype=dtype)
+        return self.layers.vmap_via(LlamaDecoderLayer.initial_cache)(spec, dtype=dtype)
 
 
 class LlamaEmbedding(ModuleWithStateDictSerialization, eqx.Module):
@@ -593,12 +593,12 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
     def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
         return {"transformer": "model", "embeddings": None}
 
-    def initial_cache(self, page_table: PageTable, *, dtype) -> KvPageCache:
+    def initial_cache(self, spec: PageTableSpec, *, dtype) -> KvPageCache:
         """
         Creates an initial cache for this model. Note that in order to create a decoder state, you
         need to couple the KvPageCache to the PageTable's state with a BatchInfo object.
         """
-        return hax.auto_sharded(self.transformer.initial_cache(page_table, dtype=dtype))
+        return hax.auto_sharded(self.transformer.initial_cache(spec, dtype=dtype))
 
     @named_call
     def decode(

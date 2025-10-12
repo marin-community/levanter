@@ -40,7 +40,7 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec
 from jaxtyping import PRNGKeyArray
 
-from ..inference.page_table import PageBatchInfo, PageTable
+from ..inference.page_table import PageBatchInfo, PageTableSpec
 from .normalization import LayerNormConfigBase
 from .rotary import RotaryEmbeddings, RotaryEmbeddingsConfig
 
@@ -1564,13 +1564,8 @@ class Attention(eqx.Module):
 
         return Attention(config, q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rot_embs)
 
-    def empty_page_cache(self, page_table: PageTable, *, dtype) -> "KvPageCache":
-        return KvPageCache.init(
-            page_table,
-            self.config.KVHeads,
-            self.config.HeadSize,
-            dtype=dtype,
-        )
+    def empty_page_cache(self, spec: PageTableSpec, *, dtype) -> "KvPageCache":
+        return KvPageCache.init(spec, self.config.KVHeads, self.config.HeadSize, dtype=dtype)
 
     @named_call
     def __call__(
@@ -1714,20 +1709,20 @@ class KvPageCache(eqx.Module):
     kv_pages: NamedArray  # [Page, Slot, 2 * KVHeads, Embed]
 
     @staticmethod
-    def init(page_table: PageTable, kv_heads: Axis, head_size: Axis, dtype=jnp.float32) -> "KvPageCache":
+    def init(spec: PageTableSpec, kv_heads: Axis, head_size: Axis, dtype=jnp.float32) -> "KvPageCache":
         """
-        Initialize a KvPageCache with the given page table and dimensions.
+        Initialize a KvPageCache with the given page table specification and dimensions.
 
         Args:
-            page_table: The PageTable instance that defines the pages.
+            spec: The layout specification for KV pages.
             kv_heads: Axis for key/value heads.
             head_size: Axis for head size.
             dtype: Data type for the cache.
         """
         kv_pages = hax.zeros(
             {
-                "page": page_table.num_pages,
-                "slot": page_table.page_size,
+                "page": spec.num_pages,
+                "slot": spec.page_size,
                 "kv_head": 2 * kv_heads.size,
                 head_size.name: head_size.size,
             },

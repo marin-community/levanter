@@ -12,14 +12,14 @@ from haliax import Axis
 
 from levanter.inference.engine import InferenceEngine, Request, InferenceEngineConfig
 from levanter.inference.jit_scheduler import SeqDecodingParams
-from levanter.inference.page_table import PageTable
+from levanter.inference.page_table import PageTableSpec
 from levanter.layers.attention import KvPageCache
 
 
 class DummyModel(eqx.Module):
     """Minimal model stub to drive GenerationService for tests.
 
-    - `initial_cache` returns an empty KvPageCache sized to the PageTable.
+    - `initial_cache` returns an empty KvPageCache sized to the page-table spec.
     - `decode` returns constant logits that strongly prefer token `EOS`.
     """
 
@@ -30,11 +30,11 @@ class DummyModel(eqx.Module):
         self.Vocab = Axis("vocab", vocab_size)
         self.eos = eos_id
 
-    def initial_cache(self, page_table: PageTable, *, dtype):
+    def initial_cache(self, spec: PageTableSpec, *, dtype):
         # Use trivial cache dimensions; the cache is unused by this dummy model
         kv_heads = Axis("kv_head", 1)
         head_size = Axis("embed", 1)
-        return KvPageCache.init(page_table, kv_heads, head_size, dtype=dtype)
+        return KvPageCache.init(spec, kv_heads, head_size, dtype=dtype)
 
     def decode(self, input_ids, kv_cache, batch_info, pos_ids):
         # Produce logits that prefer `eos` for every sampled position

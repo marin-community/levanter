@@ -784,7 +784,7 @@ class InferenceEngine:
         assert config.max_pages is not None
 
         table = PageTable.init(config.max_pages, config.max_seqs, config.page_size, max_pages_per_seq)
-        cache = hax.named_jit(model.initial_cache)(table, dtype=config.compute_dtype)
+        cache = hax.named_jit(model.initial_cache)(table.spec(), dtype=config.compute_dtype)
         decode_state = DecodeState.init(
             table,
             max_stop_seqs=config.max_stop_seqs,
@@ -1397,7 +1397,7 @@ class InferenceEngine:
 
             def initial_cache(pages: int) -> int:
                 table = PageTable.init(pages, config.max_seqs, config.page_size, max_pages_per_seq)
-                cache_shape = model.initial_cache(table, dtype=config.compute_dtype)
+                cache_shape = model.initial_cache(table.spec(), dtype=config.compute_dtype)
                 return cache_shape
 
             cache_shape = eqx.filter_eval_shape(initial_cache, num_pages)
