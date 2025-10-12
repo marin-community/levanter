@@ -932,6 +932,7 @@ class InferenceEngine:
         max_num_tokens = np.zeros((max_slots,), dtype=np.int32)
         temperatures = np.zeros((max_slots,), dtype=np.float32)
         prng_keys = np.zeros((max_slots, 2), dtype=np.uint32)
+        ignore_eos = np.zeros((max_slots,), dtype=bool)
         if stop_tokens_template is not None:
             stop_tokens = np.full(
                 (
@@ -985,6 +986,7 @@ class InferenceEngine:
             max_num_tokens[prefill_idx] = np.asarray(seq_params.max_num_tokens, dtype=np.int32).item()
             temperatures[prefill_idx] = np.asarray(seq_params.temperature, dtype=np.float32).item()
             prng_keys[prefill_idx] = np.asarray(seq_params.key, dtype=np.uint32)
+            ignore_eos[prefill_idx] = np.asarray(seq_params.ignore_eos, dtype=bool).item()
             if stop_tokens is not None:
                 if seq_params.stop_tokens is None:
                     stop_tokens[prefill_idx].fill(INVALID)
@@ -1024,6 +1026,7 @@ class InferenceEngine:
                     max_num_tokens[clone_idx] = np.asarray(child_params.max_num_tokens, dtype=np.int32).item()
                     temperatures[clone_idx] = np.asarray(child_params.temperature, dtype=np.float32).item()
                     prng_keys[clone_idx] = np.asarray(child_params.key, dtype=np.uint32)
+                    ignore_eos[clone_idx] = np.asarray(child_params.ignore_eos, dtype=bool).item()
                     if stop_tokens is not None:
                         stop_tokens[clone_idx] = stop_tokens[prefill_idx]
 
@@ -1058,6 +1061,7 @@ class InferenceEngine:
                 ),
                 temperature=jnp.asarray(temperatures, dtype=jnp.float32),
                 key=jnp.asarray(prng_keys, dtype=jnp.uint32),
+                ignore_eos=jnp.asarray(ignore_eos, dtype=bool),
             ),
         )
 

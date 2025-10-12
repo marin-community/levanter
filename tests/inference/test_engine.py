@@ -157,3 +157,56 @@ def test_reuse_with_clones_and_slot_reassignment():
     reqs2 = build_requests(100)
     outputs2 = svc.generate(reqs2)
     assert all(out == [3] for out in outputs2.tokens)
+
+
+def test_ignore_eos_parameter():
+    """Test that ignore_eos parameter correctly controls whether generation stops at EOS tokens."""
+    svc = _build_service()
+
+    prompt = [[1, 2]]
+    stop_tokens = [3]  # DummyModel always emits token 3 (EOS)
+
+    stop_ids = hax.named(jnp.asarray(stop_tokens, dtype=jnp.int32), axis=("position",)).broadcast_axis({"stop_seq": 1})
+
+    # Test 1: ignore_eos=False (default) - should stop after first EOS token
+    seq_params_respect_eos = SeqDecodingParams(
+        max_num_tokens=jnp.array(len(prompt[0]) + 10, dtype=jnp.int32),  # Allow up to 10 tokens
+        stop_tokens=stop_ids,
+        temperature=jnp.array(0.0, dtype=jnp.float32),
+        key=jax.random.PRNGKey(0),
+        ignore_eos=jnp.array(False, dtype=bool),  # Explicitly set to False
+    )
+    req_respect_eos = Request(
+        prompt_tokens=prompt[0], request_id=0, decode_params=seq_params_respect_eos, n_generations=1
+    )
+
+    result_respect_eos = svc.generate([req_respect_eos])
+
+    # Should stop after generating exactly 1 token (the EOS token)
+    assert len(result_respect_eos.tokens[0]) == 1, f"Expected 1 token, got {len(result_respect_eos.tokens[0])}"
+    assert result_respect_eos.tokens[0] == [3], f"Expected [3], got {result_respect_eos.tokens[0]}"
+    assert result_respect_eos.total_generated == 1
+
+    # Test 2: ignore_eos=True - should continue generating until max_num_tokens
+    max_tokens_to_generate = 5
+    seq_params_ignore_eos = SeqDecodingParams(
+        max_num_tokens=jnp.array(len(prompt[0]) + max_tokens_to_generate, dtype=jnp.int32),
+        stop_tokens=stop_ids,
+        temperature=jnp.array(0.0, dtype=jnp.float32),
+        key=jax.random.PRNGKey(1),
+        ignore_eos=jnp.array(True, dtype=bool),  # Set to True to ignore EOS
+    )
+    req_ignore_eos = Request(
+        prompt_tokens=prompt[0], request_id=1, decode_params=seq_params_ignore_eos, n_generations=1
+    )
+
+    result_ignore_eos = svc.generate([req_ignore_eos])
+
+    # Should generate exactly max_tokens_to_generate tokens, all should be EOS (token 3)
+    assert (
+        len(result_ignore_eos.tokens[0]) == max_tokens_to_generate
+    ), f"Expected {max_tokens_to_generate} tokens, got {len(result_ignore_eos.tokens[0])}"
+    assert all(
+        token == 3 for token in result_ignore_eos.tokens[0]
+    ), f"Expected all tokens to be 3, got {result_ignore_eos.tokens[0]}"
+    assert result_ignore_eos.total_generated == max_tokens_to_generate

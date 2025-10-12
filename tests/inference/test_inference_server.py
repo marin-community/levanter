@@ -41,7 +41,7 @@ def baby_llama_config():
             max_seq_len=16,
             max_seqs=2,
             page_size=4,
-            max_queued_tokens=8,
+            max_queued_tokens=16,  # Must be >= max_seqs_in_prefill (default 16)
         ),
         temperature=0.7,
         seed=42,
@@ -503,12 +503,12 @@ def test_logprobs_match_full_forward_pass(test_client, loaded_model, trainer_con
     print(f"Server returned {len(choice.logprobs.content)} tokens:")
     for i, token_logprob in enumerate(choice.logprobs.content):
         token_str = token_logprob.token
-        # Encode the token string to get the ID
-        token_ids = tokenizer.encode(token_str, add_special_tokens=False)
-        print(f"  Token {i}: '{token_str}' -> {token_ids}, logprob={token_logprob.logprob}")
-        if len(token_ids) == 1:
-            generated_token_ids.append(token_ids[0])
-            server_logprobs.append(token_logprob.logprob)
+        token_id = tokenizer.convert_tokens_to_ids(token_str)
+        print(f"  Token {i}: '{token_str}' -> {token_id}, logprob={token_logprob.logprob}")
+        if token_id is None:
+            continue
+        generated_token_ids.append(int(token_id))
+        server_logprobs.append(token_logprob.logprob)
 
     print(f"Generated {len(generated_token_ids)} tokens: {generated_token_ids}")
     print(f"Server logprobs: {server_logprobs}")
@@ -564,3 +564,209 @@ def test_logprobs_match_full_forward_pass(test_client, loaded_model, trainer_con
         assert diff < 3e-3, f"Logprob mismatch at token {i}: server={server_lp}, model={model_lp}, diff={diff}"
 
     print("All logprobs match successfully!")
+
+
+@pytest.mark.slow
+def test_ignore_eos_generates_until_max_tokens(test_client, loaded_model):
+    """Test that ignore_eos=True generates tokens until max_tokens is reached, ignoring stop tokens."""
+    client, server = test_client
+    model, tokenizer = loaded_model
+
+    # Get EOS token ID from tokenizer
+    eos_token_id = tokenizer.eos_token_id
+    eos_token = tokenizer.decode([eos_token_id])
+
+    print(f"EOS token ID: {eos_token_id}, EOS token: '{eos_token}'")
+
+    # Test 1: Without ignore_eos (default behavior) - should stop at EOS or stop token
+    response_with_stop = client.post(
+        "/v1/completions",
+        json={
+            "model": "timinar/baby-llama-58m",
+            "prompt": "Hello",
+            "max_tokens": 10,
+            "temperature": 0.0,
+            "seed": 42,
+            "ignore_eos": False,
+        },
+    )
+
+    assert response_with_stop.status_code == 200
+    completion_with_stop = Completion.model_validate(response_with_stop.json())
+    tokens_with_stop = completion_with_stop.usage.completion_tokens
+
+    print(f"With ignore_eos=False: generated {tokens_with_stop} tokens")
+    print(f"Text: '{completion_with_stop.choices[0].text}'")
+
+    # Test 2: With ignore_eos=True - should generate exactly max_tokens
+    response_ignore_eos = client.post(
+        "/v1/completions",
+        json={
+            "model": "timinar/baby-llama-58m",
+            "prompt": "Hello",
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "seed": 42,
+            "ignore_eos": True,
+        },
+    )
+
+    assert response_ignore_eos.status_code == 200
+    completion_ignore_eos = Completion.model_validate(response_ignore_eos.json())
+    tokens_ignore_eos = completion_ignore_eos.usage.completion_tokens
+
+    print(f"With ignore_eos=True: generated {tokens_ignore_eos} tokens")
+    print(f"Text: '{completion_ignore_eos.choices[0].text}'")
+
+    # With ignore_eos=True, should generate exactly max_tokens
+    assert tokens_ignore_eos == 2, f"Expected exactly 2 tokens, got {tokens_ignore_eos}"
+
+
+@pytest.mark.slow
+def test_ignore_eos_with_explicit_stop_tokens(test_client):
+    """Test that ignore_eos=True ignores explicit stop tokens."""
+    client, server = test_client
+
+    # Use a stop token is the set to the first token that's expected to be generated
+    stop_token = " butterfly"
+
+    # Test 1: Without ignore_eos - should stop at stop token
+    response_with_stop = client.post(
+        "/v1/completions",
+        json={
+            "model": "timinar/baby-llama-58m",
+            "prompt": "The quick brown",
+            "max_tokens": 10,
+            "temperature": 0.7,
+            "seed": 42,
+            "stop": stop_token,
+            "ignore_eos": False,
+        },
+    )
+
+    assert response_with_stop.status_code == 200
+    completion_with_stop = Completion.model_validate(response_with_stop.json())
+    tokens_with_stop = completion_with_stop.usage.completion_tokens
+    text_with_stop = completion_with_stop.choices[0].text
+    # With ignore_eos=True, should generate max_tokens even with stop token
+    assert tokens_with_stop == 1, f"Expected exactly 1 tokens, got {tokens_with_stop}"
+
+    print(f"With stop='{stop_token}' and ignore_eos=False:")
+    print(f"  Generated {tokens_with_stop} tokens")
+    print(f"  Text: '{text_with_stop}'")
+
+    # Test 2: With ignore_eos=True - should ignore stop token
+    response_ignore_eos = client.post(
+        "/v1/completions",
+        json={
+            "model": "timinar/baby-llama-58m",
+            "prompt": "The quick brown",
+            "max_tokens": 10,
+            "temperature": 0.7,
+            "seed": 42,
+            "stop": stop_token,
+            "ignore_eos": True,
+        },
+    )
+
+    assert response_ignore_eos.status_code == 200
+    completion_ignore_eos = Completion.model_validate(response_ignore_eos.json())
+    tokens_ignore_eos = completion_ignore_eos.usage.completion_tokens
+    text_ignore_eos = completion_ignore_eos.choices[0].text
+
+    print(f"With stop='{stop_token}' and ignore_eos=True:")
+    print(f"  Generated {tokens_ignore_eos} tokens")
+    print(f"  Text: '{text_ignore_eos}'")
+
+    # With ignore_eos=True, should generate max_tokens even with stop token
+    assert tokens_ignore_eos == 10, f"Expected exactly 10 tokens, got {tokens_ignore_eos}"
+
+    # Should generate more or equal tokens than without ignore_eos
+    assert (
+        tokens_ignore_eos >= tokens_with_stop
+    ), f"ignore_eos=True ({tokens_ignore_eos}) should generate >= tokens than with stop ({tokens_with_stop})"
+
+
+@pytest.mark.slow
+def test_ignore_eos_with_chat_completion(test_client):
+    """Test that ignore_eos works with chat completions endpoint."""
+    client, server = test_client
+
+    # Test 1: Without ignore_eos (default)
+    response_default = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "timinar/baby-llama-58m",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "seed": 42,
+            "ignore_eos": False,
+        },
+    )
+
+    assert response_default.status_code == 200
+    chat_default = ChatCompletion.model_validate(response_default.json())
+    tokens_default = chat_default.usage.completion_tokens
+
+    print(f"Chat with ignore_eos=False: generated {tokens_default} tokens")
+
+    # Test 2: With ignore_eos=True
+    response_ignore_eos = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "timinar/baby-llama-58m",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "seed": 42,
+            "ignore_eos": True,
+        },
+    )
+
+    assert response_ignore_eos.status_code == 200
+    chat_ignore_eos = ChatCompletion.model_validate(response_ignore_eos.json())
+    tokens_ignore_eos = chat_ignore_eos.usage.completion_tokens
+
+    print(f"Chat with ignore_eos=True: generated {tokens_ignore_eos} tokens")
+
+    # With ignore_eos=True, should generate exactly max_tokens
+    assert tokens_ignore_eos == 2, f"Expected exactly 2 tokens, got {tokens_ignore_eos}"
+
+    # Should generate at least as many tokens as default
+    assert (
+        tokens_ignore_eos >= tokens_default
+    ), f"ignore_eos=True ({tokens_ignore_eos}) should generate >= tokens than default ({tokens_default})"
+
+
+@pytest.mark.slow
+def test_ignore_eos_with_multiple_generations(test_client):
+    """Test that ignore_eos works with n > 1 (multiple generations)."""
+    client, server = test_client
+
+    response = client.post(
+        "/v1/completions",
+        json={
+            "model": "timinar/baby-llama-58m",
+            "prompt": "Once upon a time",
+            "max_tokens": 2,
+            "temperature": 0.7,
+            "seed": 42,
+            "n": 2,
+            "ignore_eos": True,
+        },
+    )
+
+    assert response.status_code == 200
+    completion = Completion.model_validate(response.json())
+
+    assert len(completion.choices) == 2
+
+    for i, choice in enumerate(completion.choices):
+        print(f"Choice {i}: generated {len(choice.text.split())} words")
+        print(f"  Text: '{choice.text}'")
+
+    # Both generations should have exactly max_tokens
+    assert completion.usage.completion_tokens == 4, f"Expected 4 tokens total (2 * 2), got {completion.usage.completion_tokens}"
+
+    print("All generations produced max_tokens with ignore_eos=True")

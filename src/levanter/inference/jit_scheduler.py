@@ -48,6 +48,7 @@ class SeqDecodingParams(eqx.Module):
     stop_tokens: ht.i32[NamedArray, "stop_seq position"] | None
     temperature: jnp.ndarray
     key: jaxtyping.PRNGKeyArray
+    ignore_eos: jnp.ndarray = eqx.field(default_factory=lambda: jnp.array(False, dtype=bool))
 
     @staticmethod
     def default() -> "SeqDecodingParams":
@@ -60,6 +61,7 @@ class SeqDecodingParams(eqx.Module):
             stop_tokens=None,
             temperature=jnp.array(0.0, dtype=jnp.float32),
             key=jax.random.PRNGKey(0),
+            ignore_eos=jnp.array(False, dtype=bool),
         )
 
 
@@ -109,6 +111,8 @@ class DecodeState(eqx.Module):
     """temperature for sampling. 0 means greedy sampling"""
     prng_keys: jaxtyping.PRNGKeyArray
     """one per sequence, used for sampling. This is a JAX PRNG key, so it can be split to get new keys."""
+    ignore_eos: ht.bool_[NamedArray, "seq"]
+    """If True, ignore EOS/stop tokens and continue generation until max_num_tokens is reached."""
 
     # Token queue for pending decode work
     tqueue: "TokenQueue"
@@ -269,6 +273,7 @@ class DecodeState(eqx.Module):
                 max_num_tokens=new_state.max_num_tokens.at["seq", local_slot_id].set(seq_params.max_num_tokens),
                 temperature=new_state.temperature.at["seq", local_slot_id].set(seq_params.temperature),
                 prng_keys=self.prng_keys.at[local_slot_id].set(seq_params.key),  # type: ignore[name-defined]
+                ignore_eos=new_state.ignore_eos.at["seq", local_slot_id].set(seq_params.ignore_eos),
             )
             match (new_state.stop_tokens, seq_params.stop_tokens):
                 case (None, None):
@@ -330,12 +335,16 @@ class DecodeState(eqx.Module):
                 max_allowed = self.max_num_tokens["seq", sid].scalar()
                 len_done = (pos + 1) >= max_allowed
                 stop_done = False
+                # Only check for stop tokens if ignore_eos is False
                 if self.stop_tokens is not None:
                     stop_len = self.stop_tokens.axis_size("position")
                     row = tkns["seq", sid].array
                     padded = jnp.concatenate([jnp.full((stop_len,), INVALID, dtype=jnp.int32), row])
                     tail = jax.lax.dynamic_slice(padded, (pos + 1,), (stop_len,))
-                    stop_done = is_stop_signal(hax.named(tail, axis=("position",)), self.stop_tokens["seq", sid]).array
+                    stop_signal = is_stop_signal(hax.named(tail, axis=("position",)), self.stop_tokens["seq", sid]).array
+                    # Only consider stop signal if ignore_eos is False
+                    should_check_stop = ~self.ignore_eos["seq", sid].scalar()
+                    stop_done = stop_signal & should_check_stop
                 f = f.at["seq", sid].set(len_done | stop_done)
                 should_purge = should_purge.at["position", i].set(len_done | stop_done)
 
@@ -442,6 +451,7 @@ max_num_tokens: {max_num_tokens}
             ),
             temperature=hax.ones({"seq": max_seqs}, dtype=jnp.float32),
             prng_keys=jax.vmap(jax.random.PRNGKey, axis_size=max_seqs, in_axes=None)(0),
+            ignore_eos=hax.zeros({"seq": max_seqs}, dtype=bool),
             tqueue=TokenQueue.init(max_queued_tokens),
             finished=hax.zeros({"seq": max_seqs}, dtype=bool),
         )

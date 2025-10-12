@@ -85,6 +85,7 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Optional[Union[str, Dict]] = None
     parallel_tool_calls: Optional[bool] = None
     user: Optional[str] = None
+    ignore_eos: Optional[bool] = Field(default=False, description="Ignore EOS tokens and continue until max_tokens")
 
 
 class CompletionRequest(BaseModel):
@@ -108,6 +109,7 @@ class CompletionRequest(BaseModel):
     temperature: float = Field(default=1.0, description="Sampling temperature")
     top_p: Optional[float] = None
     user: Optional[str] = None
+    ignore_eos: Optional[bool] = Field(default=False, description="Ignore EOS tokens and continue until max_tokens")
 
 
 class TokensRequest(BaseModel):
@@ -162,6 +164,7 @@ class InferenceRequest:
     future: asyncio.Future
     n_generations: int = 1
     enable_logprobs: bool = False
+    ignore_eos: bool = False
 
 
 @dataclass
@@ -272,6 +275,7 @@ class InferenceContext:
         future: asyncio.Future,
         n_generations: int = 1,
         enable_logprobs: bool = False,
+        ignore_eos: bool = False,
     ) -> str:
         """Submit a request to the inference queue"""
         assert self.shutdown_event.is_set() is False, "InferenceContext is shut down"
@@ -288,6 +292,7 @@ class InferenceContext:
             future=future,
             n_generations=n_generations,
             enable_logprobs=enable_logprobs,
+            ignore_eos=ignore_eos,
         )
 
         logger.info("Enqueuing request %s", request)
@@ -390,6 +395,7 @@ class InferenceContext:
                 stop_tokens=stop_ids,
                 temperature=jnp.array(req.temperature, dtype=jnp.float32),
                 key=jrandom.PRNGKey(req.seed if req.seed is not None else i),
+                ignore_eos=jnp.array(req.ignore_eos, dtype=bool),
             )
 
             service_req = Request(
@@ -507,6 +513,7 @@ async def _create_completion(ctx: InferenceContext, request: CompletionRequest) 
                 future=future,
                 n_generations=request.n or 1,
                 enable_logprobs=bool(request.logprobs),
+                ignore_eos=request.ignore_eos or False,
             )
 
         # Wait for all results
@@ -626,6 +633,7 @@ async def _create_chat_completion(ctx: InferenceContext, request: ChatCompletion
             future=future,
             n_generations=request.n or 1,
             enable_logprobs=request.logprobs,
+            ignore_eos=request.ignore_eos or False,
         )
 
         # Wait for result
