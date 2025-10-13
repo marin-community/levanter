@@ -740,8 +740,8 @@ class LevanterHarnessLM(TemplateLM):
         engine_cfg = InferenceEngineConfig(
             max_stop_seqs=max_stop_seqs,
             max_stop_tokens=max_stop_tokens,
-            max_pages=131072,  # Must be equals to max_seqs * max_pages_per_seq
-            max_seqs=256,     # Reduced from 256
+            max_seq_len=max_length,
+            max_seqs=256,
             page_size=8,
             max_pages_per_seq=512,  # Reduced from 512
             compute_dtype=jnp.bfloat16,
