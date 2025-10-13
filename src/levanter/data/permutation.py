@@ -148,3 +148,62 @@ class EraShufflingDataset(AsyncDataset[T_co]):
         # wait until we hit the next era
         next_era_end = (length // self.era_length + 1) * self.era_length
         return await self.dataset.wait_until_len_at_least(next_era_end)
+
+
+class EpochPermutationDataset(AsyncDataset[T_co]):
+    """
+    A dataset wrapper that applies a fresh permutation per epoch (wrap) of the underlying finite dataset.
+
+    - The underlying dataset must be finite (has a known async_len()).
+    - This wrapper reports itself as infinite so that upstream mixers (e.g., MixtureDataset with restart)
+      do not modulo-wrap indices before they reach us. We then compute epoch = i // L and pos = i % L and
+      apply a per-epoch permutation constructed via fold_in(key, epoch).
+    """
+
+    def __init__(self, dataset: AsyncDataset[T_co], key: PRNGKeyArray, perm_type: PermType = "feistel"):
+        super().__init__()
+        self.dataset = dataset
+        self.key = key
+        self._perm_type = perm_type
+        self._length: Optional[int] = None
+
+        @alru_cache(maxsize=8)
+        async def _perm_for_epoch(epoch: int) -> Permutation:
+            L = await self._get_length()
+            ek = jax.random.fold_in(self.key, epoch)
+            return Permutation.make(self._perm_type, L, ek)
+
+        self._perm_for_epoch = _perm_for_epoch
+
+    async def _get_length(self) -> int:
+        if self._length is None:
+            self._length = await self.dataset.async_len()
+        return self._length
+
+    async def _map_index(self, i: int) -> int:
+        L = await self._get_length()
+        if L <= 0:
+            raise ValueError("Underlying dataset length must be positive")
+        epoch, pos = divmod(i, L)
+        perm = await self._perm_for_epoch(epoch)
+        return int(perm(pos))
+
+    async def async_len(self) -> int:
+        # Infinite stream by design (no known final length)
+        raise ValueError("EpochPermutationDataset is an unbounded stream under restart.")
+
+    async def final_length_is_known(self) -> bool:
+        return False
+
+    def is_finite(self) -> bool:
+        return False
+
+    async def current_len(self) -> Optional[int]:
+        return None
+
+    async def getitem_async(self, index: int) -> T_co:
+        return await self.dataset.getitem_async(await self._map_index(index))
+
+    async def get_batch(self, indices: Sequence[int]) -> Sequence[T_co]:
+        mapped = [await self._map_index(i) for i in indices]
+        return await self.dataset.get_batch(mapped)

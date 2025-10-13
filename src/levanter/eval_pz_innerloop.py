@@ -1,12 +1,9 @@
 # Copyright 2025 The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
-import pathlib
-import tempfile
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Union
-import traceback
 
 import jax
 import jax.numpy as jnp
@@ -16,7 +13,6 @@ import haliax as hax
 from haliax.partitioning import ResourceMapping, set_mesh
 
 import levanter
-from levanter.books.util import create_pz_histogram, create_pz_histogram_linear
 from levanter.callbacks import StepInfo
 from levanter.data.text import LMMixtureDatasetConfig, SingleDatasetLMConfigBase
 from levanter.models.lm_model import LmExample, LmHeadModel
@@ -66,7 +62,6 @@ def pz_eval_callback(
     device_mesh=None,
 ):
     pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-    decode_once_state: dict = {}
     # Persistent state across callback invocations (per process)
     caches_state = None  # set on first call
     selected_indices_by_ds: dict[str, List[int]] = {}
@@ -78,6 +73,7 @@ def pz_eval_callback(
         # Gate all console printing behind config.verbose (default False)
         if not config.verbose:
             return
+        # this is good
         if all_hosts or jax.process_index() == 0:
             print(f"[PZ][{_ts()}][proc={jax.process_index()}] {msg}", flush=True)
 
@@ -132,7 +128,7 @@ def pz_eval_callback(
                 _log_ctx(prefix="after_scalar_forward")
         return -float(np.array(total_nll))
 
-    def _run_for_model(model: LmHeadModel, *, log_histogram_now: bool, curr_step: int):
+    def _run_for_model(model: LmHeadModel, *, curr_step: int):
         # Only process 0 does tracker I/O. All hosts print phase timings for debugging.
         _log(f"step={curr_step} | BEGIN pz_eval inner-loop")
         _log(
@@ -395,127 +391,56 @@ def pz_eval_callback(
                 mean_pz = median_pz = max_pz = 0.0
 
             ds_elapsed_time = time.perf_counter() - ds_start_time
-            if jax.process_index() == 0:
-                metrics = {
-                    f"pz_eval/{ds_name}/num_windows": int(len(pz_values)),
-                    f"pz_eval/{ds_name}/num_documents": (
-                        int(len(set(doc_indices_for_windows))) if len(pz_values) > 0 else 0
-                    ),
-                    f"pz_eval/{ds_name}/mean_pz": mean_pz,
-                    f"pz_eval/{ds_name}/median_pz": median_pz,
-                    f"pz_eval/{ds_name}/max_pz": max_pz,
-                    # Back-compat: log the first evaluated document length under doc_len
-                    f"pz_eval/{ds_name}/doc_len": int(first_eval_len or 0),
-                    f"pz_eval/{ds_name}/chunk_size": int(N),
-                    f"pz_eval/{ds_name}/prompt_tokens": int(P),
-                    f"pz_eval/{ds_name}/suffix_tokens": int(N - P),
-                    f"pz_eval/{ds_name}/cursor_inc_tokens": int(S),
-                    f"pz_eval/{ds_name}/eval_time_seconds": ds_elapsed_time,
-                }
-                _log(f"dataset={ds_name} | metrics: {metrics}")
-                levanter.tracker.log(metrics, step=curr_step)
-                _log(f"dataset={ds_name} | logged scalars (took {ds_elapsed_time:.2f}s)")
+            metrics = {
+                f"pz_eval/{ds_name}/num_windows": int(len(pz_values)),
+                f"pz_eval/{ds_name}/num_documents": (
+                    int(len(set(doc_indices_for_windows))) if len(pz_values) > 0 else 0
+                ),
+                f"pz_eval/{ds_name}/mean_pz": mean_pz,
+                f"pz_eval/{ds_name}/median_pz": median_pz,
+                f"pz_eval/{ds_name}/max_pz": max_pz,
+                # Back-compat: log the first evaluated document length under doc_len
+                f"pz_eval/{ds_name}/doc_len": int(first_eval_len or 0),
+                f"pz_eval/{ds_name}/chunk_size": int(N),
+                f"pz_eval/{ds_name}/prompt_tokens": int(P),
+                f"pz_eval/{ds_name}/suffix_tokens": int(N - P),
+                f"pz_eval/{ds_name}/cursor_inc_tokens": int(S),
+                f"pz_eval/{ds_name}/eval_time_seconds": ds_elapsed_time,
+            }
+            # Log a value histogram of P(z) in [0, 1] with 10 bins of width 0.1
+            # This mirrors the tracker Histogram used for entropy, but with fixed edges.
+            if len(pz_values) > 0:
+                arr = np.asarray(pz_values, dtype=jnp.float32)
+                # Clip to [0, 1] for safety before binning
+                arr = np.clip(arr, 0.0, 1.0)
+                # Fixed 10 bins from 0.0 to 1.0 inclusive (edges length = 11)
+                edges = jnp.linspace(0.0, 1.0, 11, dtype=jnp.float32)
+                counts, edges_out = jnp.histogram(arr, bins=edges)
+                counts = counts.astype(jnp.int32)
 
-                # Log a value histogram of P(z) in [0, 1] with 10 bins of width 0.1
-                # This mirrors the tracker Histogram used for entropy, but with fixed edges.
-                if len(pz_values) > 0:
-                    arr = jnp.asarray(pz_values, dtype=jnp.float32)
-                    # Clip to [0, 1] for safety before binning
-                    arr = jnp.clip(arr, 0.0, 1.0)
-                    # Fixed 10 bins from 0.0 to 1.0 inclusive (edges length = 11)
-                    edges = jnp.linspace(0.0, 1.0, 11, dtype=jnp.float32)
-                    counts, edges_out = jnp.histogram(arr, bins=edges)
-                    counts = counts.astype(jnp.int32)
-
-                    # Populate Histogram fields
-                    h_min = arr.min()
-                    h_max = arr.max()
-                    h_num = int(arr.size)
-                    h_sum = arr.sum()
-                    h_sum_sq = (arr**2).sum()
-                    hist = Histogram(h_min, h_max, h_num, h_sum, h_sum_sq, edges_out, counts)
-
-                    levanter.tracker.log({f"pz_eval/{ds_name}/pz_hist": hist}, step=curr_step)
-                    _log(f"dataset={ds_name} | logged pz_hist with fixed [0,1] bins (10 bins)")
-
-            # Artifacts
-            if len(pz_values) > 0 and jax.process_index() == 0:
-                if config.histogram and log_histogram_now:
-                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
-                        temp_hist_path = tmp_file.name
-                    title = f"{ds_name} - P(z) over first doc"
-                    if config.histogram_linear:
-                        _ = create_pz_histogram_linear(
-                            pz_list=np.asarray(pz_values),
-                            threshold=config.pz_threshold,
-                            save_path=temp_hist_path,
-                            book_title=title,
-                        )
-                    else:
-                        _ = create_pz_histogram(
-                            pz_list=np.asarray(pz_values),
-                            threshold=config.pz_threshold,
-                            save_path=temp_hist_path,
-                            book_title=title,
-                        )
-                    _log(f"dataset={ds_name} | logging histogram artifact")
-                    levanter.tracker.current_tracker().log_artifact(
-                        temp_hist_path, name=f"pz_hist_{ds_name}.png", type="plot"
-                    )
-                    pathlib.Path(temp_hist_path).unlink(missing_ok=True)
-
-                if config.pz_npz:
-                    with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp_npz:
-                        np.savez(
-                            tmp_npz.name,
-                            pz_values=np.asarray(pz_values, dtype=np.float32),
-                            span_ranges=np.asarray(span_ranges, dtype=np.int32),
-                            doc_indices=np.asarray(doc_indices_for_windows, dtype=np.int32),
-                            config_info=np.asarray([N, P, S], dtype=np.int32),
-                        )
-                        tmp_npz_path = tmp_npz.name
-                    _log(f"dataset={ds_name} | logging NPZ artifact")
-                    levanter.tracker.current_tracker().log_artifact(
-                        tmp_npz_path, name=f"pz_values_{ds_name}.npz", type="data"
-                    )
-                    pathlib.Path(tmp_npz_path).unlink(missing_ok=True)
-
-            # Preview decode once (use the first selected document)
-            if config.decode_preview is not None and jax.process_index() == 0:
-                state_key = f"{ds_name}__decoded"
-                if not decode_once_state.get(state_key, False):
-                    try:
-                        preview_doc = selected_docs[0]
-                        if config.doc_tokens is None:
-                            preview_eval_len = int(preview_doc.shape[0])
-                        else:
-                            preview_eval_len = int(min(int(config.doc_tokens), int(preview_doc.shape[0])))
-                        preview_len = int(min(int(config.decode_preview), preview_eval_len))
-                        preview_ids = preview_doc[:preview_len].tolist()
-                        preview_text = tokenizer.decode(preview_ids, skip_special_tokens=False)
-                        meta = {
-                            f"pz_eval/{ds_name}/preview_text": preview_text,
-                            f"pz_eval/{ds_name}/preview_token_sum": int(sum(preview_ids)),
-                        }
-                        if config.verify_treecache:
-                            meta[f"pz_eval/{ds_name}/first_doc_len"] = int(preview_doc.shape[0])
-                        levanter.tracker.log(meta, step=curr_step)
-                        decode_once_state[state_key] = True
-                    except Exception:
-                        pass
+                # Populate Histogram fields
+                h_min = arr.min()
+                h_max = arr.max()
+                h_num = int(arr.size)
+                h_sum = arr.sum()
+                h_sum_sq = (arr**2).sum()
+                hist = jax.device_get(Histogram(h_min, h_max, h_num, h_sum, h_sum_sq, edges_out, counts))
+            # we crash here!
+            levanter.tracker.log(metrics, step=curr_step)
+            _log(f"dataset={ds_name} | metrics: {metrics}")
+            levanter.tracker.log({f"pz_eval/{ds_name}/pz_hist": hist}, step=curr_step)
 
             results[ds_name] = True
 
         eval_total_time = time.time() - eval_start_time
-        if jax.process_index() == 0:
-            levanter.tracker.log(
-                {
-                    "pz_eval/total_eval_time_seconds": eval_total_time,
-                    "pz_eval/num_datasets_evaluated": len(results),
-                },
-                step=curr_step,
-            )
-            _log(f"total P(z) eval time: {eval_total_time:.2f}s for {len(results)} dataset(s)")
+        levanter.tracker.log(
+            {
+                "pz_eval/total_eval_time_seconds": eval_total_time,
+                "pz_eval/num_datasets_evaluated": len(results),
+            },
+            step=curr_step,
+        )
+        _log(f"total P(z) eval time: {eval_total_time:.2f}s for {len(results)} dataset(s)")
 
         return results
 
@@ -528,30 +453,10 @@ def pz_eval_callback(
         _log(f"entering P(z) callback for step={int(step.step)}", all_hosts=True)
         model = step.eval_model
 
-        # Only process 0 logs to tracker
-        if jax.process_index() == 0:
-            # Heartbeat metric to confirm W&B visibility at each callback tick
-            levanter.tracker.log({"pz_eval/heartbeat": 1}, step=int(step.step))
-            _log("logged heartbeat=1")
-
-        log_hist = True
-        if config.histogram and config.histogram_every_steps is not None:
-            try:
-                log_hist = step.step % int(config.histogram_every_steps) == 0
-            except Exception:
-                log_hist = False
-
-        # Wrap in try-except to surface errors instead of silent hangs
-        try:
-            t0 = time.perf_counter()
-            _run_for_model(model, log_histogram_now=log_hist, curr_step=int(step.step))
-            t1 = time.perf_counter()
-            _log(f"finished P(z) callback in {t1 - t0:.3f}s")
-        except Exception as e:
-            # Print error with process index for debugging multi-host issues
-            _log(f"ERROR: {e}")
-            _log(f"Traceback:\n{traceback.format_exc()}")
-            raise
+        t0 = time.perf_counter()
+        _run_for_model(model, curr_step=int(step.step))
+        t1 = time.perf_counter()
+        _log(f"finished P(z) callback in {t1 - t0:.3f}s")
 
     return cb
 

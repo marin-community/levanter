@@ -49,6 +49,7 @@ from levanter.data.dataset import EpochDataset, MappedAsyncDataset
 from levanter.data.mixture import MixtureDataset, StopStrategy, rescale_mixture_schedule_for_batch_schedule
 from levanter.data.packing import GreedyPrepackedDataset
 from levanter.data.passthrough_tokenizer import PassthroughTokenizer
+from levanter.data.permutation import EpochPermutationDataset
 from levanter.models.lm_model import LmExample
 from levanter.schedule import BatchSchedule
 from levanter.store.cache import CacheMetadata, CacheOptions, TreeCache
@@ -541,8 +542,11 @@ class LMTaskConfig(abc.ABC):
     """
     Type of permutation to use for shuffle.
 
-    If None, defaults to linear, but this will change in the future since Feistel is better.
+    If None, defaults to feistel.
     """
+    shuffle_per_epoch: bool = False
+    """If True, wrap each training component dataset with an EpochPermutationDataset so each wrap/epoch gets a
+    fresh permutation (deterministic via fold_in on the base key). Applied after slicing (e.g., max_train_batches)."""
 
     @cached_property
     def the_tokenizer(self) -> HfTokenizer:
@@ -1007,15 +1011,16 @@ class SingleDatasetLMConfigBase(LmDatasetSourceConfigBase, LMTaskConfig):
 
         perm_type = self.permutation_type
         if perm_type is None:
-            logger.warning(
-                "Defaulting to linear permutation for shuffling. This will change to Feistel in the future."
-            )
-            perm_type = "linear"
+            # Default to Feistel (robust PRP for arbitrary lengths)
+            perm_type = "feistel"
 
         if self.shuffle is True:
             ds = ds.shuffle(key, perm_type=perm_type)
         elif isinstance(self.shuffle, int) and self.shuffle > 0:
             ds = ds.era_shuffle(self.shuffle, key=key, perm_type=perm_type)
+
+        if getattr(self, "shuffle_per_epoch", False):
+            ds = EpochPermutationDataset(ds, key=key, perm_type=perm_type)  # type: ignore
 
         if epochs:
             logger.info("Wrapping dataset in epoch dataset")
@@ -1235,10 +1240,8 @@ class LMMixtureDatasetConfig(LMTaskConfig):
         # the "stable batch" property of the mixture dataset.
         perm_type = self.permutation_type
         if perm_type is None and self.shuffle is not False:
-            logger.warning(
-                "Defaulting to linear permutation for shuffling. This will change to Feistel in the future."
-            )
-            perm_type = "linear"
+            # Default to Feistel (robust PRP for arbitrary lengths)
+            perm_type = "feistel"
 
         def shuffle_ds(ds, key):
             if self.shuffle is True:
@@ -1295,6 +1298,18 @@ class LMMixtureDatasetConfig(LMTaskConfig):
                     ), f"Max sequences for {name} ({num_sequences}) is greater than the dataset size ({len_dataset})"
                     logger.info(f"Selecting {num_sequences} sequences from {name} training set of size {len_dataset}")
                     datasets[name] = ds.slice_dataset(end_index=num_sequences)
+
+        # Apply per-epoch permutation after slicing so the epoch length is the post-slice length.
+        if self.shuffle_per_epoch:
+            perm_type_epoch = self.permutation_type or "feistel"
+            key_iter2 = key_iterator(key)
+            new_datasets: Dict[str, AsyncDataset[LmExample]] = {}
+            for name, ds in datasets.items():
+                # fold in a small stable hash of the name for determinism
+                name_fold = int(np.frombuffer(name.encode("utf-8"), dtype=np.uint8).sum())
+                dkey = jax.random.fold_in(next(key_iter2), name_fold)
+                new_datasets[name] = EpochPermutationDataset(ds, key=dkey, perm_type=perm_type_epoch)  # type: ignore
+            datasets = new_datasets
 
         return datasets
 
