@@ -794,7 +794,10 @@ class LevanterHarnessLM(TemplateLM):
 
         # Pass the callback to the engine if profiling is enabled
         step_callback = decode_step_callback if self.profiler_config.enabled else None
-        result = engine.generate(gen_requests, step_callback=step_callback)
+        # Enable token printing for generation tasks
+        print_tokens = True  # Set to True to print tokens as they are generated
+        print_every_n = 100    # Print every N tokens (1 = print all tokens)
+        result = engine.generate(gen_requests, step_callback=step_callback, print_tokens=print_tokens, print_every_n=print_every_n)
 
         # Decode first generation per request (LM Harness expects one string per request)
         outputs: list[str] = []
@@ -1159,7 +1162,7 @@ def run_lm_eval_harness(
     # Build both the tasks and the per-task additional stop strings map
     tasks_to_run, task_stop_map = config.to_task_dict_and_stop_map()
 
-    outputs = _actually_run_eval_harness(config, model, tasks_to_run, tokenizer, EvalBatch, axis_resources, mp, profiler_config, task_stop_map)
+    outputs = _actually_run_eval_harness(config, model, tasks_to_run, tokenizer, EvalBatch, axis_resources, mp, task_stop_map, profiler_config)
 
     return outputs
 
@@ -1172,8 +1175,8 @@ def _actually_run_eval_harness(
     EvalBatch: haliax.Axis,
     axis_resources: ResourceMapping,
     mp: jmp.Policy | None,
-    profiler_config: ProfilerConfig | None = None,
     task_stop_map: dict[str, list[str]],
+    profiler_config: ProfilerConfig | None = None,
 ) -> dict | None:
     """
     Actually run the LM Eval Harness on the given model and tasks. This is a separate function so that it can be used
