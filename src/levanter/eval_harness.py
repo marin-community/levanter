@@ -25,7 +25,7 @@ import json
 import logging
 import tempfile
 import typing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Iterator, List, Optional, Tuple, Union
 
@@ -921,7 +921,7 @@ class TaskConfig:
     """Jinja2 template string to process a sample into a list of possible string choices for multiple_choice tasks. """
 
     # Extra Levanter-only config to control generation stops per task
-    additional_stop_strings: list[str] | None = ['<|end_think|>']
+    additional_stop_strings: list[str] | None = field(default_factory=lambda: ['<|end_think|>'])
 
     def to_dict(self):
         base_dict = dataclasses.asdict(self)
