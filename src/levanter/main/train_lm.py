@@ -18,6 +18,7 @@ import equinox as eqx
 import jax.numpy as jnp
 import jax.random as jrandom
 
+from jax.experimental import multihost_utils
 import haliax as hax
 from haliax import Axis
 from haliax.partitioning import named_jit, round_axis_for_partitioning
@@ -67,6 +68,101 @@ print_host_memory_usage()
 logger = logging.getLogger(__name__)
 
 
+def _to_host_numpy(x):
+    """Converts possibly sharded global jax.Array to a host-local numpy array.
+
+    On multi-host TPU, fetching a global jax.Array directly on one host fails.
+    We reconstruct the global array by materializing local shards on each host,
+    allgathering them across processes, and summing (since shards are disjoint).
+    """
+    if isinstance(x, jax.Array):
+        # Fast path if already fully addressable on this process
+        if getattr(x, "is_fully_addressable", False):
+            return np.asarray(jax.device_get(x))
+
+        # Non-addressable global array: return None to signal shard-wise saving
+        return None
+
+    # Non-jax types: best-effort numpy conversion
+    return np.asarray(x)
+
+
+def _save_array_tpu_safe(out_dir: str, filename: str, array, gather_to_single_file: bool = False) -> None:
+    """Saves arrays in a way that works on multi-host TPU.
+
+    - If the array is fully addressable on this host, only rank 0 writes a single file.
+    - If the array is a global, non-addressable jax.Array:
+        - If gather_to_single_file=False (default): each host writes its local shards
+          to a per-host file named `{filename}.r{process_index}.npy`.
+        - If gather_to_single_file=True: all hosts gather the array and rank 0 saves
+          a single file (WARNING: may cause OOM for large arrays).
+    - Non-jax arrays are saved only by rank 0.
+    """
+    if array is None:
+        return
+
+    # Extract underlying array from NamedArray if needed
+    if hasattr(array, 'array') and hasattr(array, 'axes'):
+        # This is likely a haliax NamedArray
+        array = array.array
+
+    # Check if this is a distributed jax.Array
+    is_jax_array = isinstance(array, jax.Array)
+    is_fully_addressable = False
+
+    if is_jax_array:
+        # Check if array is fully addressable (all data is on local devices)
+        try:
+            is_fully_addressable = array.is_fully_addressable
+        except AttributeError:
+            # Fallback: if we can't determine, assume it's distributed
+            is_fully_addressable = False
+
+    # Non-jax arrays: save from rank 0 only
+    if not is_jax_array:
+        if jax.process_index() != 0:
+            return
+        array_np = np.asarray(array)
+        out_path = fsspec_utils.join_path(out_dir, filename)
+        fs, plain_path = fsspec.core.url_to_fs(out_path)
+        with fs.open(plain_path, "wb") as f:
+            np.save(f, array_np)
+        return
+
+    # Fully addressable jax.Array: save from rank 0 only
+    if is_fully_addressable:
+        if jax.process_index() != 0:
+            return
+        array_np = _to_host_numpy(array)
+        out_path = fsspec_utils.join_path(out_dir, filename)
+        fs, plain_path = fsspec.core.url_to_fs(out_path)
+        with fs.open(plain_path, "wb") as f:
+            np.save(f, array_np)
+        return
+
+    # Global non-addressable jax.Array
+    if gather_to_single_file:
+        # Gather to all hosts and save single file from rank 0
+        from jax.experimental import multihost_utils
+        gathered = multihost_utils.process_allgather(array, tiled=True)
+        if jax.process_index() == 0:
+            array_np = np.asarray(gathered)
+            out_path = fsspec_utils.join_path(out_dir, filename)
+            fs, plain_path = fsspec.core.url_to_fs(out_path)
+            with fs.open(plain_path, "wb") as f:
+                np.save(f, array_np)
+    else:
+        # Default: save per-host shard files
+        local_full = np.zeros(array.shape, dtype=array.dtype)
+        for shard in array.addressable_shards:
+            local_full[shard.index] = np.asarray(jax.device_get(shard.data))
+
+        shard_filename = f"{filename}.r{jax.process_index()}"
+        out_path = fsspec_utils.join_path(out_dir, shard_filename)
+        fs, plain_path = fsspec.core.url_to_fs(out_path)
+        with fs.open(plain_path, "wb") as f:
+            np.save(f, local_full)
+
 @dataclass
 class TrainLmConfig:
     data: Union[SingleDatasetLMConfig, LMMixtureDatasetConfig] = field(default_factory=UrlSingleDatasetLMConfig)
@@ -104,6 +200,7 @@ class TrainLmConfig:
 
     out_dir: str = 'out_dir'
     cfx_seed: int = None
+    drop_rate: float = 0.05
     train_only: bool = False
 
     load_debug_weights: bool = False
@@ -415,23 +512,35 @@ def main(config: TrainLmConfig):
 
         if config.train_only and config.cfx_seed is not None:
             # randomly set 5% of indices to 0
-            data_weight_vector = jax.random.bernoulli(jax.random.PRNGKey(config.cfx_seed), 0.95, data_weight_vector.shape).astype(jnp.float32)
+            data_weight_vector = jax.random.bernoulli(jax.random.PRNGKey(config.cfx_seed), 1-config.drop_rate, data_weight_vector.shape).astype(jnp.float32)
             #data_weight_vector = data_weight_vector.at[:1024*40].set(1.0)
         print(f"data_weight_vector: {data_weight_vector[:100]}")
-        # save data_weight_vector to out_dir
+        # save data_weight_vector to out_dir (TPU-safe)
         if True:
             out_dir = config.out_dir
             fsspec_utils.mkdirs(out_dir)
+            _save_array_tpu_safe(out_dir, 'data_weight_vector.npy', data_weight_vector)
 
-            def _save_array(filename, array):
-                if array is None:
-                    return
-                out_path = fsspec_utils.join_path(out_dir, filename)
-                fs, plain_path = fsspec.core.url_to_fs(out_path)
-                with fs.open(plain_path, "wb") as f:
-                    np.save(f, array)
+        # Initialize global loss_masks indicator array (1D boolean array)
+        # Each entry is 1 if the example has any non-zero loss_mask, 0 otherwise
+        # Create as a sharded array along batch dimension to match training data sharding
+        batch_size = trainer.config.train_batch_size
+        total_examples = trainer.config.num_train_steps * batch_size
 
-            _save_array('data_weight_vector.npy', data_weight_vector)
+        # Create sharded array: shard along the batch dimension (axis 0)
+        # This matches how training batches are sharded across devices
+        from jax.sharding import NamedSharding, PartitionSpec
+
+        # Get the current mesh and create sharding spec
+        mesh = trainer.device_mesh
+        # Map batch axis to physical "data" axis in the mesh
+        # The mesh typically has axes like ("data", "model")
+        sharding = NamedSharding(mesh, PartitionSpec("data"))
+
+        # Create the array with explicit sharding
+        loss_masks_global = jax.device_put(jnp.zeros(total_examples, dtype=jnp.int32), sharding)
+
+        logger.info(f"[LossMask] Initialized global loss_masks indicator array with shape: {loss_masks_global.shape}, sharding: {loss_masks_global.sharding}")
 
         # If an eval harness is specified, build a reward loader from its tasks (e.g., arc_easy)
         reward_loader = val_loader
@@ -470,28 +579,29 @@ def main(config: TrainLmConfig):
             data_weight_vector,
             segment_starts,
             train_only=config.train_only,
+            loss_masks_global=loss_masks_global,
         )
-        reward, metagrads, dataset_ids_global, local_indices_global = ret
+        reward, metagrads, dataset_ids_global, local_indices_global, loss_masks_global = ret
         save_success = False
         try:
-            if jax.process_index() == 0:
-                out_dir = config.out_dir
-                fsspec_utils.mkdirs(out_dir)
+            out_dir = config.out_dir
+            fsspec_utils.mkdirs(out_dir)
 
-                def _save_array(filename, array):
-                    if array is None:
-                        return
-                    out_path = fsspec_utils.join_path(out_dir, filename)
-                    fs, plain_path = fsspec.core.url_to_fs(out_path)
-                    with fs.open(plain_path, "wb") as f:
-                        np.save(f, array)
+            # Save as single files (gathered from all hosts)
+            _save_array_tpu_safe(out_dir, 'reward.npy', reward, gather_to_single_file=True)
+            _save_array_tpu_safe(out_dir, 'metagrads.npy', metagrads, gather_to_single_file=True)
+            #_save_array_tpu_safe(out_dir, 'dataset_ids_global.npy', dataset_ids_global)
+            #_save_array_tpu_safe(out_dir, 'local_indices_global.npy', local_indices_global)
+            _save_array_tpu_safe(out_dir, 'data_weight_vector.npy', data_weight_vector, gather_to_single_file=True)
 
-                _save_array('reward.npy', reward)
-                _save_array('metagrads.npy', metagrads)
-                _save_array('dataset_ids_global.npy', dataset_ids_global)
-                _save_array('local_indices_global.npy', local_indices_global)
-                _save_array('data_weight_vector.npy', data_weight_vector)
-                save_success = True
+            # Save loss_masks_global array as a single file (gathered from all hosts)
+            if loss_masks_global is not None:
+                logger.info(f"[LossMask] Saving loss_masks_global with shape: {loss_masks_global.shape}")
+                _save_array_tpu_safe(out_dir, 'loss_masks_global.npy', loss_masks_global, gather_to_single_file=True)
+            else:
+                logger.warning(f"[LossMask] No loss_masks_global to save")
+
+            save_success = True
         except Exception:
             logger.exception("Failed to save outputs to %s", config.out_dir)
         # Ensure all hosts wait for IO result (helps remote FS consistency)

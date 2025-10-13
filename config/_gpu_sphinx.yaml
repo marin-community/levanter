@@ -5,6 +5,7 @@ data:
   #  - "/juice5/scr5/nlp/data/huggingface/lingua-data/fineweb_edu_10bt_shuffled/fineweb_edu_10bt.val.jsonl"
   #cache_dir: /juice5b/scr5b/sampark/data_cache/fineweb_edu_10bt_shuffled
   id: dlwh/wikitext_103_detokenized
+  cache_dir: /scr-ssd/sampark/levanter/data_cache/wikitext_103_detokenized
   #id: Tristan/RedPajama-Data-V2-sample-100B-filtered-shuffled-tokenized-with-token-counts
 model:
   type: gpt2

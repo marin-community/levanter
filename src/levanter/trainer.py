@@ -885,6 +885,8 @@ class Trainer:
         # Keep a handle to the checkpointer used by default hooks so we can invoke
         # it manually (e.g., during segment retraining).
         self._checkpointer = None
+        # Global loss_masks array filled during training (replaces old list-based collection)
+        self.loss_masks_global: Optional[jnp.ndarray] = None
 
         if add_default_hooks:
             self._add_default_hooks()
@@ -949,6 +951,24 @@ class Trainer:
     @property
     def device_mesh(self) -> Mesh:
         return self.config.device_mesh
+
+    def get_collected_loss_masks(self) -> Optional[jnp.ndarray]:
+        """
+        Returns the global loss_masks indicator array filled during training.
+        Returns None if no loss_masks were collected.
+
+        The returned array is a 1D boolean array of shape (num_train_steps * train_batch_size,)
+        where each entry is 1 if that example had any non-zero loss_mask, 0 otherwise.
+        Indexed by sequential train order (first example seen → index 0, etc.).
+
+        In distributed training, this is a sharded JAX array that can be saved
+        with _save_array_tpu_safe which handles the sharding correctly.
+        """
+        return self.loss_masks_global
+
+    def clear_collected_loss_masks(self):
+        """Clears the global loss_masks array from memory."""
+        self.loss_masks_global = None
 
     @property
     def TrainBatch(self):
@@ -1171,6 +1191,41 @@ class Trainer:
                     example = next(iter_data)
                     self.dataset_ids.append(example.dataset_id)
 
+                    # Fill in loss_masks_global indicator array in sequential train order
+                    if self.loss_masks_global is not None:
+                        if hasattr(example, 'loss_mask') and example.loss_mask is not None:
+                            loss_mask = example.loss_mask
+                            # Extract underlying array if it's a NamedArray
+                            if hasattr(loss_mask, 'array'):
+                                loss_mask = loss_mask.array
+
+                            # Calculate sequential indices based on step and batch size
+                            # loss_masks_global is sharded the same way as the batch data,
+                            # so each process writes to its corresponding shard automatically
+                            batch_size = loss_mask.shape[0]
+                            start_idx = int(state.step) * batch_size
+                            end_idx = start_idx + batch_size
+
+                            # Compute indicator: 1 if row sum > 0, else 0
+                            # Sum over sequence dimension (axis=1 or axis=-1)
+                            row_sums = loss_mask.sum(axis=-1)
+                            mask_indicators = (row_sums > 0).astype(jnp.int32)
+
+                            # Debug: warn if all indicators are zero but mask exists
+                            num_active = int(mask_indicators.sum())
+                            if num_active == 0:
+                                logger.warning(f"[LossMask] Step {state.step}: All indicators are ZERO! loss_mask shape={loss_mask.shape}")
+
+                            # Update the global indicator array at sequential indices
+                            self.loss_masks_global = self.loss_masks_global.at[start_idx:end_idx].set(mask_indicators)
+
+                            if int(state.step) % 100 == 0:
+                                logger.info(f"[LossMask] Step {state.step}: Filled loss_mask indicators at [{start_idx}:{end_idx}], active: {num_active}/{batch_size}")
+                        else:
+                            # Missing loss_mask - log more frequently to catch this
+                            if int(state.step) % 10 == 0:
+                                logger.warning(f"[LossMask] Step {state.step}: Example missing loss_mask! has_attr={hasattr(example, 'loss_mask')}, is_none={getattr(example, 'loss_mask', None) is None}")
+
                     #if int(state.step) == 0:
                         # NOTE(safety): The preview decode below fetches a global jax.Array to host, which
                         # fails on multi-host TPU pods ("non-addressable devices"). Commented out for now.
@@ -1191,20 +1246,30 @@ class Trainer:
                         #     if j == 5:
                         #         break
 
-                    # NOTE: Commented out debug prints that format jax.Arrays.
-                    # These can trigger host fetch of global arrays on multi-host TPU pods.
-                    # If needed later, switch to jax.debug.print or gather only addressable shards.
-                    # if True: # self.config.debug_print_loss_mask:
-                    #     mask_sum = int(hax.sum(example.loss_mask).item()) if hasattr(example, "loss_mask") else -1
-                    #     print(
-                    #         f'> step: {state.step} | ds_id: {getattr(example, "dataset_id", None)} | '
-                    #         f'idx: {getattr(example, "index", None)} | mask_sum: {mask_sum}',
-                    #         flush=True,
-                    #     )
-                    #     if True: # self.config.debug_print_loss_mask_values:
-                    #         print(f'  mask: {example.loss_mask.array.sum(1)}', flush=True)
-                    # else:
-                    #     print(f'> step: {state.step} | example tokens: {example.tokens.array} | example index: {example.index} | example dataset_id: {example.dataset_id}')
+                    # Optional: print loss mask information for each batch
+                    if getattr(self.config, "debug_print_loss_mask", False) and example.loss_mask is not None:
+                        # and hasattr(example, "loss_mask") and example.loss_mask is not None:
+                        try:
+                            # Convert to host scalar safely
+                            mask_sum = int(np.asarray(hax.sum(example.loss_mask).array))
+                        except Exception:
+                            mask_sum = -1
+                        print(
+                            f'> step: {int(state.step)} | ds_id: {getattr(example, "dataset_id", None)} | '
+                            f'idx: {getattr(example, "index", None)} | mask_sum: {mask_sum}',
+                            flush=True,
+                        )
+                        if True:
+                            try:
+                                m = np.asarray(example.loss_mask.array)
+                                if m.ndim >= 2:
+                                    # Print per-example sums across the last axis (positions)
+                                    per_example = m.sum(axis=-1)
+                                    print(f'  mask_sums_per_example: {per_example.tolist()}', flush=True)
+                                else:
+                                    print(f'  mask: {m.tolist()}', flush=True)
+                            except Exception as e:
+                                print(f'  [mask values unavailable: {e}]', flush=True)
                     self.consumed_tokens += example.tokens.size
                 except StopIteration:
                     logger.info("Reached end of training data loader")
@@ -1230,12 +1295,14 @@ class Trainer:
         data_weight_vector: Optional[jnp.ndarray] = None,
         *,
         checkpoint_steps: Optional[Iterable[int]] = None,
+        loss_masks_global: Optional[jnp.ndarray] = None,
     ) -> StepInfo[S]:
         """
         Performs training until the number of steps is reached.
         """
         info: Optional[StepInfo[S]] = None
         self.data_weight_vector = data_weight_vector
+        self.loss_masks_global = loss_masks_global
 
         # Gate checkpoint saving to specified steps if provided
         prev_allowed = self._checkpoint_allowed_steps
@@ -1311,7 +1378,8 @@ class Trainer:
                          val_loader: Iterable[X],
                          data_weight_vector: jnp.ndarray,
                          segment_starts,
-                         train_only=False) -> StepInfo[S]:
+                         train_only=False,
+                         loss_masks_global: Optional[jnp.ndarray] = None) -> StepInfo[S]:
         init_state = self._duplicate_pytree_arrays(state) # TODO: check this
         forward_ckpt_steps = set(int(s) - 1 for s in segment_starts if int(s) > 0)
         metagrad_ckpt_dir = fsspec_utils.join_path(self.checkpoint_path, "metagrad_checkpoints")
@@ -1347,38 +1415,24 @@ class Trainer:
         local_indices_global = jnp.full(metagrads.shape, -1, dtype=jnp.int32)
 
         if not resumed_from_metagrad:
-            info = self.train(state, train_loader, data_weight_vector, checkpoint_steps=forward_ckpt_steps)
+            info = self.train(state, train_loader, data_weight_vector, checkpoint_steps=forward_ckpt_steps, loss_masks_global=loss_masks_global)
             final_model, final_opt_state = info.state.model, info.state.opt_state
             final_model = inference_mode(final_model, True)
             final_model = self.mp.cast_to_compute(final_model)
 
-            # save dataset_ids
-            '''
-            out_dir = self.config.out_dir
-            fsspec_utils.mkdirs(out_dir)
-
-            def _save_array(filename, array):
-                if array is None:
-                    return
-                out_path = fsspec_utils.join_path(out_dir, filename)
-                fs, plain_path = fsspec.core.url_to_fs(out_path)
-                with fs.open(plain_path, "wb") as f:
-                    np.save(f, array)
-
-            _save_array('dataset_ids_global_fwd.npy', jnp.concatenate(self.dataset_ids))
-            '''
             #self.dataset_ids = jnp.concatenate(self.dataset_ids)
             #print('dataset_ids_global_fwd:', jnp.concatenate(self.dataset_ids))
 
             # 1) Define a scalar reward loss (same as you already do, just as a callable)
             def reward_loss_fn(model, batch):
                 with hax.axis_mapping(self.compute_axis_mapping):
+                    # Per-token losses (NamedArray with Pos axis)
                     losses = compute_next_token_loss(model, batch, reduction=None, reduction_axis=())
                     mask = batch.loss_mask
-                    #debug.print("losses: {}", losses.array)
-                    #debug.print("mask: {}", mask.array)
-                    #debug.print("hax.sum(mask): {}", hax.sum(mask))
-                    return (-hax.einsum("->", losses, mask) / hax.sum(mask)).scalar()
+                    # Negative average log-likelihood over masked tokens
+                    loss_scalar = (-hax.einsum("->", losses, mask) / hax.sum(mask)).scalar()
+                    # Return aux metrics as empty dict to satisfy has_aux=True in gradient code
+                    return loss_scalar, {}
 
             # JIT a plain two-arg function that calls your microbatched gradient helper
             def _reward_grad_step_impl(model, batch):
@@ -1408,7 +1462,7 @@ class Trainer:
             # 3) Use the SAME microbatched machinery you use for training to compute reward grads
             reward = 0.0
             for i, val_batch in tqdm(enumerate(val_loader), desc="Computing reward"):
-                loss, p_grad = reward_grad_step(  # <- microbatched + checkpointed
+                loss, p_grad, _metrics = reward_grad_step(  # <- microbatched + checkpointed
                     final_model, val_batch
                 )
                 # Accumulate on device (params_grad is sharded, so we don't replicate)
@@ -1452,7 +1506,7 @@ class Trainer:
             print(f"Final reward: {reward}")
 
             if train_only:
-                return reward, None, self.dataset_ids, None
+                return reward, None, self.dataset_ids, None, self.loss_masks_global
 
             print('***** COMPUTED FINAL STATE GRADIENTS *****\n\n\n', flush=True)
 
@@ -1672,27 +1726,30 @@ class Trainer:
 
             checkpoint_start_time = time.time()
             state_pre = self._restore_step(init_state, rev_it - 1, checkpointer)
+            if state_pre is not None:
+                # ensure identical sharding as the forward path
+                state_pre = hax.shard(state_pre, self.parameter_axis_mapping)
             jax.block_until_ready(state_pre)
             checkpoint_end_time = time.time()
             checkpoint_duration = checkpoint_end_time - checkpoint_start_time
             print(f"[Timing] Checkpoint restoration for step {rev_it-1} took {checkpoint_duration:.3f}s", flush=True)
 
-            if state_pre is None or data_batches_cache is None or rev_it not in data_batches_cache:
-                logger.info(f"[REPLAY] segment missing---state_pre is None: {state_pre is None}, data_batches_cache is None: {data_batches_cache is None}, rev_it not in data_batches_cache: {rev_it not in data_batches_cache}")
+            need_retrain = (state_pre is None) or (data_batches_cache is None) or (
+                (data_batches_cache is not None) and (rev_it not in data_batches_cache)
+            )
+            safe_missing_flag = (False if data_batches_cache is None else (rev_it not in data_batches_cache))
+            if need_retrain:
+                logger.info(
+                    f"[REPLAY] segment missing---state_pre is None: {state_pre is None}, "
+                    f"data_batches_cache is None: {data_batches_cache is None}, "
+                    f"rev_it not in data_batches_cache: {safe_missing_flag}"
+                )
                 print(f"[REPLAY] rev_it: {rev_it}, retraining segment from step {segment_start - 1}...", flush=True)
                 restored = self._restore_step(init_state, segment_start - 1, checkpointer)
                 if restored is None:
                     raise RuntimeError(f"Missing checkpoint at segment start-1 ({segment_start - 1}); cannot retrain segment.")
 
                 state_pre, data_batches_cache = self.retrain_segment(restored, reversed_train_loader, segment_start, rev_it-1)
-                '''
-                if rev_it == segment_start:
-                    state_pre = restored
-                else:
-                    state_pre = self._restore_step(init_state, rev_it - 1, checkpointer)
-                if state_pre is None:
-                    raise RuntimeError(f"Checkpoint for step {rev_it - 1} still missing after retrain.")
-                '''
                 #jax.block_until_ready(state_pre)
 
             # Use the restored pre-state for VJP computation
@@ -1812,7 +1869,7 @@ class Trainer:
         print(f"dataset_ids_global: {dataset_ids_global[:200]}")
         print(f"local_indices_global: {local_indices_global[:200]}")
 
-        return reward, metagrads, dataset_ids_global, local_indices_global
+        return reward, metagrads, dataset_ids_global, local_indices_global, self.loss_masks_global
 
 
     def retrain_segment(self, state, reversed_train_loader, segment_start, target_step):
@@ -1825,6 +1882,9 @@ class Trainer:
             # Should be set in _add_default_hooks; fail loudly if missing.
             raise RuntimeError("Internal error: checkpointer handle is not initialized.")
 
+        # The iterator returned by reversed_train_loader.iter_segment already
+        # performs background prefetching via DataLoaderIterator; do not wrap it
+        # in a new DataLoader (which expects an AsyncDataset).
         segment_loader = reversed_train_loader.iter_segment(segment_start)
         data_batches_cache: dict[int, Any] = {}
 
@@ -1861,10 +1921,11 @@ class Trainer:
             data_batches_cache[segment_start + segment_idx] = self._duplicate_pytree_arrays(example)
             if segment_start + segment_idx > target_step:
                 break
-            loss, state, _metrics, _ = self._jit_train_step_fn_no_hook(state, (example,), {})
+            result = self._jit_train_step_fn_no_hook(state, (example,), {})
+            state = result.new_state
             print(' > retrained step:', segment_start + segment_idx, flush=True)
             # Force-save a permanent checkpoint for this step only
-            info = StepInfo(state, float(loss), 0.0)
+            info = StepInfo(state, float(result.loss), 0.0)
             self._checkpointer.on_step(info, force=True)
             # Cache the batch by its global step index
             current_step += 1
@@ -2137,11 +2198,11 @@ class Trainer:
                     weighted_loss_array = unreduced_loss.array * weights
                     unreduced_loss = hax.named(weighted_loss_array, unreduced_loss.axes)
 
-                return hax.mean(unreduced_loss).scalar()
+                return hax.mean(unreduced_loss).scalar(), {}
 
         # Returns (loss, grads, wrapped_metrics) where wrapped_metrics is Dict[str, Metric]
         loss, grads, wrapped_metrics = self._compute_gradients_microbatched(
-            self.loss_fn, model, *batch, **batch_kwargs, key=key
+            loss_fn, model, *batch, **batch_kwargs, key=key
         )
 
         # Sophia needs to be able to access the loss function in the optimizer

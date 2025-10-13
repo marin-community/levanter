@@ -988,23 +988,27 @@ class _SegmentOnlyDataLoaderIterator(DataLoaderIterator):
         segment_starts: Iterable[int],
         num_train_steps: int | None = None,
     ):
-        if not data_loader.data_store.is_finite():
-            if num_train_steps is None:
-                raise ValueError(
-                    "Segment iterator requires a finite dataset or num_train_steps to bound iteration."
-                )
+
+        # If an explicit training-step bound is provided, avoid waiting on dataset length (which would
+        # call cache.finished()). Bound iteration by the training schedule instead.
+        if num_train_steps is not None:
             if num_train_steps <= 0:
                 raise ValueError("num_train_steps must be > 0 for segment iteration.")
 
             self._max_bn = int(num_train_steps) - 1
-            # For infinite datasets, treat the final batch as full-sized
+            # Without dataset length, treat the final batch as full-sized
             expected_size = data_loader.scheduler.batch_size_at_step(self._max_bn)
             self._partial_last_bn = self._max_bn
             self._partial_last_bn_size = expected_size
         else:
+            if not data_loader.data_store.is_finite():
+                raise ValueError(
+                    "Segment iterator requires a finite dataset or num_train_steps to bound iteration."
+                )
+
             total_len = blocking_wait(data_loader.data_store.async_len())
 
-            # Compute the last permissible batch number given dataset length and optional num_train_steps cap.
+            # Compute the last permissible batch number given dataset length
             last_bn_dataset = 0
             while data_loader.scheduler.global_data_offset_by_step(last_bn_dataset) < total_len:
                 last_bn_dataset += 1
@@ -1012,10 +1016,7 @@ class _SegmentOnlyDataLoaderIterator(DataLoaderIterator):
             if last_bn_dataset < 0:
                 raise ValueError("Dataset appears to be empty – nothing to iterate.")
 
-            if num_train_steps is not None:
-                self._max_bn = min(num_train_steps - 1, last_bn_dataset)
-            else:
-                self._max_bn = last_bn_dataset
+            self._max_bn = last_bn_dataset
 
             # Partial final batch sizing for the true last batch within training range
             final_bn_start = data_loader.scheduler.global_data_offset_by_step(self._max_bn)
@@ -1025,7 +1026,6 @@ class _SegmentOnlyDataLoaderIterator(DataLoaderIterator):
                 partial_size = expected_size
             self._partial_last_bn = self._max_bn
             self._partial_last_bn_size = partial_size
-
         # Normalize provided segment starts, ensure 0 present, then clip to range
         starts = sorted(set(int(s) for s in segment_starts if int(s) >= 0))
         if not starts or starts[0] != 0:

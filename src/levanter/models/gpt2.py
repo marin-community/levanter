@@ -65,7 +65,7 @@ class Gpt2Config(HFCompatConfig):
     rope: RotaryEmbeddingsConfig = dataclasses.field(default_factory=DefaultRotaryEmbeddingsConfig)
 
     use_flash_attention: Optional[bool] = None
-    attn_backend: Optional[AttentionBackend] = AttentionBackend.FLASH_META
+    attn_backend: Optional[AttentionBackend] = AttentionBackend.VANILLA
     flash_attention_block_size: Optional[int] = None
 
     # Axes

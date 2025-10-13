@@ -93,3 +93,5 @@ optimizer:
   learning_rate: 1E-4
   weight_decay: 0.1
   warmup: 0.1
+
+initialize_from_checkpoint_path: "gs://marin-us-central1/checkpoints/data_grads/smoothness-v4-bs1024-s24000-lr1.0e-03-wd0.10-gc1.0-er1.00e-08/checkpoints/step-23999"
