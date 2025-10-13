@@ -1301,13 +1301,13 @@ class LMMixtureDatasetConfig(LMTaskConfig):
 
         # Apply per-epoch permutation after slicing so the epoch length is the post-slice length.
         if self.shuffle_per_epoch:
-            perm_type_epoch = self.permutation_type or "feistel"
-            key_iter2 = key_iterator(key)
+            # hard code to feistel for now
+            perm_type_epoch = "feistel"
             new_datasets: Dict[str, AsyncDataset[LmExample]] = {}
             for name, ds in datasets.items():
-                # fold in a small stable hash of the name for determinism
+                # derive per-dataset base key deterministically from key and dataset name
                 name_fold = int(np.frombuffer(name.encode("utf-8"), dtype=np.uint8).sum())
-                dkey = jax.random.fold_in(next(key_iter2), name_fold)
+                dkey = jax.random.fold_in(key, name_fold)
                 new_datasets[name] = EpochPermutationDataset(ds, key=dkey, perm_type=perm_type_epoch)  # type: ignore
             datasets = new_datasets
 

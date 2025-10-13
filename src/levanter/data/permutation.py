@@ -5,10 +5,12 @@ from typing import Optional, Sequence
 
 import jax.random
 from async_lru import alru_cache
+import jax
 from jaxtyping import PRNGKeyArray
 
 from levanter.data import AsyncDataset
 from levanter.data._prp import PermType, Permutation
+from levanter.utils.jax_utils import local_cpu_mesh
 from levanter.data.dataset import T_co
 
 
@@ -163,14 +165,33 @@ class EpochPermutationDataset(AsyncDataset[T_co]):
     def __init__(self, dataset: AsyncDataset[T_co], key: PRNGKeyArray, perm_type: PermType = "feistel"):
         super().__init__()
         self.dataset = dataset
-        self.key = key
+        # Ensure key is host/CPU resident to avoid device placement issues inside fold_in
+        with local_cpu_mesh():
+            if isinstance(key, int):
+                self.key = jax.random.PRNGKey(key)
+            else:
+                self.key = jax.device_put(jax.device_get(key))
         self._perm_type = perm_type
         self._length: Optional[int] = None
+        # DEBUG state: track last epoch printed to avoid spam
+        self._debug_last_epoch: Optional[int] = None
+
+        # DEBUG: creation print (will remove later)
+        try:
+            print(
+                f"[EpochPermutationDataset] init perm_type={self._perm_type}",
+                flush=True,
+            )
+        except Exception:
+            pass
 
         @alru_cache(maxsize=8)
         async def _perm_for_epoch(epoch: int) -> Permutation:
             L = await self._get_length()
-            ek = jax.random.fold_in(self.key, epoch)
+            # fold_in on CPU to avoid TPU/CPU mesh mismatch
+            with local_cpu_mesh():
+                base_key = jax.device_put(jax.device_get(self.key))
+                ek = jax.random.fold_in(base_key, int(epoch))
             return Permutation.make(self._perm_type, L, ek)
 
         self._perm_for_epoch = _perm_for_epoch
@@ -178,6 +199,14 @@ class EpochPermutationDataset(AsyncDataset[T_co]):
     async def _get_length(self) -> int:
         if self._length is None:
             self._length = await self.dataset.async_len()
+            # DEBUG: length print (will remove later)
+            try:
+                print(
+                    f"[EpochPermutationDataset] underlying length discovered: {self._length}",
+                    flush=True,
+                )
+            except Exception:
+                pass
         return self._length
 
     async def _map_index(self, i: int) -> int:
@@ -186,6 +215,16 @@ class EpochPermutationDataset(AsyncDataset[T_co]):
             raise ValueError("Underlying dataset length must be positive")
         epoch, pos = divmod(i, L)
         perm = await self._perm_for_epoch(epoch)
+        # DEBUG: mapping print once per epoch (at pos 0)
+        try:
+            if pos == 0 and self._debug_last_epoch != epoch:
+                self._debug_last_epoch = epoch
+                print(
+                    f"[EpochPermutationDataset] epoch boundary: epoch={epoch} (i={i}, L={L})",
+                    flush=True,
+                )
+        except Exception:
+            pass
         return int(perm(pos))
 
     async def async_len(self) -> int:
@@ -205,5 +244,17 @@ class EpochPermutationDataset(AsyncDataset[T_co]):
         return await self.dataset.getitem_async(await self._map_index(index))
 
     async def get_batch(self, indices: Sequence[int]) -> Sequence[T_co]:
+        # DEBUG: batch epochs print (will remove later)
+        try:
+            L = await self._get_length()
+            if L > 0 and len(indices) > 0:
+                epochs = sorted({i // L for i in indices})
+                print(
+                    f"[EpochPermutationDataset] get_batch size={len(indices)} epochs={epochs}",
+                    flush=True,
+                )
+        except Exception:
+            pass
+
         mapped = [await self._map_index(i) for i in indices]
         return await self.dataset.get_batch(mapped)

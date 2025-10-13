@@ -18,7 +18,16 @@ from levanter.data.text import LMMixtureDatasetConfig, SingleDatasetLMConfigBase
 from levanter.models.lm_model import LmExample, LmHeadModel
 from levanter.models.loss import next_token_loss
 from levanter.utils.hf_utils import HfTokenizer
+from levanter.data._prp import PermType
 from levanter.tracker.histogram import Histogram
+
+# Progress bar for long PRP builds; fallback is a no-op if tqdm is unavailable
+try:  # pragma: no cover - optional dependency
+    from tqdm.auto import tqdm as _tqdm  # type: ignore
+except Exception:  # pragma: no cover - keep code runnable without tqdm
+
+    def _tqdm(iterable=None, **kwargs):  # type: ignore
+        return iterable
 
 
 # Debug helpers for inspecting mesh/device state when verbose=True.
@@ -50,6 +59,12 @@ class PzInnerLoopConfig:
     # Verbose printing for debug; default false so configs need not set it
     verbose: bool = False
     # (no extra debug controls here; use verbose for lightweight logging)
+    # Selection controls
+    restrict_to_training_subset: bool = True
+    initial_batch_size: Optional[int] = None  # required if max_train_batches is set
+    doc_shuffle: bool = True
+    doc_perm_type: PermType = "feistel"
+    doc_perm_seed: Optional[int] = None
 
 
 def pz_eval_callback(
@@ -129,6 +144,14 @@ def pz_eval_callback(
         return -float(np.array(total_nll))
 
     def _run_for_model(model: LmHeadModel, *, curr_step: int):
+        # DEBUG print helper
+        def _p(msg: str):
+            try:
+                if jax.process_index() == 0:
+                    print(f"[PZ][step={curr_step}] {msg}", flush=True)
+            except Exception:
+                pass
+
         # Only process 0 does tracker I/O. All hosts print phase timings for debugging.
         _log(f"step={curr_step} | BEGIN pz_eval inner-loop")
         _log(
@@ -141,12 +164,15 @@ def pz_eval_callback(
         eval_start_time = time.time()
         if caches_state is None:
             _log(f"step={curr_step} | building caches(train)...", all_hosts=True)
+            _p("building train caches…")
             t0_caches = time.perf_counter()
             caches_state = data_config.build_caches("train", monitors=False)
             t1_caches = time.perf_counter()
             _log(f"built caches in {t1_caches - t0_caches:.3f}s; datasets={list(caches_state.keys())}")
+            _p(f"built caches in {t1_caches - t0_caches:.3f}s; datasets={list(caches_state.keys())}")
         else:
             _log("reusing previously built caches")
+            _p("reusing previously built caches")
         caches = caches_state
 
         # Determine datasets to evaluate
@@ -156,43 +182,325 @@ def pz_eval_callback(
             selected = [name for name in config.datasets if name in caches]
 
         _log(f"step={curr_step} | selected datasets: {selected}")
+        if jax.process_index() == 0:
+            try:
+                print(
+                    f"[PZ][step={curr_step}] config.datasets={config.datasets} | caches={list(caches.keys())} | selected={selected}",
+                    flush=True,
+                )
+            except Exception:
+                pass
 
         results = {}
+
+        # Aggregates across all datasets for a 'total' series
+        total_num_windows = 0
+        total_sum_pz = 0.0
+        total_sum_sq_pz = 0.0
+        total_min_pz = float("inf")
+        total_max_pz = float("-inf")
+        total_counts = jnp.zeros(10, dtype=jnp.int32)
+        total_edges = jnp.linspace(0.0, 1.0, 11, dtype=jnp.float32)
+        total_docs_selected = 0
+
+        # If evaluating across all datasets (datasets=None), build a pooled selection once
+        if config.datasets is None:
+            if jax.process_index() == 0:
+                print(
+                    f"[PZ] DATASETS=None → pooling across all datasets. Previously pinned={bool(selected_indices_by_ds)}",
+                    flush=True,
+                )
+            # Only compute if not already pinned; else reuse
+            if len(selected_indices_by_ds) == 0:
+                if jax.process_index() == 0:
+                    print(
+                        f"[PZ] POOL START: pooling across {len(selected)} datasets: {sorted(selected)}",
+                        flush=True,
+                    )
+                need_global = int(max(1, config.num_documents))
+                seq_len_train = int(model.Pos.size)
+                # Stable dataset order for determinism
+                selected_sorted = sorted(selected)
+                pool_ds_ids: List[int] = []
+                pool_doc_idx: List[np.ndarray] = []
+                ds_name_to_id = {name: i for i, name in enumerate(selected_sorted)}
+                t_pool0 = time.perf_counter()
+                total_eligible_pool = 0
+                for ds_name_all in selected_sorted:
+                    cache_all = caches[ds_name_all]
+                    input_store_all = cache_all.store.tree["input_ids"]  # type: ignore[index]
+                    num_rows_all = int(input_store_all.num_rows)
+                    # Read offsets and compute eligibility for this dataset
+                    t_off0 = time.perf_counter()
+                    offsets_all = input_store_all.offsets[0 : num_rows_all + 1].read().result()
+                    if len(offsets_all) > 0:
+                        offsets_all = offsets_all.copy()
+                        offsets_all[0] = 0
+                    t_off1 = time.perf_counter()
+                    if jax.process_index() == 0:
+                        print(
+                            f"[PZ] {ds_name_all}: offsets read {t_off1 - t_off0:.3f}s (rows={num_rows_all})",
+                            flush=True,
+                        )
+
+                    last_off_all = int(offsets_all[-1] if len(offsets_all) > 0 else 0)
+                    total_sequences_all = last_off_all // seq_len_train
+
+                    effective_sequences_all = total_sequences_all
+                    if isinstance(data_config, LMMixtureDatasetConfig):
+                        if (
+                            data_config.experiment_budget is not None
+                            and data_config.target_budget is not None
+                            and data_config.target_budget > 0
+                        ):
+                            ratio = float(data_config.experiment_budget) / float(data_config.target_budget)
+                            effective_sequences_all = int(effective_sequences_all * ratio)
+                        if (
+                            data_config.num_validation_sequences is not None
+                            and ds_name_all in data_config.num_validation_sequences
+                        ):
+                            effective_sequences_all = max(
+                                0, effective_sequences_all - int(data_config.num_validation_sequences[ds_name_all])
+                            )
+                        if data_config.max_train_batches is not None and ds_name_all in data_config.max_train_batches:
+                            if config.initial_batch_size is None:
+                                raise ValueError(
+                                    "P(z) restrict_to_training_subset requires initial_batch_size when max_train_batches is set."
+                                )
+                            limit = int(data_config.max_train_batches[ds_name_all]) * int(config.initial_batch_size)
+                            effective_sequences_all = min(effective_sequences_all, limit)
+
+                    tokens_cutoff_all = int(effective_sequences_all * seq_len_train)
+
+                    if len(offsets_all) >= 2:
+                        lens_all = offsets_all[1:] - offsets_all[:-1]
+                        eligible_len_all = lens_all >= int(config.chunk_size)
+                        eligible_cut_all = (
+                            offsets_all[1:] <= tokens_cutoff_all
+                            if config.restrict_to_training_subset
+                            else np.ones_like(lens_all, dtype=bool)
+                        )
+                        eligible_mask_all = np.logical_and(eligible_len_all, eligible_cut_all)
+                        eligible_indices_all = np.nonzero(eligible_mask_all)[0]
+                    else:
+                        eligible_indices_all = np.zeros((0,), dtype=np.int64)
+
+                    total_eligible = int(eligible_indices_all.shape[0])
+                    total_eligible_pool += total_eligible
+
+                    if total_eligible > 0:
+                        ds_id = ds_name_to_id[ds_name_all]
+                        pool_ds_ids.append(np.full(total_eligible, ds_id, dtype=np.int32))
+                        pool_doc_idx.append(eligible_indices_all.astype(np.int32))
+
+                if len(pool_doc_idx) == 0:
+                    raise ValueError("P(z): no eligible documents across any dataset; check caps and chunk_size")
+
+                ds_ids_np = np.concatenate(pool_ds_ids)
+                doc_idx_np = np.concatenate(pool_doc_idx)
+
+                # Deterministic global shuffle of pooled eligibles
+                t_pool1 = time.perf_counter()
+                seed = int(config.doc_perm_seed or 0)
+                base_key = jax.random.PRNGKey(seed)
+                # Fold in sorted dataset names for stability
+                names_blob = ("|".join(selected_sorted)).encode("utf-8")
+                name_sum = int(np.frombuffer(names_blob, dtype=np.uint8).sum())
+                pkey_global = jax.random.fold_in(base_key, name_sum)
+
+                N_pool = int(doc_idx_np.shape[0])
+                if N_pool < need_global:
+                    # Fail early at the global level instead of per-dataset later
+                    raise ValueError(
+                        f"P(z) pooled selection found only {N_pool} eligible documents across all datasets, "
+                        f"but requested {need_global}."
+                    )
+                perm_positions = jax.random.permutation(pkey_global, jnp.arange(N_pool, dtype=jnp.int32))
+                take = np.asarray(perm_positions[:need_global]).astype(np.int32)
+                chosen_ds_ids = ds_ids_np[take]
+                chosen_doc_idx = doc_idx_np[take]
+                # Group back per dataset
+                for i, ds_name_sorted in enumerate(selected_sorted):
+                    mask = chosen_ds_ids == i
+                    if np.any(mask):
+                        sel = chosen_doc_idx[mask].astype(int).tolist()
+                    else:
+                        sel = []
+                    selected_indices_by_ds[ds_name_sorted] = sel
+                t_pool2 = time.perf_counter()
+                elapsed_pool = t_pool2 - t_pool0
+            else:
+                print("[PZ] POOL REUSE: reusing previously selected indices across all datasets.", flush=True)
+
+        # After pooling, if we have a global selection, record expected total documents
+        try:
+            total_docs_selected = int(sum(len(selected_indices_by_ds.get(n, [])) for n in selected))
+        except Exception:
+            total_docs_selected = 0
+
         for ds_name in selected:
             ds_start_time = time.perf_counter()
 
             cache = caches[ds_name]
             input_store = cache.store.tree["input_ids"]  # type: ignore[index]
 
-            # Persist selection once using fast offsets-based length checks
+            # Persist selection once using training-subset gating + doc-level shuffle
             if ds_name not in selected_indices_by_ds:
                 need = int(max(1, config.num_documents))
-                _log(f"dataset={ds_name} | selecting {need} doc(s) with length >= {config.chunk_size} via offsets")
+                _log(
+                    f"dataset={ds_name} | selecting {need} doc(s) with shuffle-first + training-subset gating",
+                )
                 scan_t0 = time.perf_counter()
                 num_rows = int(input_store.num_rows)
-                selected_doc_indices: List[int] = []
-                block = 4096
-                idx = 0
-                while idx < num_rows and len(selected_doc_indices) < need:
-                    end = min(num_rows, idx + block)
-                    offsets = input_store.offsets[idx : end + 1].read().result()
-                    if idx == 0:
-                        offsets = offsets.copy()
-                        offsets[0] = 0
+
+                # Compute effective training subset in sequences to derive token cutoff
+                seq_len_train = int(model.Pos.size)
+                # Batch read offsets once
+                t_off0 = time.perf_counter()
+                offsets = input_store.offsets[0 : num_rows + 1].read().result()
+                if len(offsets) > 0:
+                    offsets = offsets.copy()
+                    offsets[0] = 0
+                t_off1 = time.perf_counter()
+                _p(
+                    f"dataset={ds_name}: read offsets[0:{num_rows + 1}] in {t_off1 - t_off0:.3f}s (num_rows={num_rows})"
+                )
+                last_off = int(offsets[-1] if len(offsets) > 0 else 0)
+                total_sequences = last_off // seq_len_train
+                _p(
+                    f"dataset={ds_name}: total_tokens={last_off} seq_len={seq_len_train} total_sequences={total_sequences}"
+                )
+
+                effective_sequences = total_sequences
+                if isinstance(data_config, LMMixtureDatasetConfig):
+                    # Simulated budget
+                    if (
+                        data_config.experiment_budget is not None
+                        and data_config.target_budget is not None
+                        and data_config.target_budget > 0
+                    ):
+                        ratio = float(data_config.experiment_budget) / float(data_config.target_budget)
+                        effective_sequences = int(effective_sequences * ratio)
+                    # Reserve validation sequences (take head for training)
+                    if (
+                        data_config.num_validation_sequences is not None
+                        and ds_name in data_config.num_validation_sequences
+                    ):
+                        effective_sequences = max(
+                            0, effective_sequences - int(data_config.num_validation_sequences[ds_name])
+                        )
+                    # Max train batches
+                    if data_config.max_train_batches is not None and ds_name in data_config.max_train_batches:
+                        if config.initial_batch_size is None:
+                            raise ValueError(
+                                "P(z) restrict_to_training_subset requires initial_batch_size when max_train_batches is set."
+                            )
+                        limit = int(data_config.max_train_batches[ds_name]) * int(config.initial_batch_size)
+                        effective_sequences = min(effective_sequences, limit)
+
+                tokens_cutoff = int(effective_sequences * seq_len_train)
+                _p(f"dataset={ds_name}: effective_sequences={effective_sequences} tokens_cutoff={tokens_cutoff}")
+
+                # Precompute eligibility mask using batched offsets (can be done before PRP)
+                if len(offsets) >= 2:
                     lens = offsets[1:] - offsets[:-1]
-                    good = np.nonzero(lens >= int(config.chunk_size))[0]
-                    for g in good:
-                        sel_idx = idx + int(g)
-                        selected_doc_indices.append(sel_idx)
-                        if len(selected_doc_indices) >= need:
-                            break
-                    idx = end
+                    eligible_len = lens >= int(config.chunk_size)
+                    eligible_cut = (
+                        offsets[1:] <= tokens_cutoff
+                        if config.restrict_to_training_subset
+                        else np.ones_like(lens, dtype=bool)
+                    )
+                    eligible_mask = np.logical_and(eligible_len, eligible_cut)
+                    eligible_count = int(np.count_nonzero(eligible_mask))
+                else:
+                    eligible_mask = np.zeros((0,), dtype=bool)
+                    eligible_count = 0
+                _p(f"dataset={ds_name}: eligible docs pre-PRP count={eligible_count}")
+                _p(f"dataset={ds_name}: eligible_mask.sum()={int(np.sum(eligible_mask))}")
+                _p(f"dataset={ds_name}: eligible_mask.sum()={int(np.sum(eligible_mask))}")
+
+                # Build doc-level PRP order (or identity)
+                # NOTE: The full-domain PRP build below is retained for reference but commented out.
+                #       We now use a fast path that permutes only eligible indices with JAX.
+                # if config.doc_shuffle:
+                #     seed = int(config.doc_perm_seed or 0)
+                #     base_key = jax.random.PRNGKey(seed)
+                #     name_sum = int(np.frombuffer(ds_name.encode("utf-8"), dtype=np.uint8).sum())
+                #     pkey = jax.random.fold_in(base_key, name_sum)
+                #     prp: Permutation = Permutation.make(config.doc_perm_type, num_rows, pkey)
+                #     order = []
+                #     # Timing around the PRP order build (with tqdm)
+                #     t_prp0 = time.perf_counter()
+                #     if jax.process_index() == 0:
+                #         print(
+                #             f"\n===== BEGIN PRP ORDER BUILD: dataset={ds_name} rows={num_rows} =====",
+                #             flush=True,
+                #         )
+                #     # Show progress only on process 0 to avoid clutter in multi-host runs
+                #     for i in _tqdm(
+                #         range(num_rows),
+                #         total=num_rows,
+                #         desc=f"PRP order: {ds_name}",
+                #         disable=(jax.process_index() != 0),
+                #     ):
+                #         order.append(int(prp(i)))
+                #     t_prp1 = time.perf_counter()
+                #     if jax.process_index() == 0:
+                #         elapsed = t_prp1 - t_prp0
+                #         rate = (num_rows / elapsed) if elapsed > 0 else float('inf')
+                #         print(
+                #             f"===== END PRP ORDER BUILD: dataset={ds_name} took {elapsed:.3f}s ({rate:,.0f} it/s) =====\n",
+                #             flush=True,
+                #         )
+                # else:
+                #     order = list(range(num_rows))
+
+                # FAST PATH: Permute only the eligible indices with JAX and take first K
+                selected_doc_indices: List[int] = []
+                t_fast0 = time.perf_counter()
+                # Compute eligible indices (numpy), then permute via jax on jnp arrays
+                eligible_indices_np = np.nonzero(eligible_mask)[0]
+                if config.doc_shuffle:
+                    seed = int(config.doc_perm_seed or 0)
+                    base_key = jax.random.PRNGKey(seed)
+                    name_sum = int(np.frombuffer(ds_name.encode("utf-8"), dtype=np.uint8).sum())
+                    pkey = jax.random.fold_in(base_key, name_sum)
+                    eligible_jnp = jnp.asarray(eligible_indices_np, dtype=jnp.int32)
+                    permuted = jax.random.permutation(pkey, eligible_jnp)
+                    # Bring to host and slice first K
+                    selected_doc_indices = list(np.asarray(permuted[:need]).astype(int))
+                else:
+                    # Identity order over eligible; take head
+                    selected_doc_indices = eligible_indices_np[:need].astype(int).tolist()
+                t_fast1 = time.perf_counter()
+                if jax.process_index() == 0:
+                    elapsed_fast = t_fast1 - t_fast0
+                    rate_fast = (max(1, len(eligible_indices_np)) / elapsed_fast) if elapsed_fast > 0 else float("inf")
+                    print(
+                        f"===== FAST ELIGIBLE SHUFFLE: dataset={ds_name} took {elapsed_fast:.3f}s "
+                        f"(eligible={len(eligible_indices_np)}, K={need}, ~{rate_fast:,.0f} el/s) =====",
+                        flush=True,
+                    )
+
                 if len(selected_doc_indices) == 0:
-                    _log(f"[WARN] dataset={ds_name} | no document with length >= {config.chunk_size} found; skipping")
-                    continue
+                    # No eligible documents at all — hard fail as requested
+                    raise ValueError(
+                        f"P(z) selection failed for {ds_name}: no eligible documents (len>=chunk_size and within training subset). "
+                        f"tokens_cutoff={tokens_cutoff}, chunk_size={int(config.chunk_size)}"
+                    )
+                if len(selected_doc_indices) < need:
+                    # Not enough eligible documents to satisfy requested num_documents — hard fail
+                    raise ValueError(
+                        f"P(z) selection for {ds_name} found only {len(selected_doc_indices)} eligible documents, "
+                        f"but requested {need}. Increase training subset or reduce num_documents. "
+                        f"tokens_cutoff={tokens_cutoff}, chunk_size={int(config.chunk_size)}"
+                    )
                 selected_indices_by_ds[ds_name] = selected_doc_indices
                 scan_t1 = time.perf_counter()
                 _log(f"dataset={ds_name} | selected indices={selected_doc_indices} in {scan_t1 - scan_t0:.3f}s")
+                _p(
+                    f"dataset={ds_name}: selected {len(selected_doc_indices)}/{need} in {scan_t1 - scan_t0:.3f}s; eligible={eligible_count}"
+                )
                 # (Preview decode handled later with decode_once_state guard if configured)
             else:
                 _log(f"dataset={ds_name} | reusing pinned indices={selected_indices_by_ds[ds_name]}")
@@ -200,13 +508,16 @@ def pz_eval_callback(
             selected_doc_indices = selected_indices_by_ds[ds_name]
             # Read tokens for selected indices (minimally)
             selected_docs: List[np.ndarray] = []
+            _p(f"dataset={ds_name}: reading {len(selected_doc_indices)} docs…")
             for _sel_idx in selected_doc_indices:
                 try:
                     arr = np.asarray(input_store[_sel_idx], dtype=np.int32).reshape(-1)
                     selected_docs.append(arr)
                 except Exception as e:
                     _log(f"[WARN] dataset={ds_name} | error reading doc {_sel_idx}: {e}")
+                    _p(f"dataset={ds_name}: error reading doc {_sel_idx}: {e}")
                     continue
+            _p(f"dataset={ds_name}: finished reading docs count={len(selected_docs)}")
 
             # Use config.chunk_size, not model.Pos.size, to avoid evaluating mostly padding
             N = int(config.chunk_size)
@@ -410,27 +721,82 @@ def pz_eval_callback(
             # Log a value histogram of P(z) in [0, 1] with 10 bins of width 0.1
             # This mirrors the tracker Histogram used for entropy, but with fixed edges.
             if len(pz_values) > 0:
-                arr = np.asarray(pz_values, dtype=jnp.float32)
+                arr32 = np.asarray(pz_values, dtype=jnp.float32)
                 # Clip to [0, 1] for safety before binning
-                arr = np.clip(arr, 0.0, 1.0)
+                arr32 = np.clip(arr32, 0.0, 1.0)
                 # Fixed 10 bins from 0.0 to 1.0 inclusive (edges length = 11)
                 edges = jnp.linspace(0.0, 1.0, 11, dtype=jnp.float32)
-                counts, edges_out = jnp.histogram(arr, bins=edges)
+                counts, edges_out = jnp.histogram(arr32, bins=edges)
                 counts = counts.astype(jnp.int32)
 
                 # Populate Histogram fields
-                h_min = arr.min()
-                h_max = arr.max()
-                h_num = int(arr.size)
-                h_sum = arr.sum()
-                h_sum_sq = (arr**2).sum()
+                h_min = float(np.min(arr32))
+                h_max = float(np.max(arr32))
+                h_num = int(arr32.size)
+                h_sum = float(np.sum(arr32))
+                h_sum_sq = float(np.sum(arr32**2))
                 hist = jax.device_get(Histogram(h_min, h_max, h_num, h_sum, h_sum_sq, edges_out, counts))
+
+                # Update totals safely
+                total_num_windows += h_num
+                total_sum_pz += h_sum
+                total_sum_sq_pz += h_sum_sq
+                total_min_pz = float(min(total_min_pz, h_min))
+                total_max_pz = float(max(total_max_pz, h_max))
+                total_counts = total_counts + counts
             # we crash here!
             levanter.tracker.log(metrics, step=curr_step)
             _log(f"dataset={ds_name} | metrics: {metrics}")
             levanter.tracker.log({f"pz_eval/{ds_name}/pz_hist": hist}, step=curr_step)
 
             results[ds_name] = True
+
+        # After processing all datasets, log aggregated 'total' series
+        if total_num_windows > 0:
+            total_mean_pz = float(total_sum_pz / total_num_windows)
+            # Approximate median from aggregated histogram
+            counts_np = np.asarray(total_counts)
+            edges_np = np.asarray(total_edges)
+            cumsum = np.cumsum(counts_np)
+            half = total_num_windows / 2
+            bin_idx = int(np.searchsorted(cumsum, half, side="left"))
+            bin_idx = max(0, min(bin_idx, len(counts_np) - 1))
+            prev = 0 if bin_idx == 0 else cumsum[bin_idx - 1]
+            in_bin = counts_np[bin_idx]
+            if in_bin > 0:
+                frac = (half - prev) / in_bin
+            else:
+                frac = 0.0
+            bin_lo = float(edges_np[bin_idx])
+            bin_hi = float(edges_np[bin_idx + 1])
+            total_median_pz = float(bin_lo + frac * (bin_hi - bin_lo))
+
+            total_hist = jax.device_get(
+                Histogram(
+                    float(total_min_pz),
+                    float(total_max_pz),
+                    int(total_num_windows),
+                    float(total_sum_pz),
+                    float(total_sum_sq_pz),
+                    total_edges,
+                    total_counts.astype(jnp.int32),
+                )
+            )
+        else:
+            total_mean_pz = total_median_pz = 0.0
+            total_hist = None
+
+        # Total metrics
+        total_metrics = {
+            "pz_eval/total/num_windows": int(total_num_windows),
+            "pz_eval/total/num_documents": int(total_docs_selected),
+            "pz_eval/total/requested_num_documents": int(max(1, config.num_documents)),
+            "pz_eval/total/mean_pz": float(total_mean_pz),
+            "pz_eval/total/median_pz": float(total_median_pz),
+        }
+        levanter.tracker.log(total_metrics, step=curr_step)
+        if total_hist is not None:
+            levanter.tracker.log({"pz_eval/total/pz_hist": total_hist}, step=curr_step)
 
         eval_total_time = time.time() - eval_start_time
         levanter.tracker.log(
