@@ -1219,7 +1219,7 @@ class InferenceEngine:
         total_generated = sum(len(seq_outputs) for seq_outputs in outputs_list)
         total_time = time.time() - time_in
         tps_overall = (total_generated / total_time) if total_time > 0 else 0.0
-        logger.info(f"Batch generated in {total_time:.2f}s, {total_generated} tokens, {tps_overall:.2f} tok/s")
+        # logger.info(f"Batch generated in {total_time:.2f}s, {total_generated} tokens, {tps_overall:.2f} tok/s")
         # Clear results for these requests now that we've assembled outputs
         for rid in call_rids:
             if rid in self.results:
@@ -1263,9 +1263,9 @@ class InferenceEngine:
                 try:
                     # Decode the full sequence so far
                     full_text = self.tokenizer.decode(dr.token_list, skip_special_tokens=False)
-                    print(f"[Request {rid}, Choice {cid}] Tokens {dr.tokens_decoded}: '{full_text}'", flush=True)
+                    logger.info(f"[Request {rid}, Choice {cid}] Tokens {dr.tokens_decoded}: '{full_text}'", flush=True)
                 except Exception as e:
-                    print(f"[Request {rid}, Choice {cid}] Tokens {dr.tokens_decoded}: <decode_error: {e}>", flush=True)
+                    logger.info(f"[Request {rid}, Choice {cid}] Tokens {dr.tokens_decoded}: <decode_error: {e}>", flush=True)
 
         # Update done flags based on snapshot
         for local_slot, is_done in enumerate(fins):
@@ -1282,12 +1282,12 @@ class InferenceEngine:
             if print_tokens and dr.tokens_decoded > 0:
                 try:
                     full_text = self.tokenizer.decode(dr.token_list, skip_special_tokens=False)
-                    print(f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): '{full_text}'", flush=True)
+                    logger.info(f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): '{full_text}'", flush=True)
                 except Exception as e:
-                    print(f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): <decode_error: {e}>", flush=True)
+                    logger.info(f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): <decode_error: {e}>", flush=True)
 
         num_finished = int(fins.sum()) if hasattr(fins, "sum") else 0
-        logger.info(f"extract: appended={appended} (drained={n}) unmapped={unmapped} finished_count={num_finished}")
+        # logger.info(f"extract: appended={appended} (drained={n}) unmapped={unmapped} finished_count={num_finished}")
 
         return appended
 
