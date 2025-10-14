@@ -1346,7 +1346,7 @@ class InferenceEngine:
                 dr.logprobs.append(float(pending_outputs.logprobs.array[i]))
             dr.tokens_decoded += 1
             appended += 1
-            
+
             # Print accumulated decoded text as it is generated
             if print_every_n > 0 and dr.tokens_decoded % print_every_n == 0:
                 try:
@@ -1366,14 +1366,16 @@ class InferenceEngine:
             rid, cid = info
             dr = self.results.setdefault(rid, {}).setdefault(cid, DecodeResult(id=rid, choice=cid, token_list=[]))
             dr.done = True
-            
+
             # Print final complete text when sequence is finished
             if print_every_n > 0 and dr.tokens_decoded > 0:
                 try:
                     full_text = self.tokenizer.decode(dr.token_list, skip_special_tokens=False)
                     logger.info(f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): '{full_text}'")
                 except Exception as e:
-                    logger.info(f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): <decode_error: {e}>")
+                    logger.info(
+                        f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): <decode_error: {e}>"
+                    )
 
         num_finished = int(fins.sum()) if hasattr(fins, "sum") else 0
         # logger.info(f"extract: appended={appended} (drained={n}) unmapped={unmapped} finished_count={num_finished}")

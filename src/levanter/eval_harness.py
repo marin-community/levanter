@@ -91,20 +91,20 @@ class SafeJSONEncoder(json.JSONEncoder):
     Custom JSON encoder that handles non-serializable objects by converting them to strings.
     These objects are sometimes emitted by lm-eval.
     """
-    
+
     def default(self, obj):
         """
         Convert non-serializable objects to strings.
-        
+
         Args:
             obj: The object to serialize
-            
+
         Returns:
             String representation of the object, or calls parent default method
         """
         if callable(obj):
             return f"<function: {obj.__name__ if hasattr(obj, '__name__') else str(obj)}>"
-        elif hasattr(obj, '__dict__'):
+        elif hasattr(obj, "__dict__"):
             return str(obj)
         return super().default(obj)
 
@@ -261,10 +261,10 @@ class _LmEvalHarnessWorker:
     def make_harness_lm(self):
         """
         Create a LevanterHarnessLM instance for the main process.
-        
+
         Returns:
             LevanterHarnessLM instance for process 0
-            
+
         Raises:
             ValueError: If called on any process other than 0
         """
@@ -276,7 +276,7 @@ class _LmEvalHarnessWorker:
     def worker_message_loop(self):
         """
         Main message loop for worker processes.
-        
+
         Continuously listens for messages from the main process and handles
         loglikelihood computation requests until a STOP message is received.
         """
@@ -330,7 +330,7 @@ class _LmEvalHarnessWorker:
 
 class _Message:
     """Message types for communication between worker processes."""
-    
+
     STOP = 0
     LOGLIKELIHOOD = 1
 
@@ -356,12 +356,12 @@ def _get_padding_count(batch, pad_token_id):
 class LevanterHarnessLM(TemplateLM):
     """
     Levanter implementation of the LM Eval Harness TemplateLM interface.
-    
+
     This class provides the interface between Levanter models and the LM Eval Harness
     evaluation framework. It handles loglikelihood computation and text generation
     for various evaluation tasks.
     """
-    
+
     def __init__(self, leader: _LmEvalHarnessWorker):
         super().__init__()
         self.leader = leader
@@ -371,7 +371,7 @@ class LevanterHarnessLM(TemplateLM):
         self.profiler_config = leader.profiler_config
         self._current_step = 0
         self._profiler_started = False
-        self.print_every_n = 0 # Prints generations every n tokens; 0 means no printing
+        self.print_every_n = 0  # Prints generations every n tokens; 0 means no printing
 
     tokenizer = property(lambda self: self.leader.tokenizer)
     EvalBatch = property(lambda self: self.leader.EvalBatch)
@@ -442,7 +442,7 @@ class LevanterHarnessLM(TemplateLM):
     def set_current_task(self, task_name: str):
         """
         Set the current task name for organizing sample outputs.
-        
+
         Args:
             task_name: Name of the current evaluation task
         """
@@ -453,7 +453,7 @@ class LevanterHarnessLM(TemplateLM):
     def get_sample_outputs(self) -> dict[str, list[dict]]:
         """
         Get all stored sample outputs.
-        
+
         Returns:
             Dictionary mapping task names to lists of sample outputs
         """
@@ -462,7 +462,7 @@ class LevanterHarnessLM(TemplateLM):
     def clear_sample_outputs(self):
         """
         Clear all stored sample outputs.
-        
+
         Removes all previously collected sample outputs from memory.
         """
         self.sample_outputs.clear()
@@ -749,7 +749,7 @@ class LevanterHarnessLM(TemplateLM):
             # Use the full remaining context for generation after accounting for prompt
             prompt_len = len(toks)
             max_gen_toks = max_length - prompt_len
-            
+
             # Ensure we have at least some space for generation (minimum 1 token)
             if max_gen_toks <= 0:
                 # Prompt is too long, truncate it to leave space for generation
@@ -757,12 +757,14 @@ class LevanterHarnessLM(TemplateLM):
                 max_prompt_len = max_length - min_gen_space
                 if prompt_len > max_prompt_len:
                     overflow = prompt_len - max_prompt_len
-                    logger.warning(f"Prompt {i} too long ({prompt_len}). Truncating left by {overflow} to fit in max_length={max_length}.")
+                    logger.warning(
+                        f"Prompt {i} too long ({prompt_len}). Truncating left by {overflow} to fit in max_length={max_length}."
+                    )
                     prompt_token_lists[i] = toks[-max_prompt_len:]
                     max_gen_toks = min_gen_space
                 else:
                     max_gen_toks = min_gen_space
-            
+
             # Update the generation kwargs with the computed max_gen_toks
             gen_kwargs["max_gen_toks"] = max_gen_toks
 
@@ -800,8 +802,8 @@ class LevanterHarnessLM(TemplateLM):
                 max_stop_seqs = max(max_stop_seqs, num_stop_seqs)
                 max_stop_tokens = max(max_stop_tokens, num_stop_tokens)
 
-        # [ChiHeem,2025-10-06] TODO: Pass this from marin to allow users to 
-        # optimize the inference based on hardware and model. 
+        # [ChiHeem,2025-10-06] TODO: Pass this from marin to allow users to
+        # optimize the inference based on hardware and model.
         engine_cfg = InferenceEngineConfig(
             max_stop_seqs=max_stop_seqs,
             max_stop_tokens=max_stop_tokens,
@@ -993,7 +995,7 @@ class TaskConfig:
     def to_dict(self):
         """
         Convert the TaskConfig to a dictionary, excluding None values.
-        
+
         Returns:
             Dictionary representation of the task configuration
         """
@@ -1005,12 +1007,12 @@ class TaskConfig:
 class LmEvalHarnessConfig:
     """
     Configuration for running the LM Eval Harness.
-    
+
     This class contains all the configuration options needed to run the LM Eval Harness
     on a Levanter model, including task specifications, generation parameters, and
     logging options.
     """
-    
+
     task_spec: list[TaskConfig | str]
     max_examples: int | None = None
     max_length: int | None = None
@@ -1045,7 +1047,7 @@ class LmEvalHarnessConfig:
     def to_task_spec(self) -> list[str | dict]:
         """
         Convert task specifications to a list of dictionaries or strings.
-        
+
         Returns:
             List of task specifications, with TaskConfig objects converted to dictionaries
         """
@@ -1209,11 +1211,11 @@ class LmEvalHarnessConfig:
 class EvalHarnessMainConfig:
     """
     Main configuration for running the LM Eval Harness as a standalone script.
-    
+
     This configuration combines the evaluation harness settings with model and
     training configuration needed to load and run a Levanter model for evaluation.
     """
-    
+
     eval_harness: LmEvalHarnessConfig
     tokenizer: str
     checkpoint_path: str
@@ -1267,7 +1269,9 @@ def run_lm_eval_harness(
     # Build both the tasks and the per-task additional stop strings map
     tasks_to_run, task_stop_map = config.to_task_dict_and_stop_map()
 
-    outputs = _actually_run_eval_harness(config, model, tasks_to_run, tokenizer, EvalBatch, axis_resources, mp, task_stop_map, profiler_config)
+    outputs = _actually_run_eval_harness(
+        config, model, tasks_to_run, tokenizer, EvalBatch, axis_resources, mp, task_stop_map, profiler_config
+    )
 
     return outputs
 
@@ -1421,7 +1425,7 @@ def _compute_averages(outputs):
 def run_eval_harness_main(config: EvalHarnessMainConfig):
     """
     Main function for running the LM Eval Harness as a standalone script.
-    
+
     Args:
         config: Configuration containing model, tokenizer, and evaluation settings
     """
@@ -1449,10 +1453,10 @@ def run_eval_harness_main(config: EvalHarnessMainConfig):
             converter: HFCheckpointConverter = model_config.hf_checkpoint_converter()
             converter = converter.replaced(reference_checkpoint=config.checkpoint_path, tokenizer=tokenizer)
             model = converter.load_pretrained(
-                model_config.model_type, 
-                ref=config.checkpoint_path, 
+                model_config.model_type,
+                ref=config.checkpoint_path,
                 dtype=config.trainer.mp.compute_dtype,  # type: ignore
-                axis_mapping=parameter_axis_mapping
+                axis_mapping=parameter_axis_mapping,
             )
         else:
             with use_cpu_device():
@@ -1512,7 +1516,7 @@ def run_eval_harness_main(config: EvalHarnessMainConfig):
 def log_report_to_tracker(prefix: str, report: dict, tracker: Optional[levanter.tracker.Tracker] = None):
     """
     Log evaluation results to the tracker.
-    
+
     Args:
         prefix: Prefix for the logged metrics
         report: Dictionary containing evaluation results
@@ -1545,14 +1549,14 @@ def log_report_to_tracker(prefix: str, report: dict, tracker: Optional[levanter.
 def lm_eval_harness(config: LmEvalHarnessConfig, tokenizer, EvalBatch, axis_resources, mp: jmp.Policy | None):
     """
     Create a callback function for running the LM Eval Harness during training.
-    
+
     Args:
         config: Configuration for the evaluation harness
         tokenizer: Tokenizer for the model
         EvalBatch: Batch axis for evaluation
         axis_resources: Resource mapping for distributed computation
         mp: Mixed precision policy
-        
+
     Returns:
         Callback function that can be used with the trainer
     """
