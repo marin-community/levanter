@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 from dataclasses import dataclass
 from typing import NamedTuple, Optional, Any
@@ -12,6 +15,8 @@ from haliax.nn import Linear
 
 from levanter.optim.config import OptimizerConfig
 from levanter.utils.jax_utils import leaf_key_paths
+
+
 @OptimizerConfig.register_subclass("adamH")
 @dataclass(frozen=True)
 class AdamHConfig(OptimizerConfig):
@@ -21,12 +26,13 @@ class AdamHConfig(OptimizerConfig):
     We ensure that the linear weights stay exactly constant norm as initialization by applying the following update rule:
 
     p_new_intermediate = p - learning_rate * u * norm(p) / norm(u)
-    p_new = p_new_intermediate / norm(p_new_intermediate) * norm(p) 
+    p_new = p_new_intermediate / norm(p_new_intermediate) * norm(p)
 
     where p is the parameter, u is the update and norm is the Frobenius norm of a matrix.
 
     The default learning rate for the AdamH configuration should be sqrt(learning_rate * weight_decay) for Adam configuration with weight decay.
     """
+
     beta1: float = 0.9
     # cf https://docs.mosaicml.com/projects/composer/en/latest/api_reference/generated/composer.optim.DecoupledAdamW.html
     # https://x.com/giffmana/status/1692641748445438301
@@ -34,25 +40,21 @@ class AdamHConfig(OptimizerConfig):
     epsilon: float = 1e-8
     max_grad_norm: Optional[float] = 1.0
     nesterov: bool = False
-    adam_lr: float = 6e-4 # learning rate used for weight without weight decay
-
+    adam_lr: float = 6e-4  # learning rate used for weight without weight decay
 
     def build(self, num_train_steps):
         """Creates the optimizer"""
         learning_rate_schedule = self.lr_scheduler(num_train_steps)
         adam_lr_schedule = self.lr_scheduler(num_train_steps, override_lr=self.adam_lr)
 
-
         # indirection makes it work with optax.inject_hyperparams so we can log the learning rate
         def optimizer(learning_rate, adam_lr):
-            
+
             def adamh_transform():
                 components = []
                 if self.max_grad_norm:
                     components.append(optax.clip_by_global_norm(self.max_grad_norm))
-                components.append(
-                    scale_by_adamh(self.beta1, self.beta2, self.epsilon, learning_rate)
-                )
+                components.append(scale_by_adamh(self.beta1, self.beta2, self.epsilon, learning_rate))
                 optimizer = optax.chain(*components)
                 return optimizer
 
@@ -70,10 +72,10 @@ class AdamHConfig(OptimizerConfig):
                 "adam": adam_transform(),
             }
 
-            return optax.multi_transform(
-                transformations, self.create_mask
-            )
+            return optax.multi_transform(transformations, self.create_mask)
+
         return optax.inject_hyperparams(optimizer)(learning_rate=learning_rate_schedule, adam_lr=adam_lr_schedule)
+
     def create_mask(self, params):
         """
         Creates a mask that labels parameters as 'adamh' or 'adam' based on their
@@ -92,8 +94,10 @@ class AdamHConfig(OptimizerConfig):
 
         return jax.tree_util.tree_map(mask_fn, params, paths, is_leaf=lambda x: isinstance(x, Linear))
 
+
 class ScaleByAdamHState(NamedTuple):
     """State for the AdamH algorithm."""
+
     count: chex.Array  # shape=(), dtype=jnp.int32.
     mu: optax.Updates
     nu: optax.Updates
@@ -108,7 +112,7 @@ def scale_by_adamh(
 ) -> optax.GradientTransformation:
     r"""Rescale updates according to the AdamH algorithm.
 
-    Concretely, 
+    Concretely,
 
     Args:
       b1: Decay rate for the exponentially weighted average of grads.
@@ -145,7 +149,6 @@ def scale_by_adamh(
         )
         mu = otu.tree_cast(mu, mu_dtype)
 
-
         # projected training for linear weight
         def scale_invariant_update(p, u):
             if p is None:
@@ -162,7 +165,6 @@ def scale_by_adamh(
                 new_p_norm = jnp.sqrt(jnp.sum(jnp.square(new_p), axis=axes, keepdims=True))
                 return new_p / new_p_norm * p_norm - p
 
-
         adamh_updates = jax.tree_util.tree_map(
             scale_invariant_update,
             params,
@@ -170,10 +172,6 @@ def scale_by_adamh(
             is_leaf=lambda x: x is None,
         )
 
-
-
-
         return adamh_updates, ScaleByAdamHState(count=count_inc, mu=mu, nu=nu)
 
     return optax.GradientTransformation(init_fn, update_fn)
-

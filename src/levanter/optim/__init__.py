@@ -51,7 +51,7 @@ from .adamh import AdamHConfig
 from .kron import KronConfig
 from .mars import MarsConfig, ScaleByMarsState
 from .muon import MuonConfig, ScaleByMuonState
-from .muonh import MuonHConfig, ScaleByMuonHState
+from .muonh import MuonHConfig
 from .rmsprop import RMSPropMomentumConfig, ScaleByRMSPropMomState
 from .scion import ScaleByScionState, ScionConfig
 from .soap import SoapConfig

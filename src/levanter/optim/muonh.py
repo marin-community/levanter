@@ -3,8 +3,7 @@
 
 import dataclasses
 from dataclasses import dataclass
-from functools import partial
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 import chex
 import jax
@@ -31,13 +30,14 @@ class MuonHConfig(OptimizerConfig):
     We ensure that the linear weights stay exactly constant norm as initialization by applying the following update rule:
 
     p_new_intermediate = p - learning_rate * u * norm(p) / norm(u)
-    p_new = p_new_intermediate / norm(p_new_intermediate) * norm(p) 
+    p_new = p_new_intermediate / norm(p_new_intermediate) * norm(p)
 
     where p is the parameter, u is the update and norm is the Frobenius norm of a matrix.
 
     The default learning rate for the MuonH configuration should be sqrt(learning_rate * weight_decay) for Muon configuration with weight decay.
 
     """
+
     adam_lr: float = 6e-4  # Adam LR
     momentum: float = 0.95
     nesterov: bool = True
@@ -67,7 +67,7 @@ class MuonHConfig(OptimizerConfig):
                 )
                 optimizer = optax.chain(*components)
                 return optimizer
-            
+
             def adamh_transform():
                 components = []
                 if self.max_grad_norm:
@@ -91,9 +91,7 @@ class MuonHConfig(OptimizerConfig):
                 "adam": adam_transform(),
             }
 
-            return optax.multi_transform(
-                transformations, self.create_mask
-            )
+            return optax.multi_transform(transformations, self.create_mask)
 
         return optax.inject_hyperparams(optimizer)(learning_rate=learning_rate_schedule, adam_lr=adam_lr_schedule)
 
@@ -164,6 +162,7 @@ def scale_with_muonh(momentum=0.95, nesterov=True, steps=5, muon_eps=1e-8, learn
             return dataclasses.replace(layer, weight=updated_weight)  # type: ignore
 
         muon_updates = map_flattened_linear_layers(transform_linear_layer, updates)
+
         # projected training for linear weight
         def scale_invariant_update(p, u):
             if p is None:
@@ -179,7 +178,6 @@ def scale_with_muonh(momentum=0.95, nesterov=True, steps=5, muon_eps=1e-8, learn
                 new_p = p - learning_rate * u * p_norm / u_norm
                 new_p_norm = jnp.sqrt(jnp.sum(jnp.square(new_p), axis=axes, keepdims=True))
                 return new_p / new_p_norm * p_norm - p
-
 
         muonh_updates = jax.tree_util.tree_map(
             scale_invariant_update,
