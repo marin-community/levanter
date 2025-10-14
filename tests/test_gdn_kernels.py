@@ -11,6 +11,8 @@ import pytest
 from levanter.layers.gated_deltanet import chunk_gated_delta_rule, recurrent_gated_delta_rule
 from tests.test_utils import skip_if_no_torch
 
+jax.config.update("jax_default_matmul_precision", "float32")
+
 
 def _to_np(x):
     return np.array(x.detach().cpu().numpy())

@@ -17,6 +17,8 @@ from levanter.layers.gated_deltanet import (
 )
 from tests.test_utils import skip_if_no_torch
 
+jax.config.update("jax_default_matmul_precision", "float32")
+
 
 def _np(x):
     return np.array(x.detach().cpu().numpy())

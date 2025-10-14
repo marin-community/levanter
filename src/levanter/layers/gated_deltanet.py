@@ -444,8 +444,8 @@ def chunk_gated_delta_rule(
     diff = gi.broadcast_axis(Cj) - gj.broadcast_axis(Ci)
     # Avoid overflow/NaNs in the strict upper triangle by setting exp argument to -inf
     neg_inf = jnp.asarray(-jnp.inf, dtype=diff.dtype)
-    diff = hax.where(_tri_upper_eq_mask(Ci, Cj), neg_inf, diff)
     diff = hax.where(_diag_mask(Ci, Cj), jnp.asarray(0.0, dtype=diff.dtype), diff)
+    diff = hax.where(_tri_upper_eq_mask(Ci, Cj), neg_inf, diff)
     decay = hax.exp(diff)  # [B,Nc,Ci,Cj,H]
 
     # Zero out diagonal and strict upper triangle
@@ -621,7 +621,7 @@ class GatedDeltaNet(eqx.Module):
         C = config.key_dim * 2 + config.value_dim
         K = config.conv_kernel_size
         conv_weight = jax.random.normal(k_conv, (C, K), dtype=jnp.float32) * (1.0 / jnp.sqrt(C * K))
-        conv_bias = None  # matches many CUDA fast-path impls (bias fused upstream)
+        conv_bias = None
 
         # GDN discretization parameters (per V-head)
         A_log = jnp.log(jax.random.uniform(k_out, (config.num_v_heads,), minval=0.0, maxval=16.0, dtype=jnp.float32))
