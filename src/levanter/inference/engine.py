@@ -1315,7 +1315,7 @@ class InferenceEngine:
         else:
             logger.info(f"Written trace info to {path}")
 
-    def _extract_outputs(self, pending_outputs, print_every_n: int = 1) -> int:
+    def _extract_outputs(self, pending_outputs, print_every_n: int = 0) -> int:
         """Append newly available tokens into outputs per (request_id, child_id).
 
         Returns number of new tokens appended.
@@ -1380,7 +1380,7 @@ class InferenceEngine:
 
         return appended
 
-    def _ingest_outputs(self, outputs: _DecodeOutputs | None, print_every_n: int = 1) -> int:
+    def _ingest_outputs(self, outputs: _DecodeOutputs | None, print_every_n: int = 0) -> int:
         """Drain device outputs into host results and apply host-side release.
 
         Returns the number of tokens appended to results. No-op if outputs is None.
