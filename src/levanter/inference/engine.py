@@ -1153,9 +1153,9 @@ class InferenceEngine:
             if step_callback is not None:
                 step_callback(decode_iteration)
 
-            iter_start = time.time()
+            # iter_start = time.time()
 
-            fake_submit_start = time.time()
+            # fake_submit_start = time.time()
             # future_state, decode_outputs = _run_generation_loop(
             jax.tree.flatten(
                 (
@@ -1166,9 +1166,9 @@ class InferenceEngine:
                     0,
                 )
             )
-            fake_submit_done = time.time()
+            # fake_submit_done = time.time()
 
-            submit_start = iter_start
+            # submit_start = iter_start
             future_state, decode_outputs = _run_generation_loop(
                 self.gen_state,
                 self.model,
@@ -1177,17 +1177,17 @@ class InferenceEngine:
                 self.config.imputed_max_tokens_per_round,
                 self.config.max_rounds,
             )
-            submit_done = time.time()
+            # submit_done = time.time()
             # Time spent with device executing (and the host thread waiting)
             self.gen_state = future_state
-            device_time = time.time() - submit_done
+            # device_time = time.time() - submit_done
 
-            extract_start = time.time()
+            # extract_start = time.time()
             new_tokens = self._ingest_outputs(decode_outputs, print_every_n=print_every_n)
-            extract_time = time.time() - extract_start
+            # extract_time = time.time() - extract_start
 
             # Release any sequences that finished in this step
-            release_start = time.time()
+            # release_start = time.time()
             # Admit more if capacity allows
             admit_outputs = self._admit_from_queue()
             if admit_outputs is not None:
@@ -1195,13 +1195,13 @@ class InferenceEngine:
             else:
                 mid_tokens = 0
             new_tokens += mid_tokens
-            release_time = time.time() - release_start
+            # release_time = time.time() - release_start
 
-            iter_end = time.time()
-            iter_time = iter_end - iter_start
+            # iter_end = time.time()
+            # iter_time = iter_end - iter_start
             # Host time is everything except the device execution wait
-            host_time = max(iter_time - device_time, 0.0)
-            submit_time = submit_done - submit_start
+            # host_time = max(iter_time - device_time, 0.0)
+            # submit_time = submit_done - submit_start
             # if iter_time > 0:
             #     tps_total = new_tokens / iter_time
             #     logger.info(
@@ -1246,8 +1246,8 @@ class InferenceEngine:
                 logprobs_list.append(dr.logprobs if dr.logprobs is not None else [])
             self.results[rid] = kid_map
         total_generated = sum(len(seq_outputs) for seq_outputs in outputs_list)
-        total_time = time.time() - time_in
-        tps_overall = (total_generated / total_time) if total_time > 0 else 0.0
+        # total_time = time.time() - time_in
+        # tps_overall = (total_generated / total_time) if total_time > 0 else 0.0
         # logger.info(f"Batch generated in {total_time:.2f}s, {total_generated} tokens, {tps_overall:.2f} tok/s")
         # Clear results for these requests now that we've assembled outputs
         for rid in call_rids:
@@ -1377,7 +1377,7 @@ class InferenceEngine:
                         f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): <decode_error: {e}>"
                     )
 
-        num_finished = int(fins.sum()) if hasattr(fins, "sum") else 0
+        # num_finished = int(fins.sum()) if hasattr(fins, "sum") else 0
         # logger.info(f"extract: appended={appended} (drained={n}) unmapped={unmapped} finished_count={num_finished}")
 
         return appended
