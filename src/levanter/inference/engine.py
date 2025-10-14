@@ -249,8 +249,7 @@ def _clone_sequence(
         seq_params=seq_params,
     )
     # Record clone mapping on the child slot
-    new_clone_sources = decode_state.clone_sources.at["seq", child_local_id].set(parent_local_id)
-    new_sequences = dataclasses.replace(decode_state.sequences, clone_sources=new_clone_sources)
+    new_sequences = decode_state.sequences.set_clone_source(child_local_id, parent_local_id)
     decode_state = dataclasses.replace(decode_state, sequences=new_sequences)
 
     page_table = page_table.clone_pages_from(parent_local_id, child_local_id)

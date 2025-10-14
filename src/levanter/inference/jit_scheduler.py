@@ -83,6 +83,38 @@ class SequenceTable(eqx.Module):
     def max_seqs(self) -> int:
         return self.seq_lens.axis_size("seq")
 
+    def with_seq_lens(self, seq_lens: ht.i32[NamedArray, "seq"]) -> "SequenceTable":  # type: ignore[name-defined]
+        return SequenceTable(seq_lens, self.clone_sources, self.kv_pages)
+
+    def with_clone_sources(self, clone_sources: ht.i32[NamedArray, "seq"]) -> "SequenceTable":  # type: ignore[name-defined]
+        return SequenceTable(self.seq_lens, clone_sources, self.kv_pages)
+
+    def with_kv_pages(self, kv_pages: ht.i32[NamedArray, "seq page"]) -> "SequenceTable":  # type: ignore[name-defined]
+        return SequenceTable(self.seq_lens, self.clone_sources, kv_pages)
+
+    def assign_slot(
+        self,
+        slot_id: int,
+        *,
+        seq_len: jnp.ndarray,
+        kv_pages: ht.i32[NamedArray, "page"],  # type: ignore[name-defined]
+        clone_source: jnp.ndarray | int = INVALID,
+    ) -> "SequenceTable":
+        new_seq_lens = self.seq_lens.at["seq", slot_id].set(seq_len)
+        new_clone_sources = self.clone_sources.at["seq", slot_id].set(clone_source)
+        new_kv_pages = self.kv_pages.at["seq", slot_id].set(kv_pages)
+        return SequenceTable(new_seq_lens, new_clone_sources, new_kv_pages)
+
+    def set_clone_source(self, slot_id: int, clone_source: jnp.ndarray | int) -> "SequenceTable":
+        new_clone_sources = self.clone_sources.at["seq", slot_id].set(clone_source)
+        return SequenceTable(self.seq_lens, new_clone_sources, self.kv_pages)
+
+    def clear_slots(self, mask: ht.bool_[NamedArray, "seq"]) -> "SequenceTable":  # type: ignore[name-defined]
+        new_seq_lens = hax.where(mask, INVALID, self.seq_lens)
+        new_clone_sources = hax.where(mask, INVALID, self.clone_sources)
+        new_kv_pages = hax.where(mask, INVALID, self.kv_pages)
+        return SequenceTable(new_seq_lens, new_clone_sources, new_kv_pages)
+
 
 class DecodeState(eqx.Module):
     """
@@ -195,15 +227,8 @@ class DecodeState(eqx.Module):
         - Clears ``kv_pages`` rows for finished slots to INVALID
         """
         mask = self.finished
-        sequences = self.sequences
-        new_seq_lens = hax.where(mask, INVALID, sequences.seq_lens)
-        new_clone_sources = hax.where(mask, INVALID, sequences.clone_sources)
-        new_kv_pages = hax.where(mask, INVALID, sequences.kv_pages)
-        finished = hax.zeros_like(self.finished)  # reset finished flags
-
-        new_sequences = dataclasses.replace(
-            sequences, seq_lens=new_seq_lens, clone_sources=new_clone_sources, kv_pages=new_kv_pages
-        )
+        finished = hax.zeros_like(self.finished)
+        new_sequences = self.sequences.clear_slots(mask)
         return dataclasses.replace(self, sequences=new_sequences, finished=finished)
 
     def prng_key_for(self, slot_id: int, pos_id: int) -> jaxtyping.PRNGKeyArray:
@@ -267,7 +292,7 @@ class DecodeState(eqx.Module):
             return jax.lax.cond(is_valid(tid), do, lambda c: c, cmap)
 
         new_map = jax.lax.fori_loop(0, num_targets, body, clone_map)
-        new_sequences = dataclasses.replace(self.sequences, clone_sources=new_map)
+        new_sequences = self.sequences.with_clone_sources(new_map)
         return dataclasses.replace(self, sequences=new_sequences)
 
     def clone_pages_from(self, src, dest) -> "DecodeState":
@@ -327,16 +352,7 @@ class DecodeState(eqx.Module):
         if kv_pages is None:
             kv_pages = hax.full_like(sequences.kv_pages["seq", local_slot_id], INVALID)
 
-        updated_kv_pages = sequences.kv_pages.at["seq", local_slot_id].set(kv_pages)
-        updated_seq_lens = sequences.seq_lens.at["seq", local_slot_id].set(seq_len)
-        updated_clone_sources = sequences.clone_sources.at["seq", local_slot_id].set(INVALID)
-
-        new_sequences = dataclasses.replace(
-            sequences,
-            kv_pages=updated_kv_pages,
-            seq_lens=updated_seq_lens,
-            clone_sources=updated_clone_sources,
-        )
+        new_sequences = sequences.assign_slot(local_slot_id, seq_len=seq_len, kv_pages=kv_pages)
 
         new_state = dataclasses.replace(
             self,
@@ -451,7 +467,7 @@ class DecodeState(eqx.Module):
         # Enqueue tokens and their corresponding position ids into the queue
         new_tqueue = self.tqueue.enqueue_tokens(new_tokens, local_slot_ids, pos_ids, num_new_tokens_to_queue)
 
-        new_sequences = dataclasses.replace(sequences, seq_lens=counts)
+        new_sequences = sequences.with_seq_lens(counts)
 
         return dataclasses.replace(
             self, tokens=tokens, logprobs=logprobs, sequences=new_sequences, tqueue=new_tqueue, finished=fins
