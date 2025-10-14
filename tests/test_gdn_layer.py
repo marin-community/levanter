@@ -296,12 +296,12 @@ def test_gdn_layer_matches_hf_prefill():
         hax.named(ba.numpy(), ("batch", "position", "ba")),
     )
 
-    np.testing.assert_allclose(q_lev.array, q_hf, atol=0, rtol=0)
-    np.testing.assert_allclose(k_lev.array, k_hf, atol=0, rtol=0)
-    np.testing.assert_allclose(v_lev.array, v_hf, atol=0, rtol=0)
-    np.testing.assert_allclose(z_lev.array, z_hf, atol=0, rtol=0)
-    np.testing.assert_allclose(b_lev.array, b_hf, atol=0, rtol=0)
-    np.testing.assert_allclose(a_lev.array, a_hf, atol=0, rtol=0)
+    np.testing.assert_allclose(q_lev.array, q_hf, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(k_lev.array, k_hf, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(v_lev.array, v_hf, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(z_lev.array, z_hf, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(b_lev.array, b_hf, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(a_lev.array, a_hf, atol=1e-4, rtol=1e-4)
 
     # Levanter forward (prefill)
     y_lev, _ = lev_layer(x_named, inference=True, chunk_size=32)

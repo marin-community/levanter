@@ -86,6 +86,7 @@ def _causal_depthwise_conv1d_full(
         padding="VALID",
         dimension_numbers=("NCH", "OIH", "NCH"),
         feature_group_count=C,  # depthwise
+        precision=lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
     if bias_c is not None:
@@ -122,6 +123,7 @@ def _causal_depthwise_conv1d_update(
         padding="VALID",
         dimension_numbers=("NCH", "OIH", "NCH"),
         feature_group_count=x_hist.shape[1],
+        precision=lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
     y = y2[..., -1:]  # (N, C, 1): the newest output sample
