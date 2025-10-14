@@ -63,6 +63,27 @@ class SeqDecodingParams(eqx.Module):
         )
 
 
+class SequenceTable(eqx.Module):
+    """Compact view over per-sequence metadata tracked by :class:`DecodeState`."""
+
+    seq_lens: ht.i32[NamedArray, "seq"]
+    clone_sources: ht.i32[NamedArray, "seq"]
+    kv_pages: ht.i32[NamedArray, "seq page"]
+
+    @staticmethod
+    def init(max_seqs: int, pages_per_seq: int) -> "SequenceTable":
+        """Create an empty sequence table."""
+        return SequenceTable(
+            seq_lens=hax.zeros({"seq": max_seqs}, dtype=jnp.int32),
+            clone_sources=hax.full({"seq": max_seqs}, INVALID, dtype=jnp.int32),
+            kv_pages=hax.full({"seq": max_seqs, "page": pages_per_seq}, INVALID, dtype=jnp.int32),
+        )
+
+    @property
+    def max_seqs(self) -> int:
+        return self.seq_lens.axis_size("seq")
+
+
 class DecodeState(eqx.Module):
     """
     State of sequences during decoding. This manages a "hot set" of sequences that are currently being decoded.
@@ -79,19 +100,8 @@ class DecodeState(eqx.Module):
     tokens: ht.i32[NamedArray, "seq position"]
     """ most recent tokens generated for each sequence. Should always start at a page boundary. """
     logprobs: ht.Float[NamedArray, "seq position"] | None  # log probabilities of the tokens
-    seq_lens: ht.i32[NamedArray, "seq"]
-    """Sequence length for each sequence. This is the number of tokens currently in the sequence"""
-    clone_sources: ht.i32[NamedArray, "seq"]
-    """
-    For each local sequence slot, the local source id it should be cloned from, or INVALID if it's either already
-    been cloned or is an original sequence. This is used to implement efficient cloning of sequences for multi-sample
-    decoding or potentially beam search / particle filtering.
-    """
-
-    # TODO: these aren't actually used anywhere. (We currently only use them from PageTable)
-    # This is a better place for them, so we should move them here and update the code to use them.
-    kv_pages: ht.i32[NamedArray, "seq page"]
-    """Key-value pages for each sequence. This is used to store the key-value pairs for the sequences."""
+    sequences: SequenceTable
+    """Aggregated per-sequence state such as lengths, clone metadata, and KV page assignments."""
     page_size: int = eqx.field(static=True)
 
     # Page table for KV page allocation and per-sequence lengths/usage
@@ -133,8 +143,10 @@ class DecodeState(eqx.Module):
         page_size = page_table.page_size
         max_seq_len = page_table.max_len_per_seq
 
+        sequence_table = SequenceTable.init(max_seqs, pages_per_seq)
+
         return DecodeState(
-            kv_pages=hax.full({"seq": max_seqs, "page": pages_per_seq}, INVALID, dtype=jnp.int32),
+            sequences=sequence_table,
             page_size=page_size,
             page_table=page_table,
             tokens=hax.full({"seq": max_seqs, "position": max_seq_len}, pad_token_id, dtype=jnp.int32),
@@ -143,8 +155,6 @@ class DecodeState(eqx.Module):
                 if not enable_logprobs
                 else hax.full({"seq": max_seqs, "position": max_seq_len}, jnp.nan, dtype=jnp.float32)
             ),
-            seq_lens=hax.zeros({"seq": max_seqs}, dtype=jnp.int32),
-            clone_sources=hax.full({"seq": max_seqs}, INVALID, dtype=jnp.int32),
             max_num_tokens=hax.full({"seq": max_seqs}, 0, dtype=jnp.int32),
             stop_tokens=(
                 hax.full(
@@ -161,6 +171,21 @@ class DecodeState(eqx.Module):
             finished=hax.zeros({"seq": max_seqs}, dtype=bool),
         )
 
+    @property
+    def seq_lens(self) -> ht.i32[NamedArray, "seq"]:  # type: ignore[name-defined]
+        """Current logical length for each active sequence."""
+        return self.sequences.seq_lens
+
+    @property
+    def clone_sources(self) -> ht.i32[NamedArray, "seq"]:  # type: ignore[name-defined]
+        """Mapping from clone targets to their parent sequences."""
+        return self.sequences.clone_sources
+
+    @property
+    def kv_pages(self) -> ht.i32[NamedArray, "seq page"]:  # type: ignore[name-defined]
+        """KV page assignments per sequence."""
+        return self.sequences.kv_pages
+
     @eqx.filter_jit(donate="all")
     def invalidate_finished(self) -> "DecodeState":
         """Invalidate metadata for sequences marked finished by ``finished_mask``.
@@ -170,18 +195,16 @@ class DecodeState(eqx.Module):
         - Clears ``kv_pages`` rows for finished slots to INVALID
         """
         mask = self.finished
-        new_seq_lens = hax.where(mask, INVALID, self.seq_lens)
-        new_clone_sources = hax.where(mask, INVALID, self.clone_sources)
-        new_kv_pages = hax.where(mask, INVALID, self.kv_pages)
+        sequences = self.sequences
+        new_seq_lens = hax.where(mask, INVALID, sequences.seq_lens)
+        new_clone_sources = hax.where(mask, INVALID, sequences.clone_sources)
+        new_kv_pages = hax.where(mask, INVALID, sequences.kv_pages)
         finished = hax.zeros_like(self.finished)  # reset finished flags
 
-        return dataclasses.replace(
-            self,
-            seq_lens=new_seq_lens,
-            clone_sources=new_clone_sources,
-            kv_pages=new_kv_pages,
-            finished=finished,
+        new_sequences = dataclasses.replace(
+            sequences, seq_lens=new_seq_lens, clone_sources=new_clone_sources, kv_pages=new_kv_pages
         )
+        return dataclasses.replace(self, sequences=new_sequences, finished=finished)
 
     def prng_key_for(self, slot_id: int, pos_id: int) -> jaxtyping.PRNGKeyArray:
         """
@@ -233,7 +256,7 @@ class DecodeState(eqx.Module):
 
         JIT-safe: uses a bounded fori_loop over ``num_targets``.
         """
-        clone_map = self.clone_sources
+        clone_map = self.sequences.clone_sources
 
         def body(i, cmap):
             tid = target_slot_ids["position", i].scalar()
@@ -244,7 +267,8 @@ class DecodeState(eqx.Module):
             return jax.lax.cond(is_valid(tid), do, lambda c: c, cmap)
 
         new_map = jax.lax.fori_loop(0, num_targets, body, clone_map)
-        return dataclasses.replace(self, clone_sources=new_map)
+        new_sequences = dataclasses.replace(self.sequences, clone_sources=new_map)
+        return dataclasses.replace(self, sequences=new_sequences)
 
     def clone_pages_from(self, src, dest) -> "DecodeState":
         """
@@ -299,12 +323,24 @@ class DecodeState(eqx.Module):
 
         new_tokens = self.tokens.at["seq", local_slot_id, "position", 0 : tokens.axis_size("position")].set(tokens)
 
+        sequences = self.sequences
         if kv_pages is None:
-            kv_pages = hax.full_like(self.kv_pages["seq", local_slot_id], INVALID)
+            kv_pages = hax.full_like(sequences.kv_pages["seq", local_slot_id], INVALID)
+
+        updated_kv_pages = sequences.kv_pages.at["seq", local_slot_id].set(kv_pages)
+        updated_seq_lens = sequences.seq_lens.at["seq", local_slot_id].set(seq_len)
+        updated_clone_sources = sequences.clone_sources.at["seq", local_slot_id].set(INVALID)
+
+        new_sequences = dataclasses.replace(
+            sequences,
+            kv_pages=updated_kv_pages,
+            seq_lens=updated_seq_lens,
+            clone_sources=updated_clone_sources,
+        )
 
         new_state = dataclasses.replace(
             self,
-            kv_pages=self.kv_pages.at["seq", local_slot_id].set(kv_pages),
+            sequences=new_sequences,
             tokens=new_tokens,
             # set log probs to nan for the prefix tokens
             logprobs=(
@@ -312,7 +348,6 @@ class DecodeState(eqx.Module):
                 if self.logprobs is not None
                 else None
             ),
-            seq_lens=self.seq_lens.at["seq", local_slot_id].set(seq_len),
             finished=self.finished.at["seq", local_slot_id].set(False),
         )
 
@@ -362,7 +397,8 @@ class DecodeState(eqx.Module):
         """
         tokens = self.tokens
         logprobs = self.logprobs
-        counts = self.seq_lens
+        sequences = self.sequences
+        counts = sequences.seq_lens
         fins = self.finished
 
         # We'll also compute per-token absolute position ids to feed into the TokenQueue.
@@ -415,8 +451,10 @@ class DecodeState(eqx.Module):
         # Enqueue tokens and their corresponding position ids into the queue
         new_tqueue = self.tqueue.enqueue_tokens(new_tokens, local_slot_ids, pos_ids, num_new_tokens_to_queue)
 
+        new_sequences = dataclasses.replace(sequences, seq_lens=counts)
+
         return dataclasses.replace(
-            self, tokens=tokens, logprobs=logprobs, seq_lens=counts, tqueue=new_tqueue, finished=fins
+            self, tokens=tokens, logprobs=logprobs, sequences=new_sequences, tqueue=new_tqueue, finished=fins
         )
 
     def is_finished(self, slot_id: jnp.ndarray) -> jnp.ndarray:
@@ -445,11 +483,11 @@ kv_pages: {kv_pages}
 logprobs: {logprobs}
 max_num_tokens: {max_num_tokens}
 """,
-            num_tokens=self.seq_lens,
+            num_tokens=self.sequences.seq_lens,
             finished=self.finished,
             tokens=self.tokens,
             stop_tokens=self.stop_tokens,
-            kv_pages=self.kv_pages,
+            kv_pages=self.sequences.kv_pages,
             logprobs=self.logprobs if self.logprobs is not None else "None",
             max_num_tokens=self.max_num_tokens,
         )
