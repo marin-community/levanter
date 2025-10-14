@@ -86,6 +86,7 @@ def _causal_depthwise_conv1d_full(
         padding="VALID",
         dimension_numbers=("NCH", "OIH", "NCH"),
         feature_group_count=C,  # depthwise
+        preferred_element_type=jnp.float32,
     )
     if bias_c is not None:
         y = y + bias_c[:, None]
@@ -121,6 +122,7 @@ def _causal_depthwise_conv1d_update(
         padding="VALID",
         dimension_numbers=("NCH", "OIH", "NCH"),
         feature_group_count=x_hist.shape[1],
+        preferred_element_type=jnp.float32,
     )
     y = y2[..., -1:]  # (N, C, 1): the newest output sample
     if bias_c is not None:
