@@ -769,18 +769,6 @@ class LevanterHarnessLM(TemplateLM):
             gen_kwargs["max_gen_toks"] = max_gen_toks
 
         # Process stop sequences for each request individually
-        # Merge per-task additional stop strings if available
-        task_name = getattr(self, "_current_task", None)
-        addl_stops_for_task: list[str] = []
-        if task_name is not None and hasattr(self.leader, "_task_additional_stops"):
-            addl_stops_for_task = self.leader._task_additional_stops.get(task_name, [])
-        if addl_stops_for_task:
-            for gen_kwargs in processed_kwargs_list:
-                existing_until = list(gen_kwargs.get("until") or [])
-                for s in addl_stops_for_task:
-                    if s and s not in existing_until:
-                        existing_until.append(s)
-                gen_kwargs["until"] = existing_until
 
         # Get EOS token for stop sequence handling
         eos = self.tokenizer.decode(self.eot_token_id)
@@ -1266,11 +1254,11 @@ def run_lm_eval_harness(
         - "averages": A dictionary with macro and micro averages for all metrics.
         Otherwise, returns None.
     """
-    # Build both the tasks and the per-task additional stop strings map
-    tasks_to_run, task_stop_map = config.to_task_dict_and_stop_map()
+    # Build the tasks dictionary
+    tasks_to_run = config.to_task_dict()
 
     outputs = _actually_run_eval_harness(
-        config, model, tasks_to_run, tokenizer, EvalBatch, axis_resources, mp, task_stop_map, profiler_config
+        config, model, tasks_to_run, tokenizer, EvalBatch, axis_resources, mp, profiler_config
     )
 
     return outputs
@@ -1284,7 +1272,6 @@ def _actually_run_eval_harness(
     EvalBatch: haliax.Axis,
     axis_resources: ResourceMapping,
     mp: jmp.Policy | None,
-    task_stop_map: dict[str, list[str]],
     profiler_config: ProfilerConfig | None = None,
 ) -> dict | None:
     """
@@ -1319,9 +1306,6 @@ def _actually_run_eval_harness(
         sample_logging_config=config.sample_logging,
         profiler_config=profiler_config,
     )
-
-    # Attach additional stop strings map to worker so the LM can consult by task name
-    worker._task_additional_stops = task_stop_map
 
     if jax.process_index() == 0:
         logger.info("Process 0 is running the eval harness.")
