@@ -131,6 +131,132 @@ def _load_hf_weights_into_lev(lev_layer: GatedDeltaNet, hf_layer) -> GatedDeltaN
     return lev_layer
 
 
+# -------------------------------
+# JAX-only layer-level tests
+# -------------------------------
+
+
+def test_layer_streaming_decode_matches_one_shot_prefill():
+    """Streaming (per-token) with carried (conv_state, S_state) must match one-shot prefill."""
+    key = jax.random.PRNGKey(0)
+    B, L = 2, 20
+    cfg = GatedDeltaNetConfig(
+        Embed=Axis("embed", 32),
+        num_k_heads=2,
+        num_v_heads=4,  # ratio > 1 exercises Q/K repetition across V groups
+        head_k_dim=8,
+        head_v_dim=8,
+        conv_kernel_size=4,
+        rms_norm_eps=1e-6,
+    )
+    layer = GatedDeltaNet.init(cfg, key=key)
+
+    Batch, Pos, Embed = Axis("batch", B), Axis("position", L), cfg.Embed
+    xkey = jax.random.PRNGKey(0)
+    x = hax.named(jax.random.normal(xkey, (B, L, Embed.size), dtype=jnp.float32), (Batch, Pos, Embed))
+
+    # One-shot prefill (returns final state as well since inference=True)
+    y_full, state_full = layer(x, inference=True, chunk_size=8, attention_mask=None, decode_state=None)
+    assert state_full is not None
+
+    # Streaming decode: step through one token at a time with carried state
+    Channels = cfg.key_dim * 2 + cfg.value_dim
+    K = cfg.conv_kernel_size
+    conv_state = jnp.zeros((B, Channels, K), dtype=jnp.float32)
+    S_state = jnp.zeros((B, cfg.num_v_heads, cfg.head_k_dim, cfg.head_v_dim), dtype=jnp.float32)
+
+    ys = []
+    for t in range(L):
+        xt = x["position", hax.ds(t, Axis("pos1", 1))]
+        y_t, (conv_state, S_state) = layer(xt, inference=True, chunk_size=8, decode_state=(conv_state, S_state))
+        ys.append(y_t.array)
+
+    y_stream = np.concatenate(ys, axis=1)  # (B, L, Embed)
+    np.testing.assert_allclose(y_stream, y_full.array, rtol=1e-5, atol=1e-5)
+
+
+def test_layer_masking_trailing_zeros_equivalence():
+    """Zeroing trailing positions via attention_mask should not change earlier outputs (causality)."""
+    key = jax.random.PRNGKey(0)
+    B, L = 2, 19
+    cfg = GatedDeltaNetConfig(
+        Embed=Axis("embed", 48),
+        num_k_heads=2,
+        num_v_heads=2,
+        head_k_dim=8,
+        head_v_dim=8,
+        conv_kernel_size=4,
+        rms_norm_eps=1e-6,
+    )
+    layer = GatedDeltaNet.init(cfg, key=key)
+
+    Batch, Pos, Embed = Axis("batch", B), Axis("position", L), cfg.Embed
+    x = hax.named(jax.random.normal(key, (B, L, Embed.size), dtype=jnp.float32), (Batch, Pos, Embed))
+
+    # Keep first L0 tokens
+    L0 = 11
+    mask = hax.named(
+        jnp.concatenate([jnp.ones((B, L0)), jnp.zeros((B, L - L0))], axis=1).astype(jnp.float32),
+        (Batch.name, Pos.name),
+    )
+
+    y_masked, _ = layer(x, inference=False, attention_mask=mask)
+    y_trunc, _ = layer(x["position", hax.ds(0, Axis("pos1", L0))], inference=False)
+
+    np.testing.assert_allclose(y_masked.array[:, :L0, :], y_trunc.array, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("csize_a,csize_b", [(8, 16), (16, 32)])
+def test_layer_chunk_size_invariance(csize_a, csize_b):
+    """Prefill outputs should be invariant to chunk size."""
+    key = jax.random.PRNGKey(0)
+    B, L = 2, 37
+    cfg = GatedDeltaNetConfig(
+        Embed=Axis("embed", 40),
+        num_k_heads=2,
+        num_v_heads=4,
+        head_k_dim=8,
+        head_v_dim=8,
+        conv_kernel_size=4,
+        rms_norm_eps=1e-6,
+    )
+    layer = GatedDeltaNet.init(cfg, key=key)
+
+    Batch, Pos, Embed = Axis("batch", B), Axis("position", L), cfg.Embed
+    x = hax.named(jax.random.normal(key, (B, L, Embed.size), dtype=jnp.float32), (Batch, Pos, Embed))
+
+    y_a, _ = layer(x, inference=False, chunk_size=csize_a)
+    y_b, _ = layer(x, inference=False, chunk_size=csize_b)
+    np.testing.assert_allclose(y_a.array, y_b.array, rtol=1e-5, atol=1e-5)
+
+
+def test_layer_gradients_exist():
+    """End-to-end differentiability: grads w.r.t. inputs exist and are finite."""
+    key = jax.random.PRNGKey(0)
+    B, L = 1, 12
+    cfg = GatedDeltaNetConfig(
+        Embed=Axis("embed", 32),
+        num_k_heads=2,
+        num_v_heads=2,
+        head_k_dim=8,
+        head_v_dim=8,
+        conv_kernel_size=4,
+        rms_norm_eps=1e-6,
+    )
+    layer = GatedDeltaNet.init(cfg, key=key)
+
+    Batch, Pos, Embed = Axis("batch", B), Axis("position", L), cfg.Embed
+    x0 = hax.named(jax.random.normal(key, (B, L, Embed.size), dtype=jnp.float32), (Batch, Pos, Embed))
+
+    def loss_fn(x_arr):
+        x = hax.named(x_arr, x0.axes)
+        y, _ = layer(x, inference=False, chunk_size=8)
+        return jnp.sum(y.array)
+
+    grads = jax.grad(loss_fn)(x0.array)
+    assert jnp.all(jnp.isfinite(grads))
+
+
 @skip_if_no_torch
 def test_gdn_layer_matches_hf_prefill():
     import torch  # local import for environments without torch
