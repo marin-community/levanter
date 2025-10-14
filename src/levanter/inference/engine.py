@@ -549,20 +549,21 @@ def _handle_clones(
     new_tokens, log_probs = hax.vmap(sampler, "position")(logits_this_time, temps, key=prng_keys)
 
     # update page table and cache for the clone targets
-    page_table = gen_state.decode_state.page_table
+    decode_state = gen_state.decode_state
     cache = gen_state.cache
-    size = page_table.page_size
+    size = decode_state.page_size
 
     def copy_pages_for_updated_seq(
         i,
-        state: tuple[PageTable, KvPageCache],
-    ) -> tuple[PageTable, KvPageCache]:
-        page_table, cache = state
+        state: tuple[DecodeState, KvPageCache],
+    ) -> tuple[DecodeState, KvPageCache]:
+        decode_state, cache = state
         src_slot_id = src_ids["position", i].scalar()
         dst_slot_id = tgt_ids["position", i].scalar()
-        page_table = page_table.clone_pages_from(src_slot_id, dst_slot_id)
+        decode_state = decode_state.clone_pages_from(src_slot_id, dst_slot_id)
+        page_table = decode_state.page_table
 
-        src_len = page_table.seq_lens["seq", src_slot_id].scalar()
+        src_len = decode_state.seq_lens["seq", src_slot_id].scalar()
         used_pages = (src_len + size - 1) // size
         last_idx = jnp.maximum(used_pages - 1, 0)
 
@@ -575,16 +576,14 @@ def _handle_clones(
             return cache
 
         cache = jax.lax.cond((src_len % size != 0) & (src_len > 0), _copy, _identity, None)
-        return page_table, cache
+        return decode_state, cache
 
-    page_table, cache = jax.lax.fori_loop(0, num_new, copy_pages_for_updated_seq, (page_table, cache))
+    decode_state, cache = jax.lax.fori_loop(0, num_new, copy_pages_for_updated_seq, (decode_state, cache))
 
     # Enqueue/update tokens for the clone targets (only the first num_new entries will be used)
-    decode_state = gen_state.decode_state.update_tokens(new_tokens, tgt_ids, log_probs, num_new)
+    decode_state = decode_state.update_tokens(new_tokens, tgt_ids, log_probs, num_new)
     # Discharge processed clones so they are not reprocessed in subsequent flushes
     decode_state = decode_state.discharge_clone(tgt_ids, num_new)
-    # persist page table into decode state
-    decode_state = dataclasses.replace(decode_state, page_table=page_table)
     gen_state = dataclasses.replace(gen_state, decode_state=decode_state, cache=cache)
 
     # Append clone outputs
