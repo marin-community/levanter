@@ -66,6 +66,7 @@ class LlamaConfig(HFCompatConfig):
     layer_norm_epsilon: float = 1e-5
     tie_word_embeddings: bool = False
     hybrid_norm: bool = False
+    use_qk_norm: bool = False
     input_embedding_norm: bool = False
 
     # Attention-related config
@@ -233,6 +234,7 @@ class LlamaConfig(HFCompatConfig):
             attn_backend=self.attn_backend,
             flash_attention_block_size=self.flash_attention_block_size,
             rope=self.rope,
+            qk_norm=self.norm_config if self.use_qk_norm else None,
         )
 
     @property
