@@ -1352,9 +1352,9 @@ class InferenceEngine:
                 try:
                     # Decode the full sequence so far
                     full_text = self.tokenizer.decode(dr.token_list, skip_special_tokens=False)
-                    logger.info(f"[Request {rid}, Choice {cid}] Tokens {dr.tokens_decoded}: '{full_text}'", flush=True)
+                    logger.info(f"[Request {rid}, Choice {cid}] Tokens {dr.tokens_decoded}: '{full_text}'")
                 except Exception as e:
-                    logger.info(f"[Request {rid}, Choice {cid}] Tokens {dr.tokens_decoded}: <decode_error: {e}>", flush=True)
+                    logger.info(f"[Request {rid}, Choice {cid}] Tokens {dr.tokens_decoded}: <decode_error: {e}>")
 
         # Update done flags based on snapshot
         for local_slot, is_done in enumerate(fins):
@@ -1371,9 +1371,9 @@ class InferenceEngine:
             if print_tokens and dr.tokens_decoded > 0:
                 try:
                     full_text = self.tokenizer.decode(dr.token_list, skip_special_tokens=False)
-                    logger.info(f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): '{full_text}'", flush=True)
+                    logger.info(f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): '{full_text}'")
                 except Exception as e:
-                    logger.info(f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): <decode_error: {e}>", flush=True)
+                    logger.info(f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): <decode_error: {e}>")
 
         num_finished = int(fins.sum()) if hasattr(fins, "sum") else 0
         # logger.info(f"extract: appended={appended} (drained={n}) unmapped={unmapped} finished_count={num_finished}")
