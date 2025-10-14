@@ -1074,40 +1074,6 @@ class LmEvalHarnessConfig:
         logger.info(f"Loaded {len(this_tasks)} tasks")
         return this_tasks
 
-    def to_task_dict_and_stop_map(self) -> tuple[dict, dict[str, list[str]]]:
-        """Like to_task_dict, but also returns a mapping from final task names to additional stop strings."""
-        logger.info("Loading tasks (with stop map)...")
-        import lm_eval.tasks as tasks
-
-        manager = tasks.TaskManager()
-        this_tasks: dict = {}
-        stop_map: dict[str, list[str]] = {}
-        for task in tqdm(self.to_task_spec()):
-            try:
-                if isinstance(task, str):
-                    tdict = tasks.get_task_dict(task, manager)
-                    this_tasks.update(tdict)
-                else:
-                    our_name = task.get("task_alias", task["task"]) if isinstance(task, dict) else task
-                    our_name = our_name.replace(" ", "_")
-                    tasks_for_this_task_spec = self._get_task_and_rename(manager, our_name, task)
-                    # Record stop strings for each resulting child task name, if provided
-                    addl_stops = task.get("additional_stop_strings") or []
-                    child_names = self._get_child_tasks(tasks_for_this_task_spec)
-                    for name in child_names:
-                        if addl_stops:
-                            stop_map[name] = list(addl_stops)
-                    for k, v in tasks_for_this_task_spec.items():
-                        if k in this_tasks:
-                            raise ValueError(f"Task {k} already exists")
-                        this_tasks[k] = v
-            except Exception as e:
-                logger.exception(f"Failed to load task {task}")
-                raise ValueError(f"Failed to load task {task}") from e
-
-        logger.info(f"Loaded {len(this_tasks)} tasks")
-        return this_tasks, stop_map
-
     def _get_task_and_rename(self, manager, our_name, task: dict | str):
         """
         Get a task from the task manager and rename it to our_name.
