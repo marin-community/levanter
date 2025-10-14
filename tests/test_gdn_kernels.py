@@ -580,3 +580,159 @@ def test_kernels_match_hf_without_l2norm():
 
     np.testing.assert_allclose(np.array(out_chunk_j.array), _to_np(out_chunk_t), rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(np.array(out_recur_j.array), _to_np(out_recur_t), rtol=1e-5, atol=1e-5)
+
+
+@skip_if_no_torch
+def test_recurrent_backward_matches_hf():
+    """
+    JAX vs HF fallback gradient parity for the recurrent (decode) kernel.
+    We compare grads w.r.t. q, k, v, g, beta, and initial_state S0 on a small case.
+    """
+    import torch
+
+    hf_chunk, hf_recur = _get_hf_kernels()
+
+    key = jax.random.PRNGKey(202)
+    k1, k2 = jax.random.split(key, 2)
+    B, H, L, dk, dv = 1, 2, 16, 8, 8
+
+    # Named inputs
+    q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, k1)
+    S0 = jax.random.normal(k2, (B, H, dk, dv), dtype=jnp.float32) * 0.1
+
+    # ---- JAX grads ----
+    def loss_recur(q_arr, k_arr, v_arr, g_arr, b_arr, S0_arr):
+        qn = hax.named(q_arr, q.axes)
+        kn = hax.named(k_arr, k.axes)
+        vn = hax.named(v_arr, v.axes)
+        gn = hax.named(g_arr, g.axes)
+        bn = hax.named(b_arr, beta.axes)
+        out, _ = recurrent_gated_delta_rule(
+            qn,
+            kn,
+            vn,
+            gn,
+            bn,
+            initial_state=S0_arr,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return jnp.sum(out.array)
+
+    jax_grads = jax.grad(loss_recur, argnums=(0, 1, 2, 3, 4, 5))(q.array, k.array, v.array, g.array, beta.array, S0)
+    jq, jk, jv, jg, jb, jS0 = [np.array(x) for x in jax_grads]
+
+    # ---- Torch grads (HF fallback) ----
+    def to_t(x, requires_grad=True):
+        t = torch.from_numpy(np.array(x))
+        t.requires_grad_(requires_grad)
+        return t
+
+    q_t = to_t(q.array)
+    k_t = to_t(k.array)
+    v_t = to_t(v.array)
+    g_t = to_t(g.array)
+    b_t = to_t(beta.array)
+    S0_t = to_t(S0)
+
+    out_t, _ = hf_recur(
+        q_t,
+        k_t,
+        v_t,
+        g_t,
+        b_t,
+        initial_state=S0_t,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+    )
+    loss_t = out_t.sum()
+    loss_t.backward()
+
+    tq, tk, tv, tg, tb, tS0 = [x.grad.detach().cpu().numpy() for x in (q_t, k_t, v_t, g_t, b_t, S0_t)]
+
+    # Compare
+    np.testing.assert_allclose(jq, tq, rtol=1e-4, atol=5e-6)
+    np.testing.assert_allclose(jk, tk, rtol=1e-4, atol=5e-6)
+    np.testing.assert_allclose(jv, tv, rtol=1e-4, atol=5e-6)
+    np.testing.assert_allclose(jg, tg, rtol=1e-4, atol=5e-6)
+    np.testing.assert_allclose(jb, tb, rtol=1e-4, atol=5e-6)
+    np.testing.assert_allclose(jS0, tS0, rtol=1e-4, atol=5e-6)
+
+
+@skip_if_no_torch
+def test_chunk_backward_matches_hf():
+    """
+    JAX vs HF fallback gradient parity for the chunkwise kernel (two chunks).
+    Includes gradients w.r.t. q, k, v, g, beta, and initial_state S0.
+    """
+    import torch
+
+    hf_chunk, hf_recur = _get_hf_kernels()
+
+    key = jax.random.PRNGKey(303)
+    k1, k2 = jax.random.split(key, 2)
+    B, H, L, dk, dv = 1, 2, 16, 8, 8  # L multiple of chunk_size for a clean path
+    chunk_size = 8
+
+    q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, k1)
+    S0 = jax.random.normal(k2, (B, H, dk, dv), dtype=jnp.float32) * 0.1
+
+    # ---- JAX grads ----
+    def loss_chunk(q_arr, k_arr, v_arr, g_arr, b_arr, S0_arr):
+        qn = hax.named(q_arr, q.axes)
+        kn = hax.named(k_arr, k.axes)
+        vn = hax.named(v_arr, v.axes)
+        gn = hax.named(g_arr, g.axes)
+        bn = hax.named(b_arr, beta.axes)
+        out, _ = chunk_gated_delta_rule(
+            qn,
+            kn,
+            vn,
+            gn,
+            bn,
+            chunk_size=chunk_size,
+            initial_state=S0_arr,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return jnp.sum(out.array)
+
+    jax_grads = jax.grad(loss_chunk, argnums=(0, 1, 2, 3, 4, 5))(q.array, k.array, v.array, g.array, beta.array, S0)
+    jq, jk, jv, jg, jb, jS0 = [np.array(x) for x in jax_grads]
+
+    # ---- Torch grads (HF fallback) ----
+    def to_t(x, requires_grad=True):
+        t = torch.from_numpy(np.array(x))
+        t.requires_grad_(requires_grad)
+        return t
+
+    q_t = to_t(q.array)
+    k_t = to_t(k.array)
+    v_t = to_t(v.array)
+    g_t = to_t(g.array)
+    b_t = to_t(beta.array)
+    S0_t = to_t(S0)
+
+    out_t, _ = hf_chunk(
+        q_t,
+        k_t,
+        v_t,
+        g_t,
+        b_t,
+        chunk_size=chunk_size,
+        initial_state=S0_t,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+    )
+    loss_t = out_t.sum()
+    loss_t.backward()
+
+    tq, tk, tv, tg, tb, tS0 = [x.grad.detach().cpu().numpy() for x in (q_t, k_t, v_t, g_t, b_t, S0_t)]
+
+    # Compare
+    np.testing.assert_allclose(jq, tq, rtol=1e-4, atol=5e-6)
+    np.testing.assert_allclose(jk, tk, rtol=1e-4, atol=5e-6)
+    np.testing.assert_allclose(jv, tv, rtol=1e-4, atol=5e-6)
+    np.testing.assert_allclose(jg, tg, rtol=1e-4, atol=5e-6)
+    np.testing.assert_allclose(jb, tb, rtol=1e-4, atol=5e-6)
+    np.testing.assert_allclose(jS0, tS0, rtol=1e-4, atol=5e-6)

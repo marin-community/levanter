@@ -230,6 +230,14 @@ def _tri_upper_eq_mask(Ci: Axis, Cj: Axis) -> NamedArray:
     return I <= J
 
 
+def _diag_mask(Ci: Axis, Cj: Axis) -> NamedArray:
+    ii = hax.arange(Ci)
+    jj = hax.arange(Cj)
+    I = ii.broadcast_axis(Cj)
+    J = jj.broadcast_axis(Ci)
+    return I == J
+
+
 # ---------- Kernels ----------
 
 
@@ -433,7 +441,12 @@ def chunk_gated_delta_rule(
     #   exp( g_cum[i] - g_cum[j] )  for i >= j, else 0
     gi = g_cum.rename({C.name: Ci.name})
     gj = g_cum.rename({C.name: Cj.name})
-    decay = hax.exp(gi.broadcast_axis(Cj) - gj.broadcast_axis(Ci))  # [B,Nc,Ci,Cj,H]
+    diff = gi.broadcast_axis(Cj) - gj.broadcast_axis(Ci)
+    # Avoid overflow/NaNs in the strict upper triangle by setting exp argument to -inf
+    neg_inf = jnp.asarray(-jnp.inf, dtype=diff.dtype)
+    diff = hax.where(_tri_upper_eq_mask(Ci, Cj), neg_inf, diff)
+    diff = hax.where(_diag_mask(Ci, Cj), jnp.asarray(0.0, dtype=diff.dtype), diff)
+    decay = hax.exp(diff)  # [B,Nc,Ci,Cj,H]
 
     # Zero out diagonal and strict upper triangle
     A = A_raw * decay
