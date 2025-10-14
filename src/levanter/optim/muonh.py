@@ -216,7 +216,7 @@ def zeropower_via_newtonschulz5(X, steps=5, eps=1e-7):
 
     for i in range(steps):
         A = X @ X.T
-        # doesn't seem to be necessary, so leaivng it out. When I used inspect_sharding it was a problem, but I dunno
+        # doesn't seem to be necessary, so leaving it out. When I used inspect_sharding it was a problem, but I dunno
         # A = jax.lax.with_sharding_constraint(A, PartitionSpec(None, None))  # ensure it's desharded
         B = b * A + c * A @ A
         X = a * X + B @ X
