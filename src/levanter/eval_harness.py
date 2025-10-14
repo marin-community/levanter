@@ -334,6 +334,9 @@ class LevanterHarnessLM(TemplateLM):
         self.profiler_config = leader.profiler_config
         self._current_step = 0
         self._profiler_started = False
+        # Printing of tokens is governed solely by print_every_n.
+        # If print_every_n == 0, no token printing occurs.
+        self.print_every_n = 0
 
     tokenizer = property(lambda self: self.leader.tokenizer)
     EvalBatch = property(lambda self: self.leader.EvalBatch)
@@ -806,10 +809,12 @@ class LevanterHarnessLM(TemplateLM):
 
         # Pass the callback to the engine if profiling is enabled
         step_callback = decode_step_callback if self.profiler_config.enabled else None
-        # Enable token printing for generation tasks
-        print_tokens = True  # Set to True to print tokens as they are generated
-        print_every_n = 100    # Print every N tokens (1 = print all tokens)
-        result = engine.generate(gen_requests, step_callback=step_callback, print_tokens=print_tokens, print_every_n=print_every_n)
+        # Only print when print_every_n > 0; otherwise disable printing entirely
+        result = engine.generate(
+            gen_requests,
+            step_callback=step_callback,
+            print_every_n=self.print_every_n,
+        )
 
         # Decode first generation per request (LM Harness expects one string per request)
         outputs: list[str] = []
@@ -970,6 +975,9 @@ class LmEvalHarnessConfig:
     def max_gen_toks(self) -> int:
         """Backward compatibility property for max_gen_toks."""
         return self.generation_kwargs.get("max_gen_toks", 256)
+
+    # Printing configuration for generation debugging
+    print_every_n: int | None = None
 
     def to_task_spec(self) -> list[str | dict]:
         return [task.to_dict() if isinstance(task, TaskConfig) else task for task in self.task_spec]
@@ -1230,6 +1238,12 @@ def _actually_run_eval_harness(
     if jax.process_index() == 0:
         logger.info("Process 0 is running the eval harness.")
         harness = worker.make_harness_lm()
+        # Thread print_every_n into the harness if provided; disables printing when 0 or None
+        if config.print_every_n is not None:
+            try:
+                harness.print_every_n = int(config.print_every_n)
+            except Exception:
+                logger.warning(f"Invalid print_every_n: {config.print_every_n}. Ignoring.")
 
         # eval_harness only sets seeds in simple_evaluate, which we can't use (I think?)
         tasks_to_run = _adjust_config(tasks_to_run, 0)

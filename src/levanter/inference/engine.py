@@ -1061,7 +1061,7 @@ class InferenceEngine:
             ),
         )
 
-    def generate(self, requests: Sequence[Request], step_callback=None, print_tokens: bool = False, print_every_n: int = 1) -> GenerationResult:
+    def generate(self, requests: Sequence[Request], step_callback=None, print_every_n: int = 0) -> GenerationResult:
         """Generate tokens for a batch of Requests.
 
         Each Request provides prompt_tokens, decode_params, and n_generations (clones).
@@ -1132,7 +1132,7 @@ class InferenceEngine:
         # Try initial admission from queue and extract prompt tokens
         decode_outputs = self._admit_from_queue()
         if decode_outputs:
-            _ = self._ingest_outputs(decode_outputs, print_tokens=print_tokens, print_every_n=print_every_n)
+            _ = self._ingest_outputs(decode_outputs, print_every_n=print_every_n)
         initial_prefill_out = time.time()
         logger.info(f"Initial prefill and extraction took {initial_prefill_out - time_in:.3f}s")
 
@@ -1183,7 +1183,7 @@ class InferenceEngine:
             device_time = time.time() - submit_done
 
             extract_start = time.time()
-            new_tokens = self._ingest_outputs(decode_outputs, print_tokens=print_tokens, print_every_n=print_every_n)
+            new_tokens = self._ingest_outputs(decode_outputs, print_every_n=print_every_n)
             extract_time = time.time() - extract_start
 
             # Release any sequences that finished in this step
@@ -1191,7 +1191,7 @@ class InferenceEngine:
             # Admit more if capacity allows
             admit_outputs = self._admit_from_queue()
             if admit_outputs is not None:
-                mid_tokens = self._ingest_outputs(admit_outputs, print_tokens=print_tokens, print_every_n=print_every_n)
+                mid_tokens = self._ingest_outputs(admit_outputs, print_every_n=print_every_n)
             else:
                 mid_tokens = 0
             new_tokens += mid_tokens
@@ -1315,7 +1315,7 @@ class InferenceEngine:
         else:
             logger.info(f"Written trace info to {path}")
 
-    def _extract_outputs(self, pending_outputs, print_tokens: bool = False, print_every_n: int = 1) -> int:
+    def _extract_outputs(self, pending_outputs, print_every_n: int = 1) -> int:
         """Append newly available tokens into outputs per (request_id, child_id).
 
         Returns number of new tokens appended.
@@ -1348,7 +1348,7 @@ class InferenceEngine:
             appended += 1
             
             # Print accumulated decoded text as it is generated
-            if print_tokens and dr.tokens_decoded % print_every_n == 0:
+            if print_every_n > 0 and dr.tokens_decoded % print_every_n == 0:
                 try:
                     # Decode the full sequence so far
                     full_text = self.tokenizer.decode(dr.token_list, skip_special_tokens=False)
@@ -1368,7 +1368,7 @@ class InferenceEngine:
             dr.done = True
             
             # Print final complete text when sequence is finished
-            if print_tokens and dr.tokens_decoded > 0:
+            if print_every_n > 0 and dr.tokens_decoded > 0:
                 try:
                     full_text = self.tokenizer.decode(dr.token_list, skip_special_tokens=False)
                     logger.info(f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): '{full_text}'")
@@ -1380,14 +1380,14 @@ class InferenceEngine:
 
         return appended
 
-    def _ingest_outputs(self, outputs: _DecodeOutputs | None, print_tokens: bool = False, print_every_n: int = 1) -> int:
+    def _ingest_outputs(self, outputs: _DecodeOutputs | None, print_every_n: int = 1) -> int:
         """Drain device outputs into host results and apply host-side release.
 
         Returns the number of tokens appended to results. No-op if outputs is None.
         """
         if outputs is None:
             return 0
-        appended = self._extract_outputs(outputs, print_tokens=print_tokens, print_every_n=print_every_n)
+        appended = self._extract_outputs(outputs, print_every_n=print_every_n)
         self._release_finished_sequences(outputs)
         return appended
 
