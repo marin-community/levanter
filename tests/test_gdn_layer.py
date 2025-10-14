@@ -7,12 +7,7 @@ import jax
 import jax.numpy as jnp
 import haliax as hax
 from haliax import Axis
-
-from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
-from transformers.models.qwen3_next.modular_qwen3_next import (
-    Qwen3NextGatedDeltaNet,
-    Qwen3NextDynamicCache,
-)
+import pytest
 
 from levanter.layers.gated_deltanet import (
     GatedDeltaNet,
@@ -28,6 +23,11 @@ def _np(x):
 
 
 def _init_small_hf_layer(hidden_size=128, nk=4, nv=8, dk=8, dv=8, ksz=4):
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
+    from transformers.models.qwen3_next.modular_qwen3_next import Qwen3NextGatedDeltaNet
+
     cfg = Qwen3NextConfig(
         hidden_size=hidden_size,
         linear_num_key_heads=nk,
@@ -44,6 +44,11 @@ def _init_small_hf_layer(hidden_size=128, nk=4, nv=8, dk=8, dv=8, ksz=4):
 
 
 def _init_small_hf_layer_with_linear_only(hidden_size=128, nk=4, nv=8, dk=8, dv=8, ksz=4):
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
+    from transformers.models.qwen3_next.modular_qwen3_next import Qwen3NextGatedDeltaNet
+
     cfg = Qwen3NextConfig(
         hidden_size=hidden_size,
         linear_num_key_heads=nk,
@@ -78,7 +83,10 @@ def _assign_linear_weight(named_linear, np_weight, out_axis, in_axis):
     return dataclasses.replace(named_linear, weight=w_named)
 
 
-def _load_hf_weights_into_lev(lev_layer: GatedDeltaNet, hf_layer: Qwen3NextGatedDeltaNet) -> GatedDeltaNet:
+def _load_hf_weights_into_lev(lev_layer: GatedDeltaNet, hf_layer) -> GatedDeltaNet:
+    """
+    Load weights from HF layer into Levanter layer (avoid module-level transformers imports).
+    """
     cfg = lev_layer.config
     # in_proj_qkvz
     w_qkvz = hf_layer.in_proj_qkvz.weight.detach().cpu().numpy()  # [proj, hidden]
@@ -125,7 +133,9 @@ def _load_hf_weights_into_lev(lev_layer: GatedDeltaNet, hf_layer: Qwen3NextGated
 
 @skip_if_no_torch
 def test_gdn_layer_matches_hf_prefill():
-    import torch
+    import torch  # local import for environments without torch
+
+    # helper imports happen inside helper functions
 
     def _to_torch(x):
         return torch.from_numpy(np.array(x))
@@ -191,6 +201,7 @@ def test_gdn_layer_decode_matches_hf_one_step():
     Ensures conv-state length K and S-state handoff are correct and parity holds.
     """
     import torch
+    from transformers.models.qwen3_next.modular_qwen3_next import Qwen3NextDynamicCache
 
     hidden_size, nk, nv, dk, dv, ksz = 128, 4, 8, 8, 8, 4
     hf_cfg, hf_layer = _init_small_hf_layer_with_linear_only(hidden_size, nk, nv, dk, dv, ksz)
@@ -213,7 +224,9 @@ def test_gdn_layer_decode_matches_hf_one_step():
 
     # ---------- Levanter prefill (to get states) ----------
     x_named = hax.named(np.array(x_full), ("batch", "position", "embed"))
-    y_lev_prefill, (conv_state, S_state) = lev_layer(x_named, inference=True, chunk_size=32)
+    y_lev_prefill, new_state = lev_layer(x_named, inference=True, chunk_size=32)
+    assert new_state is not None, "expected state tuple when inference=True"
+    conv_state, S_state = new_state
 
     # sanity: conv_state should have length K (NOT K-1)
     K = ksz
@@ -222,7 +235,9 @@ def test_gdn_layer_decode_matches_hf_one_step():
 
     # ---------- Levanter decode one token ----------
     x_next_named = hax.named(np.array(x_next), ("batch", "position", "embed"))
-    y_lev_step, (conv_state2, S_state2) = lev_layer(x_next_named, inference=True, decode_state=(conv_state, S_state))
+    y_lev_step, new_state2 = lev_layer(x_next_named, inference=True, decode_state=(conv_state, S_state))
+    assert new_state2 is not None, "expected state tuple for decode step"
+    conv_state2, S_state2 = new_state2
 
     # ---------- HF prefill with cache ----------
     cache = Qwen3NextDynamicCache(hf_cfg)
@@ -249,7 +264,7 @@ def test_depthwise_conv_update_equivalence():
     Pure conv test: the incremental conv update should equal the full causal conv output, step by step,
     after warmup. Does not require HF.
     """
-    key = jax.random.PRNGKey(111)
+    key = jax.random.PRNGKey(0)
     B, C, L, K = 2, 48, 35, 7  # C = (2*key_dim + value_dim) in a typical layer
     w = jax.random.normal(key, (C, K), dtype=jnp.float32)
     bias = None
