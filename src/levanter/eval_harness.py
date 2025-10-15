@@ -80,7 +80,7 @@ from levanter.data import batched
 from levanter.data.loader import stack_batches
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
 from levanter.trainer import TrainerConfig
-from levanter.utils.jax_utils import broadcast_shard, use_cpu_device
+from levanter.utils.jax_utils import broadcast_shard, local_cpu_mesh, use_cpu_device
 from levanter.utils.tree_utils import inference_mode
 
 logger = logging.getLogger(__name__)
@@ -296,21 +296,27 @@ class _Message:
 
 
 def _get_segments_this_batch(batch, max_segments_per_ex):
-    unique_segs = np.unique(batch.attn_mask.segment_ids[0].array).tolist()
-    # + 1 because we use -1 as a padding value for segments and allow that
-    if len(unique_segs) > max_segments_per_ex + 1:
-        raise ValueError(f"Too many segments in batch: {len(unique_segs)}")
-    if -1 in unique_segs:
-        unique_segs.remove(-1)
+    with local_cpu_mesh():
+        segment_ids = np.asarray(jax.device_get(batch.attn_mask.segment_ids[0].array))
 
-    return unique_segs
+        unique_segs = np.unique(segment_ids).tolist()
+        # + 1 because we use -1 as a padding value for segments and allow that
+        if len(unique_segs) > max_segments_per_ex + 1:
+            raise ValueError(f"Too many segments in batch: {len(unique_segs)}")
+        if -1 in unique_segs:
+            unique_segs.remove(-1)
+
+        return unique_segs
 
 
 def _get_padding_count(batch, pad_token_id):
     # returns the total amount of padding in the batch
-    padding_count = np.sum(batch.tokens.array == pad_token_id)
-    total_tokens = batch.tokens.size
-    return padding_count, total_tokens
+    with local_cpu_mesh():
+        tokens = np.asarray(jax.device_get(batch.tokens.array))
+
+        padding_count = np.sum(tokens == pad_token_id)
+        total_tokens = tokens.size
+        return padding_count, total_tokens
 
 
 class LevanterHarnessLM(TemplateLM):
@@ -638,7 +644,7 @@ class LevanterHarnessLM(TemplateLM):
         # Error out on multihost JAX - Engine doesn't support it yet
         if jax.process_count() > 1:
             raise NotImplementedError(
-                "InferenceEngine does not yet support multihost JAX. " "Please use a single host for generation tasks."
+                "InferenceEngine does not yet support multihost JAX. Please use a single host for generation tasks."
             )
 
         # print(f'len(requests)={len(requests)}')
@@ -780,7 +786,9 @@ class LevanterHarnessLM(TemplateLM):
 
                 # Post-process the generated text using the imported utility function
                 text = postprocess_generated_text(
-                    text, gen_kwargs.get("until"), None  # think_end_token - could be made configurable if needed
+                    text,
+                    gen_kwargs.get("until"),
+                    None,  # think_end_token - could be made configurable if needed
                 )
                 outputs.append(text)
                 output_idx += 1  # consume one generation per request
@@ -1263,7 +1271,9 @@ def run_eval_harness_main(config: EvalHarnessMainConfig):
             converter: HFCheckpointConverter = model_config.hf_checkpoint_converter()
             converter = converter.replaced(reference_checkpoint=config.checkpoint_path, tokenizer=tokenizer)
             model = converter.load_pretrained(
-                model_config.model_type, ref=config.checkpoint_path, dtype=config.trainer.mp.compute_dtype  # type: ignore
+                model_config.model_type,
+                ref=config.checkpoint_path,
+                dtype=config.trainer.mp.compute_dtype,  # type: ignore
             )
         else:
             with use_cpu_device():
