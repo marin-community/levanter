@@ -444,9 +444,14 @@ def _apply_prefill_work(gen_state: GenState, work: PrefillWork) -> GenState:
             def do_primary(gs_primary: GenState) -> GenState:
                 decode_state = gs_primary.decode_state
                 decode_state, assigned = decode_state.reserve_slot(slot_val)
+                # Get the prompt length for this sequence
+                prompt_len = work.prompt_lengths.array[i].astype(jnp.int32)
                 decode_state = decode_state.assign_seq(
                     local_slot_id=slot_val,
                     tokens=work.prompt_tokens["seq", i],
+                    seq_len=prompt_len,
+                    kv_pages=None,  # Will be allocated later in allocate_for_seq
+                    page_indices=None,  # Will be set during page allocation
                     seq_params=seq_params,
                 )
                 return dataclasses.replace(gs_primary, decode_state=decode_state)

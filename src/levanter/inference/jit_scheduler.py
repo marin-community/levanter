@@ -278,7 +278,10 @@ class SequenceTable(eqx.Module):
         # jax.debug.print("masked_seq_len={msl} new_lens={nl} safe_updated={su}", msl=masked_seq_len, nl=new_lens, su=safe_updated)
 
         new_num_pages_needed = (new_lens + self.page_size - 1) // self.page_size
-        old_num_pages_needed = (self.seq_lens + self.page_size - 1) // self.page_size
+        # Count how many pages are actually allocated (valid page_indices), not based on seq_lens
+        # This handles the case where seq_len is set but pages haven't been allocated yet
+        num_allocated_pages = hax.sum(is_valid(self.page_indices), axis="page")
+        old_num_pages_needed = num_allocated_pages
         old_num_pages_needed = hax.where(valid_updated, old_num_pages_needed["seq", safe_updated], 0)
         new_num_pages_needed = hax.where(valid_updated, new_num_pages_needed["seq", safe_updated], 0)
         # jax.debug.print("new_num_pages_needed={nnp} old_num_pages_needed={onp}", nnp=new_num_pages_needed, onp=old_num_pages_needed)
