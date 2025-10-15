@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Levanter Training Pipeline Animation</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      *, *::before, *::after {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "Inter", "Segoe UI", sans-serif;
+        background: radial-gradient(circle at 20% 20%, #1a2233, #05070d 55%);
+        color: #e8f1ff;
+        min-height: 100vh;
+        display: flex;
+        justify-content: center;
+        padding: 2.5rem 1rem;
+      }
+
+      main {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 1.5rem;
+        max-width: 1024px;
+        width: 100%;
+      }
+
+      header {
+        text-align: center;
+      }
+
+      header h1 {
+        margin: 0;
+        font-size: clamp(1.75rem, 2vw + 1rem, 2.5rem);
+        letter-spacing: 0.04em;
+      }
+
+      header p {
+        margin: 0.75rem auto 0;
+        max-width: 680px;
+        color: #b6c6e6;
+        line-height: 1.6;
+      }
+
+      .timeline {
+        position: relative;
+        border-radius: 18px;
+        padding: 2rem clamp(1.25rem, 3vw, 2.5rem);
+        background: linear-gradient(145deg, rgba(28, 46, 74, 0.9), rgba(12, 17, 28, 0.92));
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+        backdrop-filter: blur(14px);
+      }
+
+      .progress-track {
+        height: 8px;
+        background: rgba(79, 105, 161, 0.35);
+        border-radius: 999px;
+        overflow: hidden;
+        margin-bottom: 1.75rem;
+        position: sticky;
+        top: 0;
+        z-index: 5;
+      }
+
+      .progress-bar {
+        height: 100%;
+        width: 0;
+        background: linear-gradient(90deg, #42a5f5, #7c4dff);
+        border-radius: inherit;
+        transition: width 0.8s ease;
+      }
+
+      .steps {
+        display: grid;
+        gap: 1rem;
+      }
+
+      .step {
+        position: relative;
+        padding: 1.25rem clamp(1.1rem, 2.4vw, 1.75rem);
+        border-radius: 16px;
+        background: rgba(10, 14, 23, 0.55);
+        border: 1px solid rgba(87, 123, 196, 0.28);
+        transition: transform 0.45s ease, border 0.3s ease, background 0.45s ease;
+      }
+
+      .step::before {
+        content: attr(data-index);
+        position: absolute;
+        inset: 0;
+        margin: auto 0 auto -3.6rem;
+        height: 44px;
+        width: 44px;
+        border-radius: 14px;
+        display: grid;
+        place-items: center;
+        background: rgba(32, 45, 72, 0.85);
+        border: 1px solid rgba(114, 140, 203, 0.35);
+        font-weight: 600;
+        color: #95addc;
+        letter-spacing: 0.02em;
+        transition: transform 0.45s ease, background 0.45s ease, color 0.45s ease;
+      }
+
+      .step h2 {
+        margin: 0;
+        font-size: clamp(1.1rem, 1.2vw + 0.9rem, 1.4rem);
+      }
+
+      .step p.summary {
+        margin: 0.5rem 0 0.75rem;
+        color: #a2b6da;
+        line-height: 1.55;
+      }
+
+      .step ul {
+        margin: 0;
+        padding-left: 1.1rem;
+        list-style: none;
+        color: #d5e2ff;
+        display: grid;
+        gap: 0.45rem;
+      }
+
+      .step ul li {
+        position: relative;
+        line-height: 1.45;
+      }
+
+      .step ul li::before {
+        content: "";
+        position: absolute;
+        left: -0.95rem;
+        top: 0.55rem;
+        height: 6px;
+        width: 6px;
+        border-radius: 50%;
+        background: rgba(124, 77, 255, 0.65);
+      }
+
+      .step.active {
+        background: linear-gradient(135deg, rgba(61, 92, 167, 0.95), rgba(20, 31, 66, 0.82));
+        border-color: rgba(130, 171, 255, 0.75);
+        transform: translateX(6px) scale(1.01);
+      }
+
+      .step.active::before {
+        background: linear-gradient(135deg, #4facfe, #7c4dff);
+        color: #fff;
+        transform: translateX(4px) scale(1.06);
+      }
+
+      .controls {
+        display: flex;
+        justify-content: center;
+        gap: 0.75rem;
+        margin-top: 1.5rem;
+      }
+
+      button {
+        border: none;
+        border-radius: 999px;
+        padding: 0.65rem 1.5rem;
+        background: rgba(66, 165, 245, 0.85);
+        color: #061020;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        cursor: pointer;
+        transition: transform 0.2s ease, background 0.2s ease;
+      }
+
+      button:hover {
+        transform: translateY(-2px);
+        background: rgba(124, 77, 255, 0.95);
+        color: #f0f6ff;
+      }
+
+      button:focus-visible {
+        outline: 2px solid rgba(124, 77, 255, 0.9);
+        outline-offset: 2px;
+      }
+
+      @media (max-width: 720px) {
+        body {
+          padding: 1.75rem 0.75rem;
+        }
+
+        .timeline {
+          padding: 1.5rem 1.1rem;
+        }
+
+        .step::before {
+          margin-left: -3rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Levanter Training Pipeline</h1>
+        <p>
+          Animated walkthrough of the twelve stages Levanter executes while
+          training a language model. Each card highlights the active stage and
+          its key responsibilities so you can follow the control flow end to end.
+        </p>
+      </header>
+
+      <section class="timeline" aria-live="polite">
+        <div class="progress-track">
+          <div class="progress-bar" id="progressBar"></div>
+        </div>
+        <div class="steps" id="steps">
+          <article class="step" data-index="01">
+            <h2>Load Configuration</h2>
+            <p class="summary">Resolve experiment settings and seed the run for deterministic execution.</p>
+            <ul>
+              <li>Parse base YAML/JSON configs with <code>draccus.load</code>.</li>
+              <li>Apply CLI or sweep overrides and materialise experiment IDs.</li>
+              <li>Seed PRNG streams and initialise tracker metadata.</li>
+            </ul>
+          </article>
+          <article class="step" data-index="02">
+            <h2>Assemble Mesh Resources</h2>
+            <p class="summary">Shape the device mesh and name axes used throughout the job.</p>
+            <ul>
+              <li>Probe TPU/GPU topology to decide mesh axis sizes.</li>
+              <li>Instantiate Haliax <code>Axis</code> objects for batch/model/heads dimensions.</li>
+              <li>Create the PJIT mesh and register it with axis registries.</li>
+            </ul>
+          </article>
+          <article class="step" data-index="03">
+            <h2>Prepare Dataset Stream</h2>
+            <p class="summary">Build asynchronous pipelines that feed tokenised batches to devices.</p>
+            <ul>
+              <li>Expand dataset configs into shard manifests (GCS/S3/local).</li>
+              <li>Tokenise text, pack sequences, and apply map/shuffle transforms.</li>
+              <li>Prefetch batches and stage host-device queues for overlap.</li>
+            </ul>
+          </article>
+          <article class="step" data-index="04">
+            <h2>Build Model &amp; Optimizer</h2>
+            <p class="summary">Create Equinox modules and optimiser state aligned with named axes.</p>
+            <ul>
+              <li>Initialise embeddings and Transformer blocks with split PRNG keys.</li>
+              <li>Shape parameter PyTrees according to axis metadata.</li>
+              <li>Configure optimiser hyperparameters and learning-rate schedule.</li>
+            </ul>
+          </article>
+          <article class="step" data-index="05">
+            <h2>Distribute State</h2>
+            <p class="summary">Shard parameters and runtime state across the device mesh.</p>
+            <ul>
+              <li>Use <code>hax.shard</code> to partition parameters and optimiser slots.</li>
+              <li>Broadcast weights with <code>jax.device_put</code> and replicate master copies.</li>
+              <li>Scatter per-device PRNGs and gradient-accumulation buffers.</li>
+            </ul>
+          </article>
+          <article class="step" data-index="06">
+            <h2>Fetch Next Batch</h2>
+            <p class="summary">Stream preprocessed batches into device memory just-in-time.</p>
+            <ul>
+              <li>Pull sequences from the async iterator and pad for mesh alignment.</li>
+              <li>Assemble attention masks and loss masks on the host.</li>
+              <li>Transfer data with double buffering to overlap compute and I/O.</li>
+            </ul>
+          </article>
+          <article class="step" data-index="07">
+            <h2>Forward Pass</h2>
+            <p class="summary">Run Transformer layers under <code>jax.jit</code> while respecting named axes.</p>
+            <ul>
+              <li>Embed tokens and add positional encodings or rotary phases.</li>
+              <li>Apply stacked attention/MLP blocks with activation checkpointing.</li>
+              <li>Project hidden states through the LM head to produce logits.</li>
+            </ul>
+          </article>
+          <article class="step" data-index="08">
+            <h2>Compute Loss</h2>
+            <p class="summary">Derive training objectives and metrics from model outputs.</p>
+            <ul>
+              <li>Align logits/targets, mask padding, and compute cross-entropy.</li>
+              <li>Aggregate perplexity and accuracy across mesh axes with <code>hax.mean</code>.</li>
+              <li>Record auxiliary stats (KL, regularisers) for logging.</li>
+            </ul>
+          </article>
+          <article class="step" data-index="09">
+            <h2>Backward Pass</h2>
+            <p class="summary">Differentiate the loss and prepare gradients for the optimiser.</p>
+            <ul>
+              <li>Call <code>jax.value_and_grad</code> to obtain gradients.</li>
+              <li>Clip gradients, apply weight decay prep, and handle grad scaling.</li>
+              <li>Collect gradient norms and microbatch statistics for trackers.</li>
+            </ul>
+          </article>
+          <article class="step" data-index="10">
+            <h2>Optimizer Update</h2>
+            <p class="summary">Update model parameters and scheduler state on each step.</p>
+            <ul>
+              <li>Refresh optimiser slots (momentum, variance, Adafactor statistics).</li>
+              <li>Apply parameter deltas respecting partition specs and weight decay.</li>
+              <li>Advance learning-rate schedules and reset accumulation buffers.</li>
+            </ul>
+          </article>
+          <article class="step" data-index="11">
+            <h2>Checkpoint &amp; Log</h2>
+            <p class="summary">Persist model state and surface metrics to monitoring hooks.</p>
+            <ul>
+              <li>Stream metrics to WandB/TensorBoard/JSONL trackers.</li>
+              <li>Trigger evaluation passes on validation datasets when scheduled.</li>
+              <li>Write async checkpoints with parameters, optimiser state, and metadata.</li>
+            </ul>
+          </article>
+          <article class="step" data-index="12">
+            <h2>Loop Control</h2>
+            <p class="summary">Decide whether to continue training or exit gracefully.</p>
+            <ul>
+              <li>Increment global step counters and update wall-clock accounting.</li>
+              <li>Check stop criteria (steps, tokens, time, convergence triggers).</li>
+              <li>Schedule next iteration or perform shutdown/cleanup routines.</li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="controls">
+          <button type="button" id="prev">Previous</button>
+          <button type="button" id="pauseToggle">Pause</button>
+          <button type="button" id="next">Next</button>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const steps = Array.from(document.querySelectorAll('.step'));
+      const progressBar = document.getElementById('progressBar');
+      const pauseToggle = document.getElementById('pauseToggle');
+      const prevBtn = document.getElementById('prev');
+      const nextBtn = document.getElementById('next');
+
+      let index = 0;
+      let isPaused = false;
+      let timerId = null;
+      const HOLD_MS = 3300;
+
+      function setActiveStep(nextIndex) {
+        steps.forEach((step, i) => {
+          step.classList.toggle('active', i === nextIndex);
+        });
+
+        const progress = ((nextIndex + 1) / steps.length) * 100;
+        progressBar.style.width = `${progress}%`;
+
+        steps[nextIndex].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        index = nextIndex;
+      }
+
+      function scheduleNext() {
+        clearTimeout(timerId);
+        if (!isPaused) {
+          timerId = setTimeout(() => {
+            const nextIndex = (index + 1) % steps.length;
+            setActiveStep(nextIndex);
+            scheduleNext();
+          }, HOLD_MS);
+        }
+      }
+
+      pauseToggle.addEventListener('click', () => {
+        isPaused = !isPaused;
+        pauseToggle.textContent = isPaused ? 'Resume' : 'Pause';
+        scheduleNext();
+      });
+
+      prevBtn.addEventListener('click', () => {
+        const nextIndex = (index - 1 + steps.length) % steps.length;
+        setActiveStep(nextIndex);
+        scheduleNext();
+      });
+
+      nextBtn.addEventListener('click', () => {
+        const nextIndex = (index + 1) % steps.length;
+        setActiveStep(nextIndex);
+        scheduleNext();
+      });
+
+      setActiveStep(index);
+      scheduleNext();
+    </script>
+  </body>
+</html>

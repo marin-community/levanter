@@ -220,4 +220,3 @@ else:
         with open(os.path.expanduser(config_file), "r", encoding="utf-8") as f:
             contents = yaml.safe_load(f) or {}
         return decode(config_class, contents)
-
