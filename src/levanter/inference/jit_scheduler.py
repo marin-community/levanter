@@ -357,7 +357,7 @@ class SequenceTable(eqx.Module):
         return new_sequences, new_page_table, batch_info
 
     def _create_batch_info(self, updated_seqs, page_indices, cu_new_counts, new_lens, token_slot_ids, token_pos_ids):
-        mask = is_valid(updated_seqs)
+        mask = is_valid(updated_seqs) & (updated_seqs < self.max_seqs)
         safe_updated = hax.where(mask, updated_seqs, 0)
 
         gathered_page_indices = page_indices["seq", safe_updated]

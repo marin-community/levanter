@@ -31,7 +31,7 @@ from levanter.inference.jit_scheduler import (
 )
 from levanter.inference.page_table import PageTable
 from levanter.inference.utils import INVALID, is_valid
-from levanter.layers.attention import KvPageCache
+from levanter.layers.kv_cache import PageCache
 from levanter.layers.sampler import Sampler
 from levanter.models.lm_model import LmHeadModel
 from levanter.utils.jax_utils import estimated_free_device_memory, sharded_tree_size
@@ -185,7 +185,7 @@ class GenState(eqx.Module):
     sharing fully used pages.
     """
 
-    cache: KvPageCache
+    cache: PageCache
     decode_state: DecodeState
 
     def clone_sequence(
@@ -545,8 +545,8 @@ def _handle_clones(
 
     def copy_pages_for_updated_seq(
         i,
-        state: tuple[DecodeState, KvPageCache],
-    ) -> tuple[DecodeState, KvPageCache]:
+        state: tuple[DecodeState, PageCache],
+    ) -> tuple[DecodeState, PageCache]:
         decode_state, cache = state
         src_slot_id = src_ids["position", i].scalar()
         dst_slot_id = tgt_ids["position", i].scalar()
@@ -691,7 +691,7 @@ class InferenceEngine:
         *,
         model: LmHeadModel,
         tokenizer,
-        cache: KvPageCache,
+        cache: PageCache,
         decode_state: DecodeState,
         sampler: Sampler,
         config: InferenceEngineConfig,

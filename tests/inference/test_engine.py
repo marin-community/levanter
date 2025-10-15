@@ -14,7 +14,7 @@ from levanter.inference.engine import InferenceEngine, Request, InferenceEngineC
 from levanter.inference.jit_scheduler import SeqDecodingParams
 from levanter.inference.page_table import PageTableSpec
 from levanter.inference.utils import INVALID
-from levanter.layers.attention import KvPageCache
+from levanter.layers.kv_cache import KvPageCache
 
 
 class DummyModel(eqx.Module):
