@@ -2235,7 +2235,7 @@ requires-dist = [
     { name = "jinja2" },
     { name = "jmp", specifier = ">=0.0.3" },
     { name = "lenses" },
-    { name = "lm-eval", marker = "extra == 'lm-eval'", git = "https://github.com/stanford-crfm/lm-evaluation-harness.git?rev=18b376504e98aadcb985f9235c3e58ab2bf4c5bc" },
+    { name = "lm-eval", marker = "extra == 'lm-eval'", git = "https://github.com/stanford-crfm/lm-evaluation-harness.git?rev=d5e3391f22cde186c827674d5c3ec7c5f4fe0cab" },
     { name = "matplotlib", specifier = ">=3.7.0" },
     { name = "openai", marker = "extra == 'serve'", specifier = ">=1.0.0" },
     { name = "optax", specifier = ">=0.1.9" },
@@ -2357,7 +2357,7 @@ wheels = [
 [[package]]
 name = "lm-eval"
 version = "0.4.9.1"
-source = { git = "https://github.com/stanford-crfm/lm-evaluation-harness.git?rev=18b376504e98aadcb985f9235c3e58ab2bf4c5bc#18b376504e98aadcb985f9235c3e58ab2bf4c5bc" }
+source = { git = "https://github.com/stanford-crfm/lm-evaluation-harness.git?rev=d5e3391f22cde186c827674d5c3ec7c5f4fe0cab#d5e3391f22cde186c827674d5c3ec7c5f4fe0cab" }
 dependencies = [
     { name = "datasets" },
     { name = "dill" },
