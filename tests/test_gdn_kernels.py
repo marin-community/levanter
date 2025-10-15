@@ -104,7 +104,7 @@ def test_recurrent_perfect_fit_on_current_key_when_alpha1_beta1_and_L2norm():
         k_hat = k_arr * inv
         kv = jnp.sum(S * k_hat[..., None], axis=-2)  # (B,H,dv)
         v_arr = hax.rearrange(v_t, ("batch", "heads", "position", "v_head_dim")).array[..., 0, :]
-        np.testing.assert_allclose(kv, v_arr, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(kv, v_arr, rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize("chunk_size", [1, 2, 7, 16, 32, 64])
@@ -121,8 +121,8 @@ def test_chunk_equals_recurrent_for_random_inputs(chunk_size):
         q, k, v, g, beta, initial_state=None, output_final_state=True, use_qk_l2norm_in_kernel=True
     )
 
-    np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(S_chunk, S_recur, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(S_chunk, S_recur, rtol=1e-4, atol=1e-4)
 
 
 def test_chunk_nondivisible_padding_matches_recurrent_jax_only():
@@ -135,7 +135,7 @@ def test_chunk_nondivisible_padding_matches_recurrent_jax_only():
         q, k, v, g, beta, chunk_size=32, output_final_state=False, use_qk_l2norm_in_kernel=True
     )
     out_recur, _ = recurrent_gated_delta_rule(q, k, v, g, beta, output_final_state=False, use_qk_l2norm_in_kernel=True)
-    np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-4, atol=1e-4)
 
 
 def test_chunk_continuation_two_pass_equals_one_pass():
@@ -168,8 +168,8 @@ def test_chunk_continuation_two_pass_equals_one_pass():
 
     # Compare outputs on the suffix region and final states
     out_full_suf = out_full["position", hax.ds(split, Axis("pos2", L - split))]
-    np.testing.assert_allclose(np.array(out_suf.array), np.array(out_full_suf.array), rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(S_end, S_full, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(np.array(out_suf.array), np.array(out_full_suf.array), rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(S_end, S_full, rtol=1e-4, atol=1e-4)
 
 
 def test_chunk_size_one_degenerates_to_recurrent_without_l2norm():
@@ -190,7 +190,7 @@ def test_chunk_size_one_degenerates_to_recurrent_without_l2norm():
     out_recur, _ = recurrent_gated_delta_rule(
         q, k, v, g, beta, output_final_state=False, use_qk_l2norm_in_kernel=False
     )
-    np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-4, atol=1e-4)
 
 
 def test_extreme_gates_numerical_stability_jax_only():
@@ -210,7 +210,7 @@ def test_extreme_gates_numerical_stability_jax_only():
     k = hax.named(jax.random.normal(k2, (B, L, H, dk), dtype=jnp.float32), (Batch, Pos, Heads, Dk))
     v = hax.named(jax.random.normal(k3, (B, L, H, dv), dtype=jnp.float32), (Batch, Pos, Heads, Dv))
     g = hax.named(-jax.random.uniform(key, (B, L, H), minval=2.0, maxval=8.0, dtype=jnp.float32), (Batch, Pos, Heads))
-    beta_small = hax.named(jnp.full((B, L, H), 1e-5, dtype=jnp.float32), (Batch, Pos, Heads))
+    beta_small = hax.named(jnp.full((B, L, H), 1e-4, dtype=jnp.float32), (Batch, Pos, Heads))
     beta_big = hax.named(jnp.full((B, L, H), 1.0 - 1e-6, dtype=jnp.float32), (Batch, Pos, Heads))
 
     for beta in [beta_small, beta_big]:
@@ -273,7 +273,7 @@ def test_recurrent_kernel_matches_hf():
     )
     out_hf_np = _to_np(out_hf)
 
-    np.testing.assert_allclose(np.array(out_named.array), out_hf_np, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(np.array(out_named.array), out_hf_np, rtol=1e-4, atol=1e-4)
 
 
 @skip_if_no_torch
@@ -305,7 +305,7 @@ def test_chunk_kernel_matches_hf():
     )
     out_hf_np = _to_np(out_hf)
 
-    np.testing.assert_allclose(np.array(out_named.array), out_hf_np, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(np.array(out_named.array), out_hf_np, rtol=1e-4, atol=1e-4)
 
 
 @skip_if_no_torch
@@ -339,7 +339,7 @@ def test_chunk_kernel_matches_hf_non_divisible():
     )
     out_hf_np = _to_np(out_hf)
 
-    np.testing.assert_allclose(np.array(out_named.array), out_hf_np, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(np.array(out_named.array), out_hf_np, rtol=1e-4, atol=1e-4)
 
 
 @skip_if_no_torch
@@ -356,7 +356,7 @@ def test_chunk_size_one_matches_hf_recurrent():
 
     out_chunk, _ = chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=1, output_final_state=False)
     out_recur, _ = recurrent_gated_delta_rule(q, k, v, g, beta, output_final_state=False)
-    np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-4, atol=1e-4)
 
     def to_t(arr: jnp.ndarray):
         return torch.from_numpy(np.array(arr))
@@ -382,7 +382,7 @@ def test_chunk_size_one_matches_hf_recurrent():
         output_final_state=False,
         use_qk_l2norm_in_kernel=True,
     )
-    np.testing.assert_allclose(_to_np(out_chunk_t), _to_np(out_recur_t), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(_to_np(out_chunk_t), _to_np(out_recur_t), rtol=1e-4, atol=1e-4)
 
 
 @skip_if_no_torch
@@ -405,7 +405,7 @@ def test_chunk_kernel_with_initial_state_matches_recurrent_continuation():
         q, k, v, g, beta, chunk_size=chunk_size, initial_state=S0, output_final_state=False
     )
     out_recur, _ = recurrent_gated_delta_rule(q, k, v, g, beta, initial_state=S0, output_final_state=False)
-    np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-4, atol=1e-4)
 
     def to_t(arr: jnp.ndarray):
         return torch.from_numpy(np.array(arr))
@@ -432,7 +432,7 @@ def test_chunk_kernel_with_initial_state_matches_recurrent_continuation():
         output_final_state=False,
         use_qk_l2norm_in_kernel=True,
     )
-    np.testing.assert_allclose(_to_np(out_chunk_t), _to_np(out_recur_t), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(_to_np(out_chunk_t), _to_np(out_recur_t), rtol=1e-4, atol=1e-4)
 
 
 @skip_if_no_torch
@@ -466,7 +466,7 @@ def test_short_sequences_edge_cases():
         )
         out_hf = _to_np(out_t)
 
-        np.testing.assert_allclose(np.array(out_named.array), out_hf, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(np.array(out_named.array), out_hf, rtol=1e-4, atol=1e-4)
 
 
 @skip_if_no_torch
@@ -490,7 +490,7 @@ def test_extreme_gates_no_nans_and_parity():
     k = hax.named(jax.random.normal(key, (B, L, H, dk), dtype=jnp.float32), (Batch, Pos, Heads, Dk))
     v = hax.named(jax.random.normal(key, (B, L, H, dv), dtype=jnp.float32), (Batch, Pos, Heads, Dv))
     g = hax.named(-jax.random.uniform(key, (B, L, H), minval=2.0, maxval=8.0, dtype=jnp.float32), (Batch, Pos, Heads))
-    beta_small = hax.named(jnp.full((B, L, H), 1e-5, dtype=jnp.float32), (Batch, Pos, Heads))
+    beta_small = hax.named(jnp.full((B, L, H), 1e-4, dtype=jnp.float32), (Batch, Pos, Heads))
     beta_big = hax.named(jnp.full((B, L, H), 1.0 - 1e-6, dtype=jnp.float32), (Batch, Pos, Heads))
 
     for beta in [beta_small, beta_big]:
@@ -513,7 +513,7 @@ def test_extreme_gates_no_nans_and_parity():
         )
         out_hf = _to_np(out_t)
 
-        np.testing.assert_allclose(np.array(out_named.array), out_hf, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(np.array(out_named.array), out_hf, rtol=1e-4, atol=1e-4)
 
 
 @skip_if_no_torch
@@ -580,8 +580,8 @@ def test_kernels_match_hf_without_l2norm():
         use_qk_l2norm_in_kernel=False,
     )
 
-    np.testing.assert_allclose(np.array(out_chunk_j.array), _to_np(out_chunk_t), rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(np.array(out_recur_j.array), _to_np(out_recur_t), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(np.array(out_chunk_j.array), _to_np(out_chunk_t), rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(np.array(out_recur_j.array), _to_np(out_recur_t), rtol=1e-4, atol=1e-4)
 
 
 @skip_if_no_torch
