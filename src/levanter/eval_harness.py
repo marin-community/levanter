@@ -296,27 +296,25 @@ class _Message:
 
 
 def _get_segments_this_batch(batch, max_segments_per_ex):
-    with local_cpu_mesh():
-        segment_ids = np.asarray(jax.device_get(batch.attn_mask.segment_ids[0].array))
+    segment_ids = np.asarray(jax.device_get(batch.attn_mask.segment_ids[0].array))
 
-        unique_segs = np.unique(segment_ids).tolist()
-        # + 1 because we use -1 as a padding value for segments and allow that
-        if len(unique_segs) > max_segments_per_ex + 1:
-            raise ValueError(f"Too many segments in batch: {len(unique_segs)}")
-        if -1 in unique_segs:
-            unique_segs.remove(-1)
+    unique_segs = np.unique(segment_ids).tolist()
+    # + 1 because we use -1 as a padding value for segments and allow that
+    if len(unique_segs) > max_segments_per_ex + 1:
+        raise ValueError(f"Too many segments in batch: {len(unique_segs)}")
+    if -1 in unique_segs:
+        unique_segs.remove(-1)
 
-        return unique_segs
+    return unique_segs
 
 
 def _get_padding_count(batch, pad_token_id):
     # returns the total amount of padding in the batch
-    with local_cpu_mesh():
-        tokens = np.asarray(jax.device_get(batch.tokens.array))
+    tokens = np.asarray(jax.device_get(batch.tokens.array))
 
-        padding_count = np.sum(tokens == pad_token_id)
-        total_tokens = tokens.size
-        return padding_count, total_tokens
+    padding_count = np.sum(tokens == pad_token_id)
+    total_tokens = tokens.size
+    return padding_count, total_tokens
 
 
 class LevanterHarnessLM(TemplateLM):
@@ -507,6 +505,9 @@ class LevanterHarnessLM(TemplateLM):
         for q, batch in enumerate(packed_iterator):
             # Handle profiler start/stop based on step
             self._handle_profiler_step()
+
+            with local_cpu_mesh():
+                batch = jax.device_put(jax.device_get(batch))
 
             segments_this_batch = _get_segments_this_batch(
                 batch, self.leader.max_packed_segments * self.EvalBatch.size
