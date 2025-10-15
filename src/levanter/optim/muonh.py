@@ -169,13 +169,13 @@ def scale_with_muonh(momentum=0.95, nesterov=True, steps=5, muon_eps=1e-8, learn
                 return None
             if p.ndim == 2:
                 # this is the case for no layer stacking
-                new_p = p - learning_rate * u * jnp.linalg.norm(p) / jnp.linalg.norm(u)
+                new_p = p - learning_rate * u * jnp.linalg.norm(p) / max(jnp.linalg.norm(u), 1e-10)
                 return new_p / jnp.linalg.norm(new_p) * jnp.linalg.norm(p) - p
             else:
                 axes = tuple(range(1, p.ndim))
                 p_norm = jnp.sqrt(jnp.sum(jnp.square(p), axis=axes, keepdims=True))
                 u_norm = jnp.sqrt(jnp.sum(jnp.square(u), axis=axes, keepdims=True))
-                new_p = p - learning_rate * u * p_norm / u_norm
+                new_p = p - learning_rate * u * p_norm / max(u_norm, 1e-10)
                 new_p_norm = jnp.sqrt(jnp.sum(jnp.square(new_p), axis=axes, keepdims=True))
                 return new_p / new_p_norm * p_norm - p
 
