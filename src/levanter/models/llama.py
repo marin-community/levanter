@@ -65,8 +65,12 @@ class LlamaConfig(HFCompatConfig):
     initializer_range: float = 0.02
     layer_norm_epsilon: float = 1e-5
     tie_word_embeddings: bool = False
-    hybrid_norm: bool = False # if set to True, this will add an additional layer norm after the attention and MLP layers
-    use_qk_norm: bool = False # if set to True, this will add an additional layer norm after the key and query projections
+    hybrid_norm: bool = (
+        False  # if set to True, this will add an additional layer norm after the attention and MLP layers
+    )
+    use_qk_norm: bool = (
+        False  # if set to True, this will add an additional layer norm after the key and query projections
+    )
     input_embedding_norm: bool = False
 
     # Attention-related config

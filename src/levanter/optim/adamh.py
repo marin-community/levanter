@@ -163,7 +163,7 @@ def scale_by_adamh(
                 u_norm = jnp.sqrt(jnp.sum(jnp.square(u), axis=axes, keepdims=True))
                 new_p = p - learning_rate * u * p_norm / max(u_norm, 1e-10)
                 new_p_norm = jnp.sqrt(jnp.sum(jnp.square(new_p), axis=axes, keepdims=True))
-                return new_p / new_p_norm * p_norm - p
+                return new_p / max(new_p_norm, 1e-10) * p_norm - p
 
         adamh_updates = jax.tree_util.tree_map(
             scale_invariant_update,
