@@ -18,9 +18,3 @@ engine:
   page_size: 128
   max_seq_len: 4096
   max_rounds: 32
-
-
-prompts:
-  - "Four score and seven years ago, our"
-  # - "On the first day of Christmas, my true love gave to me",
-  - "In a hole in the ground there lived a hobbit, not a nasty, dirty, wet hole"
