@@ -188,20 +188,14 @@ class FailSafeJSONEncoder(json.JSONEncoder):
         # Known clean conversions
         if isinstance(obj, (datetime.datetime, datetime.date, datetime.time)):
             # ISO 8601; preserves tzinfo if present
-            try:
-                return obj.isoformat()
-            except Exception:
-                return str(obj)
+            return obj.isoformat()
 
         if isinstance(obj, decimal.Decimal):
             # Prefer float; fallback to string if NaN/Inf
-            try:
-                f = float(obj)
-                if f == float("inf") or f == float("-inf") or f != f:  # NaN check
-                    return str(obj)
-                return f
-            except Exception:
+            f = float(obj)
+            if f == float("inf") or f == float("-inf") or f != f:  # NaN check
                 return str(obj)
+            return f
 
         if isinstance(obj, uuid.UUID):
             return str(obj)
@@ -228,41 +222,19 @@ class FailSafeJSONEncoder(json.JSONEncoder):
 
         if isinstance(obj, enum.Enum):
             # Serialize as its value when simple; else name
-            try:
-                val = obj.value
-                # Make sure the value itself is JSON-serializable
-                json.dumps(val)  # quick probe
-                return val
-            except Exception:
-                return obj.name
+            val = obj.value
+            # Make sure the value itself is JSON-serializable
+            json.dumps(val)  # quick probe
+            return val
 
         if is_dataclass(obj):
             # Convert dataclasses to dicts (lets the base encoder recurse)
-            try:
-                return asdict(obj)
-            except Exception:
-                pass  # fall through to string fallback
+            return asdict(obj)
 
         # Functions / callables -> a safe label
         if callable(obj):
             name = getattr(obj, "__name__", None)
             return f"<function {name}>" if name else "<callable>"
 
-        # Generic Python objects: DON'T explode—use a conservative string
-        # Avoid user-defined __repr__ surprises where possible
-        try:
-            # Try a short, informative tag
-            t = type(obj)
-            addr = hex(id(obj))
-            # Try __repr__, but guard it
-            try:
-                rep = repr(obj)
-            except Exception:
-                rep = t.__name__
-            # Cap very long reprs to keep payloads sane
-            if len(rep) > 500:
-                rep = rep[:500] + "…"
-            return {"__type__": f"{t.__module__}.{t.__name__}", "__repr__": rep, "__id__": addr}
-        except Exception:
-            # Absolute last resort
-            return "<unserializable object>"
+        # Everything else: use repr()
+        return repr(obj)
