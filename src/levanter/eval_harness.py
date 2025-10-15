@@ -408,12 +408,6 @@ class LevanterHarnessLM(TemplateLM):
         return self.tokenizer.eos_token_id
 
     def set_current_task(self, task_name: str):
-        """
-        Set the current task name for organizing sample outputs.
-
-        Args:
-            task_name: Name of the current evaluation task
-        """
         self._current_task = task_name
         if self.sample_logging_config.should_log() and task_name not in self.sample_outputs:
             self.sample_outputs[task_name] = []
@@ -1451,28 +1445,6 @@ def log_report_to_tracker(prefix: str, report: dict, tracker: Optional[levanter.
 
     if to_log:
         tracker.log(to_log, step=None)
-
-
-def _json_default(value):
-    """
-    Provide a best-effort JSON serialization for objects returned by the eval harness.
-    """
-    if dataclasses.is_dataclass(value):
-        return dataclasses.asdict(value)
-
-    if isinstance(value, set):
-        return list(value)
-
-    if hasattr(value, "to_dict") and callable(value.to_dict):
-        try:
-            return value.to_dict()
-        except Exception:
-            pass
-
-    if hasattr(value, "__dict__"):
-        return vars(value)
-
-    return repr(value)
 
 
 def lm_eval_harness(config: LmEvalHarnessConfig, tokenizer, EvalBatch, axis_resources, mp: jmp.Policy | None):
