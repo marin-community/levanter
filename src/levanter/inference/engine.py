@@ -1061,7 +1061,7 @@ class InferenceEngine:
             ),
         )
 
-    def generate(self, requests: Sequence[Request], step_callback=None, print_every_n: int = 0) -> GenerationResult:
+    def generate(self, requests: Sequence[Request], step_callback=None) -> GenerationResult:
         """Generate tokens for a batch of Requests.
 
         Each Request provides prompt_tokens, decode_params, and n_generations (clones).
@@ -1132,7 +1132,7 @@ class InferenceEngine:
         # Try initial admission from queue and extract prompt tokens
         decode_outputs = self._admit_from_queue()
         if decode_outputs:
-            _ = self._ingest_outputs(decode_outputs, print_every_n=print_every_n)
+            _ = self._ingest_outputs(decode_outputs)
         initial_prefill_out = time.time()
         logger.info(f"Initial prefill and extraction took {initial_prefill_out - time_in:.3f}s")
 
@@ -1153,9 +1153,9 @@ class InferenceEngine:
             if step_callback is not None:
                 step_callback(decode_iteration)
 
-            # iter_start = time.time()
+            iter_start = time.time()
 
-            # fake_submit_start = time.time()
+            fake_submit_start = time.time()
             # future_state, decode_outputs = _run_generation_loop(
             jax.tree.flatten(
                 (
@@ -1166,9 +1166,9 @@ class InferenceEngine:
                     0,
                 )
             )
-            # fake_submit_done = time.time()
+            fake_submit_done = time.time()
 
-            # submit_start = iter_start
+            submit_start = iter_start
             future_state, decode_outputs = _run_generation_loop(
                 self.gen_state,
                 self.model,
@@ -1177,40 +1177,40 @@ class InferenceEngine:
                 self.config.imputed_max_tokens_per_round,
                 self.config.max_rounds,
             )
-            # submit_done = time.time()
+            submit_done = time.time()
             # Time spent with device executing (and the host thread waiting)
             self.gen_state = future_state
-            # device_time = time.time() - submit_done
+            device_time = time.time() - submit_done
 
-            # extract_start = time.time()
-            new_tokens = self._ingest_outputs(decode_outputs, print_every_n=print_every_n)
-            # extract_time = time.time() - extract_start
+            extract_start = time.time()
+            new_tokens = self._ingest_outputs(decode_outputs)
+            extract_time = time.time() - extract_start
 
             # Release any sequences that finished in this step
-            # release_start = time.time()
+            release_start = time.time()
             # Admit more if capacity allows
             admit_outputs = self._admit_from_queue()
             if admit_outputs is not None:
-                mid_tokens = self._ingest_outputs(admit_outputs, print_every_n=print_every_n)
+                mid_tokens = self._ingest_outputs(admit_outputs)
             else:
                 mid_tokens = 0
             new_tokens += mid_tokens
-            # release_time = time.time() - release_start
+            release_time = time.time() - release_start
 
-            # iter_end = time.time()
-            # iter_time = iter_end - iter_start
+            iter_end = time.time()
+            iter_time = iter_end - iter_start
             # Host time is everything except the device execution wait
-            # host_time = max(iter_time - device_time, 0.0)
-            # submit_time = submit_done - submit_start
-            # if iter_time > 0:
-            #     tps_total = new_tokens / iter_time
-            #     logger.info(
-            #         f"Decode iter: total {iter_time:.3f}s (device {device_time:.3f}s, host {host_time:.3f}s, "
-            #         f"submit {submit_time:.3f}s), "
-            #         f"fake_submit {fake_submit_done - fake_submit_start:.3f}s, "
-            #         f"{tps_total:.2f} tok/s, {new_tokens} new"
-            #         f" (extract {extract_time:.3f}s, release {release_time:.3f}s)"
-            #     )
+            host_time = max(iter_time - device_time, 0.0)
+            submit_time = submit_done - submit_start
+            if iter_time > 0:
+                tps_total = new_tokens / iter_time
+                logger.debug(
+                    f"Decode iter: total {iter_time:.3f}s (device {device_time:.3f}s, host {host_time:.3f}s, "
+                    f"submit {submit_time:.3f}s), "
+                    f"fake_submit {fake_submit_done - fake_submit_start:.3f}s, "
+                    f"{tps_total:.2f} tok/s, {new_tokens} new"
+                    f" (extract {extract_time:.3f}s, release {release_time:.3f}s)"
+                )
 
             decode_iteration += 1
 
@@ -1246,9 +1246,9 @@ class InferenceEngine:
                 logprobs_list.append(dr.logprobs if dr.logprobs is not None else [])
             self.results[rid] = kid_map
         total_generated = sum(len(seq_outputs) for seq_outputs in outputs_list)
-        # total_time = time.time() - time_in
-        # tps_overall = (total_generated / total_time) if total_time > 0 else 0.0
-        # logger.info(f"Batch generated in {total_time:.2f}s, {total_generated} tokens, {tps_overall:.2f} tok/s")
+        total_time = time.time() - time_in
+        tps_overall = (total_generated / total_time) if total_time > 0 else 0.0
+        logger.debug(f"Batch generated in {total_time:.2f}s, {total_generated} tokens, {tps_overall:.2f} tok/s")
         # Clear results for these requests now that we've assembled outputs
         for rid in call_rids:
             if rid in self.results:
@@ -1315,7 +1315,7 @@ class InferenceEngine:
         else:
             logger.info(f"Written trace info to {path}")
 
-    def _extract_outputs(self, pending_outputs, print_every_n: int = 0) -> int:
+    def _extract_outputs(self, pending_outputs) -> int:
         """Append newly available tokens into outputs per (request_id, child_id).
 
         Returns number of new tokens appended.
@@ -1347,14 +1347,15 @@ class InferenceEngine:
             dr.tokens_decoded += 1
             appended += 1
 
-            # Print accumulated decoded text as it is generated
-            if print_every_n > 0 and dr.tokens_decoded % print_every_n == 0:
-                try:
-                    # Decode the full sequence so far
-                    full_text = self.tokenizer.decode(dr.token_list, skip_special_tokens=False)
-                    logger.info(f"[Request {rid}, Choice {cid}] Tokens {dr.tokens_decoded}: '{full_text}'")
-                except Exception as e:
-                    logger.info(f"[Request {rid}, Choice {cid}] Tokens {dr.tokens_decoded}: <decode_error: {e}>")
+            # # Print accumulated decoded text as it is generated -- For debugging
+            # print_every_n = 10
+            # if dr.tokens_decoded % print_every_n == 0:
+            #     try:
+            #         # Decode the full sequence so far
+            #         full_text = self.tokenizer.decode(dr.token_list, skip_special_tokens=False)
+            #         logger.info(f"[Request {rid}, Choice {cid}] Tokens {dr.tokens_decoded}: '{full_text}'")
+            #     except Exception as e:
+            #         logger.info(f"[Request {rid}, Choice {cid}] Tokens {dr.tokens_decoded}: <decode_error: {e}>")
 
         # Update done flags based on snapshot
         for local_slot, is_done in enumerate(fins):
@@ -1368,28 +1369,25 @@ class InferenceEngine:
             dr.done = True
 
             # Print final complete text when sequence is finished
-            if print_every_n > 0 and dr.tokens_decoded > 0:
-                try:
-                    full_text = self.tokenizer.decode(dr.token_list, skip_special_tokens=False)
-                    logger.info(f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): '{full_text}'")
-                except Exception as e:
-                    logger.info(
-                        f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): <decode_error: {e}>"
-                    )
+            try:
+                full_text = self.tokenizer.decode(dr.token_list, skip_special_tokens=False)
+                logger.debug(f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): '{full_text}'")
+            except Exception as e:
+                logger.error(f"[Request {rid}, Choice {cid}] FINAL ({dr.tokens_decoded} tokens): <decode_error: {e}>")
 
-        # num_finished = int(fins.sum()) if hasattr(fins, "sum") else 0
-        # logger.info(f"extract: appended={appended} (drained={n}) unmapped={unmapped} finished_count={num_finished}")
+        num_finished = int(fins.sum()) if hasattr(fins, "sum") else 0
+        logger.debug(f"extract: appended={appended} (drained={n}) unmapped={unmapped} finished_count={num_finished}")
 
         return appended
 
-    def _ingest_outputs(self, outputs: _DecodeOutputs | None, print_every_n: int = 0) -> int:
+    def _ingest_outputs(self, outputs: _DecodeOutputs | None) -> int:
         """Drain device outputs into host results and apply host-side release.
 
         Returns the number of tokens appended to results. No-op if outputs is None.
         """
         if outputs is None:
             return 0
-        appended = self._extract_outputs(outputs, print_every_n=print_every_n)
+        appended = self._extract_outputs(outputs)
         self._release_finished_sequences(outputs)
         return appended
 

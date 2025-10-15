@@ -82,31 +82,9 @@ from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
 from levanter.trainer import TrainerConfig
 from levanter.utils.jax_utils import broadcast_shard, use_cpu_device
 from levanter.utils.tree_utils import inference_mode
+from levanter.utils.py_utils import FailSafeJSONEncoder
 
 logger = logging.getLogger(__name__)
-
-
-class SafeJSONEncoder(json.JSONEncoder):
-    """
-    Custom JSON encoder that handles non-serializable objects by converting them to strings.
-    These objects are sometimes emitted by lm-eval.
-    """
-
-    def default(self, obj):
-        """
-        Convert non-serializable objects to strings.
-
-        Args:
-            obj: The object to serialize
-
-        Returns:
-            String representation of the object, or calls parent default method
-        """
-        if callable(obj):
-            return f"<function: {obj.__name__ if hasattr(obj, '__name__') else str(obj)}>"
-        elif hasattr(obj, "__dict__"):
-            return str(obj)
-        return super().default(obj)
 
 
 @dataclass(frozen=True)
@@ -259,15 +237,6 @@ class _LmEvalHarnessWorker:
         return self._generation_kwargs.get("max_gen_toks", 256)
 
     def make_harness_lm(self):
-        """
-        Create a LevanterHarnessLM instance for the main process.
-
-        Returns:
-            LevanterHarnessLM instance for process 0
-
-        Raises:
-            ValueError: If called on any process other than 0
-        """
         if jax.process_index() == 0:
             return LevanterHarnessLM(self)
         else:
@@ -371,7 +340,6 @@ class LevanterHarnessLM(TemplateLM):
         self.profiler_config = leader.profiler_config
         self._current_step = 0
         self._profiler_started = False
-        self.print_every_n = 0  # Prints generations every n tokens; 0 means no printing
 
     tokenizer = property(lambda self: self.leader.tokenizer)
     EvalBatch = property(lambda self: self.leader.EvalBatch)
@@ -799,9 +767,6 @@ class LevanterHarnessLM(TemplateLM):
             max_seqs=256,
             page_size=8,
             compute_dtype=jnp.bfloat16,
-            max_queued_tokens=256,
-            max_seqs_in_prefill=16,
-            max_prefill_size=max_length,
         )
         engine = InferenceEngine.from_model_with_config(
             model=self.leader.model, tokenizer=self.tokenizer, config=engine_cfg
@@ -848,11 +813,9 @@ class LevanterHarnessLM(TemplateLM):
 
         # Pass the callback to the engine if profiling is enabled
         step_callback = decode_step_callback if self.profiler_config.enabled else None
-        # Only print when print_every_n > 0; otherwise disable printing entirely
         result = engine.generate(
             gen_requests,
             step_callback=step_callback,
-            print_every_n=self.print_every_n,
         )
 
         # Decode first generation per request (LM Harness expects one string per request)
@@ -1028,9 +991,6 @@ class LmEvalHarnessConfig:
     def max_gen_toks(self) -> int:
         """Backward compatibility property for max_gen_toks."""
         return self.generation_kwargs.get("max_gen_toks", 256)
-
-    # Printing configuration for generation debugging
-    print_every_n: int | None = None
 
     def to_task_spec(self) -> list[str | dict]:
         """
@@ -1276,12 +1236,6 @@ def _actually_run_eval_harness(
     if jax.process_index() == 0:
         logger.info("Process 0 is running the eval harness.")
         harness = worker.make_harness_lm()
-        # Thread print_every_n into the harness if provided; disables printing when 0 or None
-        if config.print_every_n is not None:
-            try:
-                harness.print_every_n = int(config.print_every_n)
-            except Exception:
-                logger.warning(f"Invalid print_every_n: {config.print_every_n}. Ignoring.")
 
         # eval_harness only sets seeds in simple_evaluate, which we can't use (I think?)
         tasks_to_run = _adjust_config(tasks_to_run, 0)
@@ -1453,12 +1407,12 @@ def run_eval_harness_main(config: EvalHarnessMainConfig):
             # log the results as json
             logger.info("uploading artifacts...")
             with open("lm_eval_harness_results.json", "w") as f:
-                json.dump(outputs, f, indent=2, cls=SafeJSONEncoder)
+                json.dump(outputs, f, indent=2, cls=FailSafeJSONEncoder)
                 f.flush()
                 f_path = f.name
                 levanter.tracker.current_tracker().log_artifact(f_path, name="lm_eval_harness_results")
 
-            print(json.dumps(outputs, indent=2, cls=SafeJSONEncoder), flush=True)
+            print(json.dumps(outputs, indent=2, cls=FailSafeJSONEncoder), flush=True)
 
         return outputs
 
@@ -1541,7 +1495,7 @@ def lm_eval_harness(config: LmEvalHarnessConfig, tokenizer, EvalBatch, axis_reso
             with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as f:
                 import json
 
-                json.dump(outputs, f, cls=SafeJSONEncoder)
+                json.dump(outputs, f, cls=FailSafeJSONEncoder)
                 f.flush()
                 levanter.tracker.current_tracker().log_artifact(
                     f.name, name=f"lm_eval_harness_results.{step.step}.json", type="lm_eval_output"
