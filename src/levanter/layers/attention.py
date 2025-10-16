@@ -178,49 +178,26 @@ def dot_product_attention(
             )
 
         case AttentionBackend.SPLASH:
-            if attn_sink is None:
-                attention_out = _try_tpu_splash_attention(
-                    QPos,
-                    KPos,
-                    Key,
-                    query,
-                    key,
-                    value,
-                    mask,
-                    bias,
-                    dropout,
-                    inference,
-                    force_flash=not was_default,
-                    prng=prng,
-                    attention_dtype=attention_dtype,
-                    precision=precision,
-                    block_size=flash_block_size,
-                    scaling_factor=scaling_factor,
-                    logits_soft_cap=logits_soft_cap,
-                )
-            else:
-                try:
-                    attention_out = _tpu_splash_attention(  # type: ignore[call-arg]
-                        QPos,
-                        KPos,
-                        Key,
-                        query,
-                        key,
-                        value,
-                        mask=mask,
-                        bias=bias,
-                        inference=inference,
-                        block_size=flash_block_size,
-                        scaling_factor=scaling_factor,
-                        logits_soft_cap=logits_soft_cap,
-                        sinks=attn_sink,  # TODO: support after upgrade to JAX 0.7.2
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "TPU Splash w/ sinks unavailable (%s). Falling back to JAX Flash.",
-                        e,
-                    )
-                    attention_out = None
+            attention_out = _try_tpu_splash_attention(
+                QPos,
+                KPos,
+                Key,
+                query,
+                key,
+                value,
+                mask,
+                bias,
+                dropout,
+                inference,
+                force_flash=not was_default,
+                prng=prng,
+                attention_dtype=attention_dtype,
+                precision=precision,
+                block_size=flash_block_size,
+                scaling_factor=scaling_factor,
+                logits_soft_cap=logits_soft_cap,
+                attn_sink=attn_sink,
+            )
 
         case AttentionBackend.VANILLA:
             if attn_sink is None:
@@ -764,6 +741,47 @@ def _reshape_axes_for_bshd_bins(q, q_class, output_order=("B", "S", "H", "D")):
     return q
 
 
+def _prepare_sinks_for_splash(attn_sink: NamedArray, q_class, physical_axes_q: PartitionSpec):
+    """Reshape and broadcast attention sinks to (B, H) for the splash kernel."""
+
+    batch_axes = tuple(q_class["B"])
+    head_axes = tuple(q_class["H"])
+    allowed_axes = {ax.name for ax in batch_axes + head_axes}
+    extra_axes = tuple(ax for ax in attn_sink.axes if ax.name not in allowed_axes)
+    if extra_axes:
+        raise NotImplementedError(
+            f"Attention sinks contain axes unsupported by splash attention: {', '.join(ax.name for ax in extra_axes)}"
+        )
+
+    sink = attn_sink
+    sink_axis_names = {ax.name for ax in sink.axes}
+    for ax in batch_axes:
+        if ax.name not in sink_axis_names:
+            sink = sink.broadcast_axis(ax)
+            sink_axis_names.add(ax.name)
+    for ax in head_axes:
+        if ax.name not in sink_axis_names:
+            sink = sink.broadcast_axis(ax)
+            sink_axis_names.add(ax.name)
+
+    if batch_axes:
+        sink = sink.flatten_axes(tuple(ax.name for ax in batch_axes), "splash_batch")
+    else:
+        sink = sink.broadcast_axis(Axis("splash_batch", 1))
+
+    if head_axes:
+        sink = sink.flatten_axes(tuple(ax.name for ax in head_axes), "splash_head")
+    else:
+        sink = sink.broadcast_axis(Axis("splash_head", 1))
+
+    sink = sink.rearrange(("splash_batch", "splash_head"))
+
+    sinks_array = sink.astype(jnp.float32).array
+    physical_axes_sink = PartitionSpec(physical_axes_q[0], physical_axes_q[1])
+
+    return sinks_array, physical_axes_sink
+
+
 def _unflatten_bshd(attn_output, q_class, v_class):
     attn_output = attn_output.unflatten_axis("B", q_class["B"])
     attn_output = attn_output.unflatten_axis("S", q_class["S"])
@@ -1130,6 +1148,7 @@ def _try_tpu_splash_attention(
     block_size: Optional[int] = None,
     scaling_factor: float,
     logits_soft_cap: float | None,
+    attn_sink: Optional[NamedArray] = None,
 ) -> Optional[NamedArray]:
     if dropout != 0.0:
         if force_flash:
@@ -1161,14 +1180,17 @@ def _try_tpu_splash_attention(
             block_size=block_size,
             scaling_factor=scaling_factor,
             logits_soft_cap=logits_soft_cap,
+            attn_sink=attn_sink,
         )
     except ImportError as e:
         if "pallas" not in str(e):
             raise
         if force_flash:
-            raise ImportError("Could not import splash attention. You need to update your JAX to at least 0.4.26.")
+            raise ImportError(
+                "Could not import splash attention w/ sinks. You need to update your JAX to at least 0.7.2."
+            )
         warnings.warn(
-            "Could not import splash attention. You need to update your JAX to at least 0.4.26. "
+            "Could not import splash attention. You need to update your JAX to at least 0.7.2. "
             "Falling back to the reference implementation."
         )
         return None
@@ -1199,6 +1221,7 @@ def _tpu_splash_attention(
     block_size: Optional[int] = None,
     scaling_factor: float,
     logits_soft_cap: float | None = None,
+    attn_sink: Optional[NamedArray] = None,
 ) -> Optional[NamedArray]:
     from jax.experimental.pallas.ops.tpu.splash_attention import (
         splash_attention_kernel,
@@ -1274,6 +1297,12 @@ def _tpu_splash_attention(
     physical_axes_k = _physical_axis_for_binning(k_class)
     physical_axes_v = _physical_axis_for_binning(v_class)
 
+    if attn_sink is not None:
+        sinks, physical_axes_sink = _prepare_sinks_for_splash(attn_sink, q_class, physical_axes_q)
+    else:
+        sinks = None
+        physical_axes_sink = None
+
     # segment_ids: handle both the new tuple form and legacy single-array form for robustness
     segment_ids = mask.segment_ids if isinstance(mask, AttentionMask) else None
     if segment_ids is not None:
@@ -1317,11 +1346,12 @@ def _tpu_splash_attention(
             physical_axes_k,
             physical_axes_v,
             physical_axes_segments,
+            physical_axes_sink,
         ),
         out_specs=physical_axes_q,
         check_rep=False,
     )
-    def wrap_flash_attention(q, k, v, segment_ids):
+    def wrap_flash_attention(q, k, v, segment_ids, sinks):
         # NB: inside the function, q, k, and v are partitioned, so in general the lengths of dims are not the same
         Sq = q.shape[2]
         Sk = k.shape[2]
@@ -1378,12 +1408,13 @@ def _tpu_splash_attention(
         q = q.astype(attention_dtype)
         k = k.astype(attention_dtype)
         v = v.astype(attention_dtype)
+        sink_in_axes = 0 if sinks is not None else None
         return jax.vmap(
-            lambda q, k, v, si: splash_kernel(q, k, v, segment_ids=si),
-            in_axes=(0, 0, 0, segment_batch_axis),
-        )(q, k, v, segment_ids)
+            lambda q, k, v, si, sink: splash_kernel(q, k, v, segment_ids=si, sinks=sink),
+            in_axes=(0, 0, 0, segment_batch_axis, sink_in_axes),
+        )(q, k, v, segment_ids, sinks)
 
-    attn_output = wrap_flash_attention(q_, k_, v_, segment_ids)
+    attn_output = wrap_flash_attention(q_, k_, v_, segment_ids, sinks)
 
     attn_output = haliax.named(attn_output, ("B", "H", "S", "D"))
     # the output shape is B, S_q, H_q, D_v. Right now we're requiring D_k == D_v
