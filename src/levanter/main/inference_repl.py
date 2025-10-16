@@ -17,6 +17,7 @@ CLI Usage:
 import asyncio
 import json
 import logging
+import os
 import shlex
 import time
 from dataclasses import dataclass, field
@@ -163,6 +164,7 @@ class InferenceReplConfig:
             service=InferenceEngineConfig(
                 page_size=8,
                 max_seq_len=64,
+                max_seqs=2,
                 max_queued_tokens=64,
                 max_seqs_in_prefill=1,
                 max_prefill_size=64,
@@ -255,7 +257,8 @@ class ReplContext:
 
             self.server.reload(_reload)
         else:
-            self.server = InferenceServer.create(self.config.server, model=model, tokenizer=tokenizer)
+            with self.config.trainer.use_device_mesh(), hax.axis_mapping(self.config.trainer.compute_axis_mapping):
+                self.server = InferenceServer.create(self.config.server, model=model, tokenizer=tokenizer)
 
         console.print(f"[green]✓ Loaded {path}[/green]")
 
@@ -568,6 +571,7 @@ def cli_mode(config: InferenceReplConfig, commands: ReplContext):
 def main(config: InferenceReplConfig):
     """Main entry point."""
     commands = ReplContext(config)
+    os.environ["EQX_ON_ERROR"] = "nan"
 
     # Determine mode
     if config.command:
