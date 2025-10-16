@@ -41,7 +41,8 @@ def baby_llama_config():
             max_seq_len=16,
             max_seqs=2,
             page_size=4,
-            max_queued_tokens=8,
+            max_queued_tokens=32,
+            hbm_utilization=0.1,
         ),
         temperature=0.7,
         seed=42,
@@ -73,19 +74,18 @@ def loaded_model(trainer_config):
 
 
 @pytest.fixture(scope="module")
-def inference_server(baby_llama_config, loaded_model):
+def inference_server(trainer_config, baby_llama_config, loaded_model):
     """Create an InferenceServer instance."""
     model, tokenizer = loaded_model
-    return InferenceServer.create(baby_llama_config, model, tokenizer)
+    with trainer_config.use_device_mesh(), hax.axis_mapping(trainer_config.compute_axis_mapping):
+        return InferenceServer.create(baby_llama_config, model, tokenizer)
 
 
 @pytest.fixture(scope="module")
-def test_client(baby_llama_config, loaded_model):
+def test_client(baby_llama_config, loaded_model, inference_server):
     """Create a test client for the inference server."""
-    model, tokenizer = loaded_model
-    server = InferenceServer.create(baby_llama_config, model, tokenizer)
-    with TestClient(server.app) as client:
-        yield client, server
+    with TestClient(inference_server.app) as client:
+        yield client, inference_server
 
 
 def test_endpoints_exist(test_client):

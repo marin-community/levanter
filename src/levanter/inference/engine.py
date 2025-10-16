@@ -29,6 +29,7 @@ from levanter.inference.jit_scheduler import (
     TokenQueue,
     _DecodeOutputs,
 )
+from levanter.inference.page_allocator import PageAllocatorCPU
 from levanter.inference.page_table import PageTable
 from levanter.inference.utils import INVALID, is_valid
 from levanter.layers.kv_cache import PageCache
@@ -284,6 +285,20 @@ class PrefillWork(eqx.Module):
     prompt_tokens: ht.i32[NamedArray, "seq position"]  # type: ignore[name-defined]
     prompt_lengths: ht.i32[NamedArray, "seq"]  # type: ignore[name-defined]
     seq_params: SeqDecodingParams
+    page_assignments: Optional[np.ndarray] = None  # [max_seqs, pages_per_seq] - CPU-computed page assignments
+
+
+@dataclass
+class DecodeWork:
+    """CPU-prepared work for decode rounds.
+
+    This structure will be used in future phases to carry CPU-computed page allocations
+    for decode rounds, enabling page-aligned execution and simplifying device-side logic.
+    """
+
+    page_assignments: np.ndarray  # [max_seqs, pages_per_seq] - CPU-computed page assignments
+    active_slots: np.ndarray  # Which slots are active this round
+    expected_seq_lens: np.ndarray  # Expected length after this round
 
 
 def _compute_sample_indices(pos_ids, slot_ids, seq_lens, max_sample_indices):
@@ -426,6 +441,12 @@ def _apply_prefill_work(gen_state: GenState, work: PrefillWork) -> GenState:
     num_new = work.new_num_seqs.astype(jnp.int32)
     max_slots = work.new_slot_ids.array.shape[0]
 
+    # Convert CPU page assignments to JAX array if provided
+    page_assignments_jax = (
+        None if work.page_assignments is None else jnp.asarray(work.page_assignments, dtype=jnp.int32)
+    )
+    has_cpu_pages = page_assignments_jax is not None
+
     def body(i: int, state: GenState) -> GenState:
         slot_val = work.new_slot_ids.array[i]
 
@@ -439,6 +460,8 @@ def _apply_prefill_work(gen_state: GenState, work: PrefillWork) -> GenState:
                     child_local_id=slot_val,
                     seq_params=seq_params,
                 )
+                # For clones, CPU already assigned pages during host-side preparation
+                # The clone_sequence call handles page cloning on the device side
                 return new_state
 
             def do_primary(gs_primary: GenState) -> GenState:
@@ -450,10 +473,18 @@ def _apply_prefill_work(gen_state: GenState, work: PrefillWork) -> GenState:
                     local_slot_id=slot_val,
                     tokens=work.prompt_tokens["seq", i],
                     seq_len=prompt_len,
-                    kv_pages=None,  # Will be allocated later in allocate_for_seq
-                    page_indices=None,  # Will be set during page allocation
+                    kv_pages=None,  # Will be allocated later in allocate_for_seq OR set via set_page_assignments
+                    page_indices=None,  # Will be set during page allocation OR via set_page_assignments
                     seq_params=seq_params,
                 )
+
+                # If CPU-computed page assignments are available, set them now
+                if has_cpu_pages:
+                    assert page_assignments_jax is not None  # Type narrowing
+                    pages_for_slot = page_assignments_jax[slot_val, :]
+                    decode_state = decode_state.set_page_assignments(slot_val, pages_for_slot)
+                    # jax.debug.print("[Device] Set CPU-allocated pages for slot {slot}: {pages}", slot=slot_val, pages=pages_for_slot)
+
                 return dataclasses.replace(gs_primary, decode_state=decode_state)
 
             return jax.lax.cond(is_valid(parent_val), do_clone, do_primary, gs)
@@ -719,6 +750,20 @@ class InferenceEngine:
         if config.max_prefill_size is None:
             config = dataclasses.replace(config, max_prefill_size=decode_state.page_table.max_len_per_seq)
         self.config = config
+
+        # Initialize CPU-side page allocator (shadow mode for validation initially)
+        page_table = decode_state.page_table
+        self.cpu_page_allocator = PageAllocatorCPU(
+            num_pages=page_table.num_pages,
+            max_seqs=page_table.max_seqs,
+            page_size=page_table.page_size,
+            pages_per_seq=page_table.pages_per_seq,
+        )
+        logger.info(
+            f"Initialized CPU page allocator in shadow mode: {page_table.num_pages} pages, "
+            f"{page_table.page_size} tokens/page"
+        )
+
         # Track free local sequence slots as explicit ids (smallest id first to match allocator expectations).
         # Respect any pre-populated allocations in the provided PageTable.
         sequences = decode_state.sequences
@@ -810,6 +855,8 @@ class InferenceEngine:
         self.free_slots = list(range(int(page_table.max_seqs)))
         self.local_map.clear()
         self.sequences.clear()
+        # Reset CPU page allocator to match device state
+        self.cpu_page_allocator.reset()
         self._verify_free_slot_view(context="reset")
 
     def _release_finished_sequences(self, outputs: _DecodeOutputs) -> None:
@@ -825,6 +872,9 @@ class InferenceEngine:
         logger.info(f"Releasing finished sequences: locals={finished_locals}")
         # Maintain request/child mappings and slot counts on host
         for local_slot in finished_locals:
+            # Free pages on CPU to match device
+            self.cpu_page_allocator.free_pages_for_slot(local_slot)
+
             info = self.local_map.pop(local_slot, None)
             if info is not None:
                 rid, cid = info
@@ -1027,6 +1077,39 @@ class InferenceEngine:
         if offset == 0:
             return None
 
+        # Allocate pages on CPU for all slots in this prefill batch
+        page_table = self.gen_state.decode_state.page_table
+        page_assignments = np.full((max_slots, page_table.pages_per_seq), INVALID, dtype=np.int32)
+
+        for idx in range(total_new):
+            slot_id = work_slot_ids[idx]
+            if slot_id == INVALID:
+                continue
+
+            # For primary sequences: allocate based on prompt length
+            if clone_targets[idx] == INVALID:
+                prompt_len = prompt_lengths[idx]
+                positions = list(range(prompt_len))
+                pages = self.cpu_page_allocator.allocate_pages_for_tokens(slot_id, positions)
+                page_assignments[slot_id, : len(pages)] = pages
+                logger.debug(
+                    f"[CPU Page Alloc] Primary slot {slot_id}: allocated {len(pages)} pages for {prompt_len} tokens"
+                )
+
+            # For clones: clone pages from parent
+            else:
+                parent_slot = clone_targets[idx]
+                cloned_pages = self.cpu_page_allocator.clone_pages(parent_slot, slot_id)
+                page_assignments[slot_id, : len(cloned_pages)] = cloned_pages
+                logger.debug(
+                    f"[CPU Page Alloc] Clone slot {slot_id}: cloned {len(cloned_pages)} pages from slot {parent_slot}"
+                )
+
+        logger.info(
+            f"[CPU Page Alloc] Computed page assignments for {total_new} sequences in prefill batch "
+            f"(shadow mode - device will still do its own allocation)"
+        )
+
         prefill_queue = TokenQueue(
             queued_tokens=hax.named(jnp.asarray(queue_tokens, dtype=jnp.int32), axis="position"),
             queued_slot_ids=hax.named(jnp.asarray(queue_slot_ids, dtype=jnp.int32), axis="position"),
@@ -1051,7 +1134,45 @@ class InferenceEngine:
                 temperature=jnp.asarray(temperatures, dtype=jnp.float32),
                 key=jnp.asarray(prng_keys, dtype=jnp.uint32),
             ),
+            page_assignments=page_assignments,
         )
+
+    def _ensure_decode_pages(self) -> None:
+        """Pre-allocate pages on CPU for active sequences before next decode round.
+
+        For each active slot, calculates how many pages are needed to accommodate
+        the current sequence length plus max_tokens_per_round, and ensures the
+        CPU allocator has allocated enough pages.
+        """
+        page_size = self.gen_state.decode_state.page_table.page_size
+        max_tokens_per_round = self.config.imputed_max_tokens_per_round
+
+        for slot_id in self.local_map.keys():
+            # Get current sequence length from device
+            seq_len = jax.device_get(self.gen_state.decode_state.seq_lens["seq", slot_id].scalar())
+
+            # Calculate pages needed to hold seq_len + max_tokens_per_round
+            max_pos_after = seq_len + max_tokens_per_round
+            pages_needed = (max_pos_after + page_size - 1) // page_size
+
+            # Ensure we have enough pages allocated on CPU
+            self.cpu_page_allocator.ensure_pages(slot_id, pages_needed)
+
+        logger.debug(
+            f"[CPU Page Alloc] Pre-allocated pages for {len(self.local_map)} active slots before decode round"
+        )
+
+    def _sync_page_assignments_to_device(self) -> None:
+        """Transfer CPU page assignments to device state for active slots."""
+        cpu_assignments = self.cpu_page_allocator.get_page_assignments()
+
+        # For each active slot, update device assignments
+        for slot_id in self.local_map.keys():
+            cpu_pages = cpu_assignments[slot_id, :]
+            decode_state = self.gen_state.decode_state.set_page_assignments(slot_id, cpu_pages)
+            self.gen_state = dataclasses.replace(self.gen_state, decode_state=decode_state)
+
+        logger.debug(f"[CPU Page Alloc] Synced page assignments to device for {len(self.local_map)} active slots")
 
     def generate(self, requests: Sequence[Request], step_callback=None) -> GenerationResult:
         """Generate tokens for a batch of Requests.
@@ -1159,6 +1280,10 @@ class InferenceEngine:
                 )
             )
             fake_submit_done = time.time()
+
+            # Pre-allocate pages on CPU and sync to device before decode round
+            self._ensure_decode_pages()
+            self._sync_page_assignments_to_device()
 
             submit_start = iter_start
             future_state, decode_outputs = _run_generation_loop(

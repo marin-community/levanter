@@ -7,6 +7,7 @@ import equinox as eqx
 import haliax as hax
 import jax
 import jaxtyping
+import numpy as np
 from haliax import NamedArray
 from haliax import haxtyping as ht
 from haliax.jax_utils import ensure_scalar
@@ -187,6 +188,49 @@ class SequenceTable(eqx.Module):
         clone_sources = self.clone_sources.at["seq", slot_id].set(clone_source)
         return dataclasses.replace(self, clone_sources=clone_sources)
 
+    def set_page_assignments(
+        self, page_table: "PageTable", slot_id: int, pages: jnp.ndarray
+    ) -> tuple["SequenceTable", "PageTable"]:
+        """Set page assignments from CPU-provided array and increment ref counts.
+
+        Args:
+            page_table: Current page table
+            slot_id: Sequence slot to assign pages to
+            pages: Array of page IDs (may contain INVALID for unused slots)
+
+        Returns:
+            Tuple of (updated SequenceTable, updated PageTable)
+        """
+        # Convert numpy array to JAX array if needed
+        if isinstance(pages, np.ndarray):
+            pages = jnp.asarray(pages, dtype=jnp.int32)
+
+        # Create a NamedArray for the pages with the "page" axis
+        pages_named = hax.named(pages, axis="page")
+
+        # Update page_indices for this slot
+        new_page_indices = self.page_indices.at["seq", slot_id].set(pages_named)
+        # Also update kv_pages to keep them in sync
+        new_kv_pages = self.kv_pages.at["seq", slot_id].set(pages_named)
+
+        # Increment ref counts for all valid pages
+        ref_counts = page_table.page_ref_counts
+
+        def inc_ref(i, rc):
+            page_id = pages_named["page", i].scalar()
+
+            def do_inc(rc):
+                return rc.at["page", page_id].add(1)
+
+            return jax.lax.cond(is_valid(page_id), do_inc, lambda x: x, rc)
+
+        new_ref_counts = jax.lax.fori_loop(0, pages_named.axis_size("page"), inc_ref, ref_counts)
+
+        new_sequences = dataclasses.replace(self, page_indices=new_page_indices, kv_pages=new_kv_pages)
+        new_page_table = dataclasses.replace(page_table, page_ref_counts=new_ref_counts)
+
+        return new_sequences, new_page_table
+
     def clear_slots(self, mask: ht.bool_[NamedArray, "seq"]) -> "SequenceTable":  # type: ignore[name-defined]
         new_seq_lens = hax.where(mask, INVALID, self.seq_lens)
         new_clone_sources = hax.where(mask, INVALID, self.clone_sources)
@@ -215,16 +259,35 @@ class SequenceTable(eqx.Module):
         token_pos_ids: ht.i32[NamedArray, " position"],  # type: ignore[name-defined]
     ) -> tuple["SequenceTable", "PageTable", "PageBatchInfo"]:
         """
-        Allocate pages from PageTable for new sequences and update ``seq_lens``.
+        Build PageBatchInfo from pre-assigned pages and update ``seq_lens``.
 
-        **ASSUMES** that the ``token_slot_ids`` are already grouped by sequence ID, i.e. all tokens for a given sequence
-        are contiguous in the input. The order of sequences in the input does not matter.
+        **NOTE**: This method no longer allocates pages on device. Pages must be pre-allocated
+        on CPU and transferred via set_page_assignments() before calling this method.
+
+        **ASSUMES** that the ``token_slot_ids`` are already grouped by sequence ID, i.e. all tokens
+        for a given sequence are contiguous in the input. The order of sequences in the input does not matter.
         """
-        token_slot_ids = hax.where(token_slot_ids < 0, self.max_seqs, token_slot_ids)
-        # CAREFUL: we don't assume slot_ids are sorted, just contiguous. segment_sum is our friend
-        # NB: segment_sum assumes that segment ids are in the range [0, num_segments)
-        # and returns an array of that length
-        # essentially this means segment_sum et al require dense segment ids so we have to denseify the slot ids first
+        # Update seq_lens for each slot based on maximum position ID seen
+        # This is a simple scatter-max operation per slot
+        new_lens = self.seq_lens
+
+        def update_seq_len(i, lens):
+            slot_id = token_slot_ids["position", i].scalar()
+            pos_id = token_pos_ids["position", i].scalar()
+
+            def do_update(lens):
+                # seq_len should be max_pos + 1
+                new_len = pos_id + 1
+                return lens.at["seq", slot_id].max(new_len)
+
+            # Only update if slot_id and pos_id are valid
+            valid = is_valid(slot_id) & is_valid(pos_id) & (slot_id < self.max_seqs)
+            return jax.lax.cond(valid, do_update, lambda l: l, lens)
+
+        new_lens = jax.lax.fori_loop(0, token_slot_ids.axis_size("position"), update_seq_len, new_lens)
+
+        # Build per-sequence metadata for PageBatchInfo
+        # Group tokens by sequence to compute per-sequence counts and cumulative counts
         unique_ids, dense_ids = get_unique_in_order(
             token_slot_ids.array,
             size=self.max_seqs + 1,  # +1 for INVALID
@@ -235,29 +298,14 @@ class SequenceTable(eqx.Module):
             segment_ids=dense_ids,
             num_segments=self.max_seqs,
         )
-        # now we need to know the segment_ids
         segment_ids = jax.ops.segment_max(
             data=token_slot_ids.array,
-            segment_ids=dense_ids,
-            num_segments=self.max_seqs,
-        )
-        # and then the maximum position within each segment
-        max_pos_per_seq = jax.ops.segment_max(
-            data=token_pos_ids.array,
             segment_ids=dense_ids,
             num_segments=self.max_seqs,
         )
 
         updated_seqs = hax.named(segment_ids, axis="seq")
         new_counts = hax.named(segment_lengths, axis="seq")
-        new_max_pos = hax.named(max_pos_per_seq, axis="seq")
-        # jax.debug.print("segment_lengths={sl} segment_ids={sid}, tsi={tsi}", sl=new_counts, sid=updated_seqs, tsi=token_slot_ids)
-
-        valid_updated = is_valid(updated_seqs) & (updated_seqs < self.max_seqs)
-        safe_updated = hax.where(valid_updated, updated_seqs, 0)
-
-        masked_max_pos = hax.where(valid_updated, new_max_pos, -1)
-
         cu_new_counts = hax.concatenate(
             "seq",
             [
@@ -266,98 +314,25 @@ class SequenceTable(eqx.Module):
             ],
         )
 
-        new_counts = hax.where(valid_updated, new_counts, 0)
-
-        current_lens = self.seq_lens
-        active_mask_for_updated = hax.where(valid_updated, self.used_mask["seq", safe_updated], False)
-
-        num_updated_seqs = hax.sum(valid_updated).scalar().astype(jnp.int32)
-
-        masked_seq_len = (masked_max_pos + 1) * active_mask_for_updated.astype(new_counts.dtype)
-        new_lens = current_lens.at["seq", safe_updated].max(masked_seq_len, mode="drop")
-        # jax.debug.print("masked_seq_len={msl} new_lens={nl} safe_updated={su}", msl=masked_seq_len, nl=new_lens, su=safe_updated)
-
-        new_num_pages_needed = (new_lens + self.page_size - 1) // self.page_size
-        # Count how many pages are actually allocated (valid page_indices), not based on seq_lens
-        # This handles the case where seq_len is set but pages haven't been allocated yet
-        num_allocated_pages = hax.sum(is_valid(self.page_indices), axis="page")
-        old_num_pages_needed = num_allocated_pages
-        old_num_pages_needed = hax.where(valid_updated, old_num_pages_needed["seq", safe_updated], 0)
-        new_num_pages_needed = hax.where(valid_updated, new_num_pages_needed["seq", safe_updated], 0)
-        # jax.debug.print("new_num_pages_needed={nnp} old_num_pages_needed={onp}", nnp=new_num_pages_needed, onp=old_num_pages_needed)
-        # jax.debug.print(
-        #     "nnp per seq: seq0={s0} seq1={s1} seq2={s2}",
-        #     s0=new_num_pages_needed["seq", 0],
-        #     s1=new_num_pages_needed["seq", 1],
-        #     s2=new_num_pages_needed["seq", 2],
-        # )
-
-        page_indices = self.page_indices
-        page_ref_counts = page_table.page_ref_counts
-
-        # NB seq_offset refers to the offset into updated_seqs, not the actual seq_id
-        def _alloc_pages_for_seq(seq_offset, carry):
-            indices, ref_counts = carry
-            num_needed = new_num_pages_needed["seq", seq_offset].scalar()
-            old_needed = old_num_pages_needed["seq", seq_offset].scalar()
-            seq_id = safe_updated["seq", seq_offset].scalar()
-            # jax.debug.print(
-            #     "alloc seq {seq_id} lookup nnp={nnp}", seq_id=seq_id, nnp=new_num_pages_needed["seq", seq_id]
-            # )
-            # jax.debug.print("alloc seq {seq_id} old_needed={old} num_needed={new}", seq_id=seq_id, old=old_needed, new=num_needed)
-
-            def body(page_idx, state):
-                indices, ref_counts = state
-                has_free = hax.any(ref_counts == 0).scalar()
-
-                ref_counts = eqx.error_if(ref_counts, ~has_free, "Out of free pages during allocation")
-
-                def do_alloc(state):
-                    indices, ref_counts = state
-                    # choose a page with the smallest ref count; when has_free, argmin will pick a zero-ref page
-                    free_page_idx = hax.argmin(ref_counts, "page")
-                    ref_counts = ref_counts.at["page", free_page_idx].add(1)
-                    indices = indices.at["seq", seq_id, "page", page_idx].set(free_page_idx)
-                    return indices, ref_counts
-
-                def no_alloc(state):
-                    # No-op; leave index INVALID so downstream gets INVALID destinations
-                    state = eqx.error_if(state, jnp.zeros(()) < 4, "INVALID!")
-                    return state
-
-                return jax.lax.cond(has_free, do_alloc, no_alloc, (indices, ref_counts))
-
-            return jax.lax.fori_loop(old_needed, num_needed, body, (indices, ref_counts))
-
-        def outer(i, carry):
-            page_indices, page_ref_counts = carry
-
-            def do_alloc(carry):
-                return _alloc_pages_for_seq(i, carry)
-
-            seq_id = updated_seqs["seq", i].scalar()
-            cond = is_valid(seq_id)
-            # jax.debug.print("outer iter {i}: seq_id={seq} is_valid={iv}", i=i, seq=seq_id, iv=is_valid(seq_id))
-
-            page_indices, page_ref_counts = jax.lax.cond(cond, do_alloc, lambda c: c, (page_indices, page_ref_counts))
-            return page_indices, page_ref_counts
-
-        page_indices, page_ref_counts = jax.lax.fori_loop(0, num_updated_seqs, outer, (page_indices, page_ref_counts))
-
+        # Build PageBatchInfo from existing page_indices (no allocation)
         batch_info = self._create_batch_info(
             updated_seqs,
-            page_indices,
+            self.page_indices,  # Use existing pages, already assigned by CPU
             cu_new_counts,
             new_lens,
             token_slot_ids,
             token_pos_ids,
         )
 
-        kv_pages = self.kv_pages.at["seq", safe_updated].set(page_indices["seq", safe_updated])
-        new_sequences = dataclasses.replace(self, seq_lens=new_lens, page_indices=page_indices, kv_pages=kv_pages)
-        new_page_table = dataclasses.replace(page_table, page_ref_counts=page_ref_counts)
+        # Sync kv_pages to match page_indices
+        valid_updated = is_valid(updated_seqs) & (updated_seqs < self.max_seqs)
+        safe_updated = hax.where(valid_updated, updated_seqs, 0)
+        kv_pages = self.kv_pages.at["seq", safe_updated].set(self.page_indices["seq", safe_updated])
 
-        return new_sequences, new_page_table, batch_info
+        new_sequences = dataclasses.replace(self, seq_lens=new_lens, kv_pages=kv_pages)
+        # Page ref counts unchanged - CPU manages them
+
+        return new_sequences, page_table, batch_info
 
     def _create_batch_info(self, updated_seqs, page_indices, cu_new_counts, new_lens, token_slot_ids, token_pos_ids):
         mask = is_valid(updated_seqs) & (updated_seqs < self.max_seqs)
@@ -756,6 +731,23 @@ class DecodeState(eqx.Module):
         Clone kv_pages from src slot to dest slot.
         """
         sequences, page_table = self.sequences.clone_pages_from(self.page_table, src, dest)
+        return dataclasses.replace(self, sequences=sequences, page_table=page_table)
+
+    def set_page_assignments(self, slot_id: int, pages: jnp.ndarray | np.ndarray) -> "DecodeState":
+        """
+        Set page assignments from CPU-provided array and increment ref counts.
+
+        This is a wrapper around SequenceTable.set_page_assignments that updates
+        both the sequences and page_table in the DecodeState.
+
+        Args:
+            slot_id: Sequence slot to assign pages to
+            pages: Array of page IDs (may contain INVALID for unused slots)
+
+        Returns:
+            Updated DecodeState
+        """
+        sequences, page_table = self.sequences.set_page_assignments(self.page_table, slot_id, pages)
         return dataclasses.replace(self, sequences=sequences, page_table=page_table)
 
     @property

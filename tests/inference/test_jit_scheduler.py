@@ -7,7 +7,6 @@ import pytest
 
 from levanter.inference.jit_scheduler import SequenceTable, TokenQueue
 from levanter.inference.page_table import PageTable
-from levanter.inference.utils import INVALID
 
 
 def test_pack_next_sequence_single_seq_boundary_at_last_token():
@@ -82,43 +81,7 @@ def test_pack_next_sequence_boundaries_between_sequences(seq_ids):
     assert int(bm.sum()) == 2
 
 
-def test_allocate_for_seq_ignores_out_of_range_slots():
-    pt = PageTable.init(max_pages=8, max_seqs=2, page_size=4, max_pages_per_seq=2)
-    sequences = SequenceTable.init(pt.max_seqs, pt.pages_per_seq, pt.page_size)
-
-    # Slot ids that are >= max_seqs should be ignored without allocating pages.
-    slot_ids = hax.named(jnp.array([5, 5], dtype=jnp.int32), axis=("position",))
-    pos_ids = hax.named(jnp.array([0, 1], dtype=jnp.int32), axis=("position",))
-
-    new_sequences, new_pt, batch = sequences.allocate_for_seq(pt, slot_ids, pos_ids)
-
-    assert jnp.array_equal(new_sequences.seq_lens.array, jnp.zeros((pt.max_seqs,), dtype=jnp.int32))
-    assert jnp.all(new_sequences.page_indices.array == INVALID)
-    assert jnp.all(new_sequences.kv_pages.array == INVALID)
-    assert jnp.all(new_pt.page_ref_counts.array == 0)
-    assert int(batch.num_seqs) == 0
-    assert jnp.all(batch.new_token_dests.array == INVALID)
-
-
-def test_allocate_for_seq_ignores_invalid_padding_tokens():
-    pt = PageTable.init(max_pages=8, max_seqs=2, page_size=4, max_pages_per_seq=2)
-    sequences = SequenceTable.init(pt.max_seqs, pt.pages_per_seq, pt.page_size)
-    sequences, seq0 = sequences.reserve_slot(0)
-    assert int(seq0) == 0
-
-    slot_ids = hax.named(jnp.array([0, INVALID], dtype=jnp.int32), axis=("position",))
-    pos_ids = hax.named(jnp.array([0, INVALID], dtype=jnp.int32), axis=("position",))
-
-    new_sequences, new_pt, batch = sequences.allocate_for_seq(pt, slot_ids, pos_ids)
-
-    seq_lens_arr = new_sequences.seq_lens.array
-    assert int(seq_lens_arr[0]) == 1
-    assert jnp.all(seq_lens_arr[1:] == 0)
-    assert jnp.all(new_sequences.page_indices.array[1:] == INVALID)
-    # Only one sequence should be considered in the batch info
-    assert int(batch.num_seqs) == 1
-    # The real token should map to a concrete KV destination
-    assert int(batch.new_token_dests.array[0]) == 0
-    # Padding token should not produce a KV destination
-    assert int(batch.new_token_dests.array[1]) == INVALID
-    assert int(new_pt.page_ref_counts.array.sum()) == 1
+# NOTE: Tests for device-side allocation removed - allocation now happens on CPU
+# via set_page_assignments() before calling allocate_for_seq()
+# See test_checkpoint3_device_integration.py and test_checkpoint4_allocation_bypass.py
+# for tests of the new CPU-side allocation flow

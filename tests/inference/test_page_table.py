@@ -50,27 +50,6 @@ def test_page_batch_info_shapes():
     assert pb.cu_q_lens.array.shape[0] == pb.num_seqs + 1
 
 
-def test_sequence_table_allocate_and_free_pages():
-    pt = _make_table()
-    sequences = SequenceTable.init(pt.max_seqs, pt.pages_per_seq, pt.page_size)
-
-    # reserve two slots
-    sequences, seq0_arr = sequences.reserve_slot(0)
-    sequences, seq1_arr = sequences.reserve_slot(1)
-    seq0 = int(seq0_arr)
-    seq1 = int(seq1_arr)
-    assert seq0 == 0 and seq1 == 1
-
-    slot_ids = hax.named(jnp.array([seq0, seq1], dtype=jnp.int32), axis=("position",))
-    pos_ids = hax.named(jnp.array([0, 0], dtype=jnp.int32), axis=("position",))
-    sequences, pt, batch = sequences.allocate_for_seq(pt, slot_ids, pos_ids)
-
-    assert batch.num_seqs == 2
-    assert sequences.seq_lens["seq", seq0].scalar() == 1
-
-    # ensure pages are allocated/ref counts updated
-    assert (pt.page_ref_counts.array > 0).sum() == 2
-
-    sequences, pt = sequences.free_pages(pt, seq0)
-    assert sequences.seq_lens["seq", seq0].scalar() == 0
-    assert not bool(sequences.used_mask["seq", seq0].scalar())
+# NOTE: test_sequence_table_allocate_and_free_pages removed - device-side allocation removed
+# Allocation now happens on CPU via PageAllocatorCPU + set_page_assignments()
+# See test_checkpoint3_device_integration.py for CPU allocation tests
