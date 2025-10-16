@@ -80,6 +80,7 @@ def chunk_owner(chunk_index, world_size):
 - [x] Write owner-side reader that performs a single ranged `fsspec` read, converts to NumPy, and slices out per-key buffers.
 - [ ] Reintroduce a callback-based hand-off (or equivalent) that keeps non-owners from allocating each chunk, while still integrating with `best_effort_sharding`.
 - [x] Reconstruct individual tensors from the chunk buffer, apply dtype conversions, and pass them to existing consumers with their target shardings.
+- [ ] Add per-process chunk prefetch so the next chunk begins materialising while the current tensors are extracted.
 - [ ] Add configuration toggles (feature flag, chunk size, read concurrency) and document defaults.
 - [ ] Keep/restore the legacy fine-grained loader behind a feature flag for rollback.
 - [ ] Add broader tests (multi-host mock or integration) to verify redistribution behaviour, dtype handling, and the fallback switch.

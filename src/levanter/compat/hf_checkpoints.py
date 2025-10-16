@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import abc
-import asyncio
 import contextlib
 import dataclasses
 import json
@@ -216,16 +215,16 @@ def _load_safe_tensors(path, dtype):
     return d
 
 
-async def _sharded_load_tensorstore_async(path, dtype, fs: Optional[AbstractFileSystem] = None):
+def _sharded_load_tensorstore_async(path, dtype, fs: Optional[AbstractFileSystem] = None):
     """Stream a safetensors shard from remote storage and return JAX arrays."""
 
     from levanter.compat.fsspec_safetensor import SafetensorChunkLoader
 
-    loader = await SafetensorChunkLoader.create(path, fs=fs)
+    loader = SafetensorChunkLoader.create(path, fs=fs)
     arrays: dict[str, jax.Array] = {}
 
     for chunk in loader.chunk_specs:
-        tensor_views = await loader.materialize_chunk(chunk, dtype_override=dtype)
+        tensor_views = loader.materialize_chunk(chunk, dtype_override=dtype)
         for key, np_array in tensor_views.items():
             sharding = best_effort_sharding(np_array.shape)
             # arrays[key] = jax.device_put(np_array, sharding)
@@ -588,14 +587,20 @@ class HFCheckpointConverter(Generic[LevConfig]):
         if not shard_files:
             raise FileNotFoundError(f"No HF-ish checkpoint files found in {url}")
 
+        warned = False
+
         for shard_file in shard_files:
             shard_path = os.path.join(path, shard_file)
             if not fs.exists(shard_path):
                 raise FileNotFoundError(f"Shard file {shard_path} not found")
 
             if loader is _load_safe_tensors:
-                shard_state_dict = asyncio.run(_sharded_load_tensorstore_async(shard_path, dtype, fs=fs))
+                shard_state_dict = _sharded_load_tensorstore_async(shard_path, dtype, fs=fs)
             else:
+                if not warned:
+                    warnings.warn("Torch checkpoint loading will download the entire shard")
+                    warned = True
+
                 with tempfile.NamedTemporaryFile() as tmp:
                     fs.get(shard_path, tmp.name)
                     assert loader is not None
@@ -675,16 +680,12 @@ class HFCheckpointConverter(Generic[LevConfig]):
         # AFAICT neither torch state dicts nor safetensors support this.
         state_dict = self.load_state_dict(ref, dtype)
 
-        print(list(state_dict.keys()))
-
         ignore_prefix: Optional[str] = None
         if self.ignore_prefix:
             for k in state_dict.keys():
                 if k.startswith(f"{self.ignore_prefix}."):
                     ignore_prefix = self.ignore_prefix
                     break
-
-        print("ignore_prefix", ignore_prefix)
 
         def load_from_state_dict(template, state_dict):
             lev_model = from_torch_compatible_state_dict(template, state_dict, prefix=ignore_prefix)

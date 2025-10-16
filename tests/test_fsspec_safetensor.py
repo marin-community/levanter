@@ -1,18 +1,14 @@
 # Copyright 2025 The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
-import asyncio
-
 import fsspec
 import numpy as np
-import pytest
 from safetensors.numpy import load_file, save_file
 from levanter.compat.fsspec_safetensor import SafetensorChunkLoader
 from levanter.compat.hf_checkpoints import HFCheckpointConverter
 
 
-@pytest.mark.asyncio
-async def test_chunk_loader_roundtrip(tmp_path):
+def test_chunk_loader_roundtrip(tmp_path):
     data = {
         "x": np.random.randn(4, 5).astype(np.float32),
         "y": (np.random.randn(3, 4) * 10).astype(np.float32),
@@ -23,15 +19,14 @@ async def test_chunk_loader_roundtrip(tmp_path):
 
     reference = load_file(str(path))
 
-    loader = await SafetensorChunkLoader.create(f"file://{path}", chunk_size=256)
-    tensors = await loader.read_all()
+    loader = SafetensorChunkLoader.create(f"file://{path}", chunk_size=256)
+    tensors = loader.read_all()
 
     for key, value in reference.items():
         np.testing.assert_array_equal(tensors[key], value)
 
 
-@pytest.mark.asyncio
-async def test_dtype_override(tmp_path):
+def test_dtype_override(tmp_path):
     data = {
         "floaty": np.random.randn(2, 2).astype(np.float32),
         "ints": np.arange(6, dtype=np.int32).reshape(2, 3),
@@ -39,9 +34,9 @@ async def test_dtype_override(tmp_path):
     path = tmp_path / "dtype.safetensors"
     save_file(data, path)
 
-    loader = await SafetensorChunkLoader.create(f"file://{path}", chunk_size=128)
+    loader = SafetensorChunkLoader.create(f"file://{path}", chunk_size=128)
     chunk = loader.chunk_specs[0]
-    tensors = await loader.materialize_chunk(chunk, dtype_override=np.float16)
+    tensors = loader.materialize_chunk(chunk, dtype_override=np.float16)
 
     assert tensors["floaty"].dtype == np.float16
     np.testing.assert_allclose(tensors["floaty"], data["floaty"].astype(np.float16))
@@ -49,8 +44,7 @@ async def test_dtype_override(tmp_path):
     np.testing.assert_array_equal(tensors["ints"], data["ints"])
 
 
-@pytest.mark.asyncio
-async def test_materialize_single_tensor(tmp_path):
+def test_materialize_single_tensor(tmp_path):
     data = {
         "a": np.random.randn(16, 16).astype(np.float32),
         "b": np.random.randn(8).astype(np.float32),
@@ -58,14 +52,13 @@ async def test_materialize_single_tensor(tmp_path):
     path = tmp_path / "single.safetensors"
     save_file(data, path)
 
-    loader = await SafetensorChunkLoader.create(f"file://{path}", chunk_size=128)
-    tensor = await loader.materialize_tensor("b")
+    loader = SafetensorChunkLoader.create(f"file://{path}", chunk_size=128)
+    tensor = loader.materialize_tensor("b")
 
     np.testing.assert_array_equal(tensor, data["b"])
 
 
-@pytest.mark.asyncio
-async def test_out_of_order_chunk_access(tmp_path):
+def test_out_of_order_chunk_access(tmp_path):
     # Force multiple chunks by setting a small chunk size relative to tensor payloads.
     data = {
         "first": np.random.randn(128).astype(np.float32),
@@ -74,17 +67,16 @@ async def test_out_of_order_chunk_access(tmp_path):
     path = tmp_path / "out_of_order.safetensors"
     save_file(data, path)
 
-    loader = await SafetensorChunkLoader.create(f"file://{path}", chunk_size=256)
+    loader = SafetensorChunkLoader.create(f"file://{path}", chunk_size=256)
 
-    second = await asyncio.wait_for(loader.materialize_tensor("second"), timeout=1.0)
+    second = loader.materialize_tensor("second")
     np.testing.assert_array_equal(second, data["second"])
 
-    first = await asyncio.wait_for(loader.materialize_tensor("first"), timeout=1.0)
+    first = loader.materialize_tensor("first")
     np.testing.assert_array_equal(first, data["first"])
 
 
-@pytest.mark.asyncio
-async def test_chunk_loader_with_custom_fs(tmp_path):
+def test_chunk_loader_with_custom_fs(tmp_path):
     data = {
         "foo": np.random.randn(4, 4).astype(np.float32),
         "bar": np.random.randn(4, 4).astype(np.float32),
@@ -93,9 +85,9 @@ async def test_chunk_loader_with_custom_fs(tmp_path):
     save_file(data, path)
 
     fs = fsspec.filesystem("file")
-    loader = await SafetensorChunkLoader.create(str(path), chunk_size=128, fs=fs)
+    loader = SafetensorChunkLoader.create(str(path), chunk_size=128, fs=fs)
 
-    tensors = await loader.read_all()
+    tensors = loader.read_all()
     np.testing.assert_array_equal(tensors["foo"], data["foo"])
     np.testing.assert_array_equal(tensors["bar"], data["bar"])
 
