@@ -6,6 +6,7 @@ import logging
 import os
 import struct
 import threading
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -16,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 from fsspec import AbstractFileSystem
 
-from levanter.utils.jax_utils import broadcast_one_to_all
+from levanter.utils.jax_utils import broadcast_one_to_all, sync_global_devices
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ _SAFETENSOR_DTYPE_MAP: Dict[str, np.dtype] = {
 }
 
 
-DEFAUlT_CHUNK_SIZE = 128 * 1024**2
+DEFAUlT_CHUNK_SIZE = 1 * 1024**3
 
 
 @lru_cache(maxsize=1)
@@ -222,12 +223,13 @@ class SafetensorChunkLoader:
         chunk_limit = chunk_size or _default_chunk_size_bytes()
         tensors = _read_metadata(fs, path)
         chunks = tuple(_build_chunks(tensors.values(), chunk_limit))
+        maximum_chunk_size = max(chunk.size for chunk in chunks) if chunks else 0
         logger.info(
-            "Prepared safetensor chunks for %s: %d tensors across %d chunks (max chunk %.2f MiB)",
+            "Prepared safetensor chunks for %s: %d tensors across %d chunks (maximum %.2f MiB)",
             path,
             len(tensors),
             len(chunks),
-            chunk_limit / 1024**2,
+            maximum_chunk_size / 1024**2,
         )
         return cls(fs, path, chunks, tensors)
 
@@ -327,6 +329,8 @@ class SafetensorChunkLoader:
 
     def _get_chunk_buffer(self, chunk: _ChunkSpec) -> np.ndarray:
         self._ensure_owned_chunks_prefetched()
+        sync_global_devices(repr(chunk))
+        time_in = time.time()
         is_owner = self._process_index == chunk.owner(self._process_count)
         existing = self._chunk_buffers.get(chunk.chunk_id)
         if existing is not None and (not is_owner or chunk.chunk_id in self._shared_chunks):
@@ -367,14 +371,25 @@ class SafetensorChunkLoader:
                 chunk.chunk_id,
                 chunk.owner(self._process_count),
             )
+            broadcast_in = time.time()
             local_array = broadcast_one_to_all(local_array, is_source=is_owner)
+            broadcast_out = time.time()
+            logger.info(
+                "Process %d broadcasted chunk %d in %.2f seconds",
+                self._process_index,
+                chunk.chunk_id,
+                broadcast_out - broadcast_in,
+            )
 
         if existing is None:
+            time_end = time.time()
             logger.info(
-                "Process %d cached chunk %d (%.2f MiB)",
+                "Process %d cached chunk %d (%.2f MiB) in %.2f seconds (%.2f MiB/s)",
                 self._process_index,
                 chunk.chunk_id,
                 chunk.size / 1024**2,
+                time_end - time_in,
+                (chunk.size / 1024**2) / (time_end - time_in),
             )
         self._chunk_buffers[chunk.chunk_id] = local_array
         self._shared_chunks.add(chunk.chunk_id)
@@ -391,6 +406,7 @@ class SafetensorChunkLoader:
             if self._prefetch_complete:
                 return
 
+            prefetch_start = time.time()
             prefetched_count = 0
             prefetched_bytes = 0
             for chunk in self._owned_chunks:
@@ -401,11 +417,15 @@ class SafetensorChunkLoader:
                 prefetched_count += 1
                 prefetched_bytes += chunk.size
 
+            prefetch_end = time.time()
+
             if prefetched_count > 0:
                 logger.info(
-                    "Process %d prefetched %d owned chunk(s) totalling %.2f MiB",
+                    "Process %d prefetched %d owned chunk(s) totalling %.2f MiB in %.2f seconds (%.2f MiB/s)",
                     self._process_index,
                     prefetched_count,
                     prefetched_bytes / 1024**2,
+                    prefetch_end - prefetch_start,
+                    (prefetched_bytes / 1024**2) / (prefetch_end - prefetch_start),
                 )
             self._prefetch_complete = True

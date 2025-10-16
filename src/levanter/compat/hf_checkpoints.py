@@ -552,7 +552,8 @@ class HFCheckpointConverter(Generic[LevConfig]):
             with open(index_path, "r", encoding="utf-8") as f:
                 index = json.load(f)
 
-            shard_files = list(set(index["weight_map"].values()))
+            # Keep shard order deterministic across hosts.
+            shard_files = list(dict.fromkeys(index["weight_map"].values()))
             final_state_dict = {}
 
             # right now we do safe tensors thing
@@ -623,7 +624,7 @@ class HFCheckpointConverter(Generic[LevConfig]):
                 with fs.open(index_path, "r") as f:
                     index = json.load(f)
 
-                shard_files = list(set(index["weight_map"].values()))
+                shard_files = list(dict.fromkeys(index["weight_map"].values()))
 
                 if "safetensors" in index_file:
                     loader = _load_safe_tensors
