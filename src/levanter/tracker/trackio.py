@@ -14,8 +14,7 @@ from draccus import field
 
 from levanter.tracker import Tracker
 from levanter.tracker.histogram import Histogram
-from levanter.tracker.tracker import TrackerConfig, NoopTracker
-
+from levanter.tracker.tracker import NoopTracker, TrackerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +49,10 @@ class TrackioTracker(Tracker):
                 to_log[f"{k}/histogram"] = {
                     "counts": counts.tolist(),
                     "limits": limits.tolist(),
-                    "min": v.min,
-                    "max": v.max,
-                    "mean": v.mean,
-                    "variance": v.variance,
+                    "min": v.min.item(),
+                    "max": v.max.item(),
+                    "mean": v.mean.item(),
+                    "variance": v.variance.item(),
                 }
             else:
                 to_log[k] = _convert_value_to_loggable_rec(v)
@@ -92,8 +91,14 @@ def _convert_value_to_loggable_rec(value: Any):
     elif isinstance(value, Histogram):
         counts, limits = value.to_numpy_histogram()
         return {"counts": counts.tolist(), "limits": limits.tolist()}
-    else:
+    elif isinstance(value, np.ndarray):
+        return value.tolist()
+    elif isinstance(value, np.generic):
+        return value.item()
+    elif isinstance(value, (int, float)):
         return value
+    else:
+        return repr(value)
 
 
 @TrackerConfig.register_subclass("trackio")
