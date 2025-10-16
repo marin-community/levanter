@@ -227,7 +227,6 @@ def _sharded_load_tensorstore_async(path, dtype, fs: Optional[AbstractFileSystem
         tensor_views = loader.materialize_chunk(chunk, dtype_override=dtype)
         for key, np_array in tensor_views.items():
             sharding = best_effort_sharding(np_array.shape)
-            # arrays[key] = jax.device_put(np_array, sharding)
             arrays[key] = jax.jit(lambda x: jax.lax.with_sharding_constraint(x, sharding))(np_array)
         loader.release_chunk(chunk.chunk_id)
 
