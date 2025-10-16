@@ -141,13 +141,7 @@ def test_greedy_correctness_against_hf(test_client, hf_reference_model_and_token
         logprobs = choice.get("logprobs") or {}
 
         tokens = logprobs.get("tokens") or []
-        if tokens:
-            token_ids = hf_tokenizer.convert_tokens_to_ids(tokens)
-        else:
-            prompt_ids = hf_tokenizer(prompt, add_special_tokens=False)["input_ids"]
-            full_ids = hf_tokenizer(prompt + choice["text"], add_special_tokens=False)["input_ids"]
-            assert full_ids[: len(prompt_ids)] == prompt_ids, "Prompt tokens changed during re-tokenization"
-            token_ids = full_ids[len(prompt_ids) :]
+        token_ids = hf_tokenizer.convert_tokens_to_ids(tokens)
         levanter_generations.append((token_ids, choice["text"]))
 
     for (prompt, (levanter_ids, levanter_text)) in zip(prompts, levanter_generations, strict=True):
