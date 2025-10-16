@@ -185,6 +185,7 @@ Levanter supports custom evaluation plugins that run during training to track sp
 # my_eval_plugin.py
 import jax.numpy as jnp
 import levanter
+from levanter.callbacks import StepInfo
 from levanter.utils.hf_utils import HfTokenizer
 from levanter.eval import EvalPlugin
 
@@ -193,10 +194,10 @@ class PerplexityPlugin(EvalPlugin):
         # Plugin handles its own configuration internally
         self.sample_text = "The quick brown fox jumps over the lazy dog."
 
-    def create_callback(self, *, tokenizer: HfTokenizer, **kwargs):
+    def create_callback(self, *, tokenizer: HfTokenizer, **kwargs) -> Callable[[StepInfo], None]:
         tokens = tokenizer(self.sample_text)["input_ids"]
 
-        def callback(step_info):
+        def callback(step_info: StepInfo) -> None:
             # Simple perplexity calculation on sample text
             eval_model = step_info.eval_model
             logits = eval_model(jnp.array(tokens[:-1]))
