@@ -92,7 +92,7 @@ def test_client(baby_llama_config, loaded_model):
 @pytest.fixture(scope="module")
 def hf_reference_model_and_tokenizer():
     """Load the HF reference model used for correctness comparisons."""
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
 
     model_name = "timinar/baby-llama-58m"
@@ -144,7 +144,7 @@ def test_greedy_correctness_against_hf(test_client, hf_reference_model_and_token
         token_ids = hf_tokenizer.convert_tokens_to_ids(tokens)
         levanter_generations.append((token_ids, choice["text"]))
 
-    for (prompt, (levanter_ids, levanter_text)) in zip(prompts, levanter_generations, strict=True):
+    for prompt, (levanter_ids, levanter_text) in zip(prompts, levanter_generations, strict=True):
         inputs = hf_tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(hf_model.device) for k, v in inputs.items()}
         input_length = inputs["input_ids"].shape[-1]
