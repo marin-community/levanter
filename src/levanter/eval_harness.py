@@ -299,7 +299,11 @@ def get_segment_ids_from_batch(batch: LmExample, max_segments_per_ex: int) -> li
     """
     Extract unique segment IDs from a batch (on host).
     """
-    segment_ids = jax.device_get(batch.attn_mask.segment_ids[0].array)
+    if batch.attn_mask.segment_ids is None:
+        segment_ids = []
+    else:
+        segment_ids = jax.device_get(batch.attn_mask.segment_ids[0].array)
+
     unique_segs = np.unique(segment_ids).tolist()
 
     if len(unique_segs) > max_segments_per_ex + 1:
