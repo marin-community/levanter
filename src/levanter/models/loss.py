@@ -21,6 +21,7 @@ def maybe_fused_next_token_loss(
     pred_lm_head: NamedArray,
     true_ids: NamedArray,
     loss_mask: Optional[NamedArray] = None,
+    *,
     reduction: Optional[hax.ReductionFunction] = hax.mean,
     reduction_axis: Optional[hax.AxisSelection] = None,
     logsumexp_weight: Optional[float] = None,
@@ -72,6 +73,8 @@ def maybe_fused_next_token_loss(
         loss_mask = loss_mask * not_last_loss_mask
     else:
         loss_mask = not_last_loss_mask
+
+    loss_mask = loss_mask.astype(jnp.bool_)
 
     # Compute the loss with optional block-wise processing
     return fused_cross_entropy_loss_and_logsumexp_penalty(
@@ -127,6 +130,8 @@ def next_token_loss(
         loss_mask = loss_mask * not_last_loss_mask
     else:
         loss_mask = not_last_loss_mask
+
+    loss_mask = loss_mask.astype(jnp.bool_)
 
     return cross_entropy_and_logsumexp_penalty(
         Vocab=Vocab,
