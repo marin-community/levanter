@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import abc
+import asyncio
 import contextlib
 import dataclasses
 import json
@@ -218,19 +219,16 @@ def _load_safe_tensors(path, dtype):
 def _sharded_load_tensorstore_async(path, dtype, fs: Optional[AbstractFileSystem] = None):
     """Stream a safetensors shard from remote storage and return JAX arrays."""
 
-    from levanter.compat.fsspec_safetensor import SafetensorChunkLoader
+    from levanter.compat.fsspec_safetensor import read_safetensors_fsspec
 
-    loader = SafetensorChunkLoader.create(path, fs=fs)
-    arrays: dict[str, jax.Array] = {}
-
-    for chunk in loader.chunk_specs:
-        tensor_views = loader.materialize_chunk(chunk, dtype_override=dtype)
-        for key, np_array in tensor_views.items():
-            sharding = best_effort_sharding(np_array.shape)
-            arrays[key] = jax.jit(lambda x: jax.lax.with_sharding_constraint(x, sharding))(np_array)
-        loader.release_chunk(chunk.chunk_id)
-
-    return arrays
+    return asyncio.run(
+        read_safetensors_fsspec(
+            path,
+            dtype_override=dtype,
+            fs=fs,
+            sharding_fn=best_effort_sharding,
+        )
+    )
 
 
 # NB: for large models this will be jitted several times (once for each unique subset of keys at least)
