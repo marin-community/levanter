@@ -295,20 +295,32 @@ class _Message:
     LOGLIKELIHOOD = 1
 
 
-def _get_segments_this_batch(batch, max_segments_per_ex):
-    unique_segs = np.unique(batch.attn_mask.segment_ids[0].array).tolist()
-    # + 1 because we use -1 as a padding value for segments and allow that
+def get_segment_ids_from_batch(batch: LmExample, max_segments_per_ex: int) -> list[int]:
+    """
+    Extract unique segment IDs from a batch (on host).
+    """
+    if batch.attn_mask.segment_ids is None:
+        segment_ids = []
+    else:
+        segment_ids = jax.device_get(batch.attn_mask.segment_ids[0].array)
+
+    unique_segs = np.unique(segment_ids).tolist()
+
     if len(unique_segs) > max_segments_per_ex + 1:
         raise ValueError(f"Too many segments in batch: {len(unique_segs)}")
+
     if -1 in unique_segs:
         unique_segs.remove(-1)
 
     return unique_segs
 
 
-def _get_padding_count(batch, pad_token_id):
-    # returns the total amount of padding in the batch
-    padding_count = np.sum(batch.tokens.array == pad_token_id)
+def get_padding_count_from_batch(batch: LmExample, pad_token_id: int) -> tuple[int, int]:
+    """
+    Extract padding statistics from a batch (on host).
+    """
+    tokens = jax.device_get(batch.tokens.array)
+    padding_count = int(np.sum(tokens == pad_token_id))
     total_tokens = batch.tokens.size
     return padding_count, total_tokens
 
@@ -502,20 +514,20 @@ class LevanterHarnessLM(TemplateLM):
             # Handle profiler start/stop based on step
             self._handle_profiler_step()
 
-            segments_this_batch = _get_segments_this_batch(
+            segments_this_batch = get_segment_ids_from_batch(
                 batch, self.leader.max_packed_segments * self.EvalBatch.size
             )
 
-            padding_count, batch_tokens = _get_padding_count(batch, self.tokenizer.pad_token_id)
+            padding_count, batch_tokens = get_padding_count_from_batch(batch, self.tokenizer.pad_token_id)
 
             out_ids, out_lls, out_correct = self.leader.dispatch_loglikelihood(batch)
 
             # Increment step after processing batch
             self._current_step += 1
 
-            out_ids = np.array(out_ids.array)
-            out_lls = np.array(out_lls.array)
-            out_correct = np.array(out_correct.array)
+            out_ids = jax.device_get(out_ids.array)
+            out_lls = jax.device_get(out_lls.array)
+            out_correct = jax.device_get(out_correct.array)
             # -1's are going to be where we had too few sequences to fill a batch
             valid_indices = out_ids != -1
 
@@ -903,6 +915,7 @@ class LmEvalHarnessConfig:
     bootstrap_iters: int = 0
     apply_chat_template: bool = False
     fewshot_as_multiturn: bool = False
+    confirm_run_unsafe_code: bool = True
     sample_logging: SampleLoggingConfig = dataclasses.field(default_factory=SampleLoggingConfig)
     generation_kwargs: dict = dataclasses.field(
         default_factory=lambda: {"max_gen_toks": 256, "temperature": 0.0, "n": 1, "seed": None}
@@ -1162,6 +1175,7 @@ def _actually_run_eval_harness(
                 bootstrap_iters=config.bootstrap_iters,
                 apply_chat_template=config.apply_chat_template,
                 fewshot_as_multiturn=config.fewshot_as_multiturn,
+                confirm_run_unsafe_code=config.confirm_run_unsafe_code,
             )
 
         worker.stop()
@@ -1308,12 +1322,12 @@ def run_eval_harness_main(config: EvalHarnessMainConfig):
             # log the results as json
             logger.info("uploading artifacts...")
             with open("lm_eval_harness_results.json", "w") as f:
-                json.dump(outputs, f, indent=2)
+                json.dump(outputs, f, indent=2, default=_json_default)
                 f.flush()
                 f_path = f.name
                 levanter.tracker.current_tracker().log_artifact(f_path, name="lm_eval_harness_results")
 
-            print(json.dumps(outputs, indent=2), flush=True)
+            print(json.dumps(outputs, indent=2, default=_json_default), flush=True)
 
         return outputs
 
@@ -1340,7 +1354,30 @@ def log_report_to_tracker(prefix: str, report: dict, tracker: Optional[levanter.
 
                 to_log[f"{prefix}/averages/{metric_name}"] = metric_value
 
-    tracker.log(to_log, step=None)
+    if to_log:
+        tracker.log(to_log, step=None)
+
+
+def _json_default(value):
+    """
+    Provide a best-effort JSON serialization for objects returned by the eval harness.
+    """
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
+
+    if isinstance(value, set):
+        return list(value)
+
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        try:
+            return value.to_dict()
+        except Exception:
+            pass
+
+    if hasattr(value, "__dict__"):
+        return vars(value)
+
+    return repr(value)
 
 
 def lm_eval_harness(config: LmEvalHarnessConfig, tokenizer, EvalBatch, axis_resources, mp: jmp.Policy | None):
@@ -1375,7 +1412,7 @@ def lm_eval_harness(config: LmEvalHarnessConfig, tokenizer, EvalBatch, axis_reso
             with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as f:
                 import json
 
-                json.dump(outputs, f)
+                json.dump(outputs, f, default=_json_default)
                 f.flush()
                 levanter.tracker.current_tracker().log_artifact(
                     f.name, name=f"lm_eval_harness_results.{step.step}.json", type="lm_eval_output"
