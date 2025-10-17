@@ -1,5 +1,5 @@
 # cf https://github.com/tatsu-lab/stanford_alpaca#fine-tuning
-model_name_or_path: meta-llama/Llama-2-7b-hf
+model_name_or_path: NousResearch/Llama-2-7b-hf
 trainer:
   mp: p=f32,c=bfloat16
   wandb:

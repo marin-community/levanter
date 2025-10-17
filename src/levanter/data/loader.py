@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import dataclasses
 import functools
@@ -10,10 +13,13 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Generic, TypeVar
 
+import haliax.partitioning
 import jax
+import numpy
 from jax import Array
 from jax import numpy as jnp
 from jax import tree_util as jtu
+from jax._src.mesh import get_concrete_mesh
 from jax.experimental import multihost_utils
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import PyTree
@@ -31,7 +37,7 @@ from levanter.models.lm_model import LmExample
 from levanter.schedule import BatchSchedule, IntSchedule
 from levanter.shapes import NamedShapeSpec, ShapeSpec, to_raw_shape
 from levanter.utils.background_iterable import BackgroundIterator
-from levanter.utils.jax_utils import local_cpu_mesh, use_cpu_device
+from levanter.utils.jax_utils import local_cpu_mesh
 from levanter.utils.thread_utils import AsyncIteratorWrapper, blocking_wait
 
 
@@ -102,7 +108,7 @@ class DataLoader(Iterable[Ex]):
         self.data_store = data
 
         if mesh is None:
-            mesh = hax.partitioning._get_mesh()
+            mesh = get_concrete_mesh()
         self.mesh = mesh
 
         if isinstance(batch_size, hax.Axis):
@@ -114,7 +120,7 @@ class DataLoader(Iterable[Ex]):
             self.scheduler = BatchSchedule(batch_size)
 
         self._batch_sharding = hax.partitioning.sharding_for_axis(self.batch_axis_name, axis_resources, mesh)
-        with mesh:
+        with haliax.partitioning.set_mesh(mesh):
             self._data_axis_size = hax.partitioning.physical_axis_size(self.batch_axis_name, axis_resources)
 
         assert self._data_axis_size is not None, "Data axis size must be known. Make sure you're passing in a mesh"
@@ -260,45 +266,51 @@ class DataLoaderIterator(Iterator[Ex]):
             self._batches.stop()
 
     async def _produce_batches(self):
-        batch_number = self._start_from_batch or 0
-        done = False
-        while not done:
-            # we try to prefetch multiple batches at a time
-            target_next_batch_number = batch_number + self.dl.prefetch_size
-            max_achievable_batch_number, final_batch_size = await self._dataset_get_available_batch_number(
-                target_next_batch_number
-            )
-
-            assert batch_number <= max_achievable_batch_number <= target_next_batch_number
-
-            if max_achievable_batch_number < target_next_batch_number:
-                done = True
-
-            next_batch_numbers = list(range(batch_number, min(target_next_batch_number, max_achievable_batch_number)))
-
-            if len(next_batch_numbers) == 0:
-                logger.debug(f"Breaking because no more data available at batch number {batch_number}")
-                break
-
-            batches = [
-                _Batch(
-                    bn, self.dl.scheduler.global_data_offset_by_step(bn), self.dl.scheduler.batch_size_at_step(bn), {}
+        with local_cpu_mesh():
+            batch_number = self._start_from_batch or 0
+            done = False
+            while not done:
+                # we try to prefetch multiple batches at a time
+                target_next_batch_number = batch_number + self.dl.prefetch_size
+                max_achievable_batch_number, final_batch_size = await self._dataset_get_available_batch_number(
+                    target_next_batch_number
                 )
-                for bn in next_batch_numbers
-            ]
 
-            if final_batch_size is not None:
-                batches[-1] = dataclasses.replace(batches[-1], global_size=final_batch_size)
+                assert batch_number <= max_achievable_batch_number <= target_next_batch_number
 
-            batch_of_batches: list[_Batch[Ex]] = await self._do_retrieve_batch_of_batches(batches)
+                if max_achievable_batch_number < target_next_batch_number:
+                    done = True
 
-            for batch in batch_of_batches:
-                batch = self._batchify_local_data(batch)
-                yield batch
+                next_batch_numbers = list(
+                    range(batch_number, min(target_next_batch_number, max_achievable_batch_number))
+                )
 
-            batch_number = next_batch_numbers[-1] + 1
+                if len(next_batch_numbers) == 0:
+                    logger.debug(f"Breaking because no more data available at batch number {batch_number}")
+                    break
 
-        logger.debug(f"DataLoaderIterator finished at batch number {batch_number}")
+                batches = [
+                    _Batch(
+                        bn,
+                        self.dl.scheduler.global_data_offset_by_step(bn),
+                        self.dl.scheduler.batch_size_at_step(bn),
+                        {},
+                    )
+                    for bn in next_batch_numbers
+                ]
+
+                if final_batch_size is not None:
+                    batches[-1] = dataclasses.replace(batches[-1], global_size=final_batch_size)
+
+                batch_of_batches: list[_Batch[Ex]] = await self._do_retrieve_batch_of_batches(batches)
+
+                for batch in batch_of_batches:
+                    batch = self._batchify_local_data(batch)
+                    yield batch
+
+                batch_number = next_batch_numbers[-1] + 1
+
+            logger.debug(f"DataLoaderIterator finished at batch number {batch_number}")
 
     async def _dataset_get_available_batch_number(self, target_max_batch_number: int) -> tuple[int, int | None]:
         """
@@ -515,7 +527,7 @@ def stack_batches(example_iterator, Pos, Batch):
         A batch of examples.
     """
     # add timer here as well and profile
-    with use_cpu_device():
+    with local_cpu_mesh():
         for batch in batched(example_iterator, Batch.size):
             if len(batch) < Batch.size:
                 dummy_instance = _make_dummy_instance(batch, Pos)
@@ -599,7 +611,7 @@ def check_sharded_consistency(tree: PyTree, check_disjoint_indices_are_different
             replica_0_array = replica_0_arrays[_to_tuple(shard.index)]
             assert shard.data is not None
 
-            if not jnp.array_equal(shard.data, replica_0_array, equal_nan=True):
+            if not numpy.array_equal(shard.data, replica_0_array, equal_nan=True):
                 raise ValueError("Shard data does not match replica 0 data", shard, replica_0_array)
 
             if check_disjoint_indices_are_different:

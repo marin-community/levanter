@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import atexit
 import copy
 import functools
@@ -9,26 +12,40 @@ import warnings
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple, TypeVar, Union
+from typing import (
+    Any,
+    Callable,
+    ContextManager,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import equinox as eqx
 import fsspec
+import haliax as hax
+import haliax.tree_util
 import jax
 import jax.numpy as jnp
 import jmp
 import numpy as np
 from draccus import field
-from jax.experimental import multihost_utils
-from jax.sharding import Mesh
-from jaxtyping import PRNGKeyArray, PyTree
-from optax import GradientTransformation
-
-import haliax as hax
-import haliax.tree_util
 from haliax import Axis
 from haliax.partitioning import ResourceAxis, ResourceMapping, named_jit
 from haliax.quantization import QuantizationConfig
 from haliax.types import Scalar
+from jax.experimental import multihost_utils
+from jax.sharding import Mesh
+from jax.tree_util import register_dataclass
+from jaxtyping import PRNGKeyArray, PyTree
+from optax import GradientTransformation
 
 import levanter.callbacks._metrics
 import levanter.checkpoint
@@ -36,7 +53,7 @@ import levanter.tracker
 import levanter.tracker.wandb
 import levanter.utils.logging
 from levanter import tracker
-from levanter.callbacks import Callback, CBInfo, JitCallback, LambdaCallback, M, S, StepInfo
+from levanter.callbacks import Callback, CBInfo, JitCallback, LambdaCallback, StepInfo
 from levanter.callbacks.watch import WatchConfig
 from levanter.checkpoint import CheckpointerConfig, is_checkpoint_path, load_checkpoint_or_initialize
 from levanter.config import JsonAtom
@@ -44,6 +61,7 @@ from levanter.data import AsyncDataset, DataLoader
 from levanter.data.loader import _round_to_nearest_multiple
 from levanter.distributed import DistributedConfig, RayConfig
 from levanter.grad_accum import microbatched
+from levanter.metrics import Metric, auto_metric_from_name, unwrap_metrics
 from levanter.optim.model_averaging import ModelAveragingConfig
 from levanter.schedule import BatchSchedule, IntSchedule, ScheduleStep, value_at_step
 from levanter.tracker import TrackerConfig, capture_time
@@ -53,10 +71,11 @@ from levanter.utils.jax_utils import create_fsdp_mesh, zeros_like_tree
 from levanter.utils.tree_utils import inference_mode
 from levanter.utils.types import ComputeLossFunction, FilterSpec
 
-
 logger = pylogging.getLogger(__name__)
 
 X = TypeVar("X")  # Input
+M = TypeVar("M")  # Model
+S = TypeVar("S", bound=TrainerState)  # State
 
 DEFAULT_JAX_CONFIG: Dict[str, JsonAtom] = {
     "jax_threefry_partitionable": True,
@@ -79,6 +98,19 @@ class _Hook:
 class _JitHook:
     fn: JitCallback
     every: int
+
+
+@dataclass
+class TrainStepResult(typing.Generic[S]):
+    """Result of a training step, returned from the JIT-compiled _train_step function."""
+
+    loss: Scalar
+    new_state: S
+    loss_metrics: Dict[str, jax.Array]
+    hook_infos: Optional[Sequence[CBInfo]]  # type: ignore
+
+
+register_dataclass(TrainStepResult)
 
 
 class TrainerHooks:
@@ -150,6 +182,68 @@ def _unify_model_and_model_init(model: Optional[M], model_init: Optional[Callabl
     return model_init
 
 
+class WrappedLossFunction:
+    """
+    Wrapper around a loss function that provides a uniform interface.
+
+    Handles casting & executing in the proper axis mapping.
+
+    Always returns (loss, wrapped_metrics_dict). The user loss function
+    may return `Metric` objects or floats. Floats are automatically coerced to Metrics
+    based on their name.
+    """
+
+    _raw_fn: ComputeLossFunction
+    _mp: jmp.Policy
+    _compute_axis_mapping: ResourceMapping
+
+    def __init__(
+        self,
+        raw_fn: ComputeLossFunction,
+        mp: jmp.Policy,
+        compute_axis_mapping: ResourceMapping,
+    ):
+        """
+        Args:
+            raw_fn: The underlying loss function
+            mp: Mixed precision policy for casting
+            compute_axis_mapping: Axis mapping for compute
+        """
+        self._raw_fn = raw_fn
+        self._mp = mp
+        self._compute_axis_mapping = compute_axis_mapping
+
+    def __call__(self, model, *batch, **batch_kwargs) -> Tuple[Scalar, Dict[str, Metric]]:
+        """
+        Call the loss function with model casting and axis mapping.
+        Always returns (loss, wrapped_metrics) where metrics are Metric objects.
+        """
+        with hax.axis_mapping(self._compute_axis_mapping):
+            model = self._mp.cast_to_compute(model)
+            result = self._raw_fn(model, *batch, **batch_kwargs)
+
+        if isinstance(result, tuple) and len(result) == 2:
+            loss, metrics = result
+        else:
+            # Treat scalar return as (loss, {})
+            loss = result
+            metrics = {}
+
+        if not isinstance(metrics, dict):
+            raise ValueError(f"Expected metrics to be dict, got {type(metrics)}")
+
+        # Auto-wrap plain values into Metric objects
+        wrapped_metrics = {}
+        for key, value in metrics.items():
+            if isinstance(value, Metric):
+                wrapped_metrics[key] = value
+            else:
+                # Infer type from name and wrap
+                wrapped_metrics[key] = auto_metric_from_name(key, value)
+
+        return _ensure_scalar(loss.mean()), wrapped_metrics
+
+
 class Trainer:
     config: "TrainerConfig"
     optimizer: GradientTransformation
@@ -168,12 +262,13 @@ class Trainer:
         add_default_hooks: bool = True,
     ):
         """
-
         Args:
             config:  the trainer config
             optimizer: the optimizer, e.g. `optax.adam(1e-3)` or produced by [levanter.optim.OptimizerConfig][]
-            loss_fn (Callable): the loss function. This should be a function that takes a model and some inputs and returns a
-                scalar loss. It should be jit-able and should not have any side effects.
+            loss_fn (Callable): the loss function. This should be a function that takes a model and some inputs and returns
+                either a scalar loss, or a tuple of (scalar loss, metrics_dict). The metrics dict will be automatically
+                logged to the tracker with appropriate prefixes (e.g., "train/accuracy", "eval/perplexity").
+                The function should be jit-able and should not have any side effects.
         """
         self.hooks = TrainerHooks()
         self.config = config
@@ -193,18 +288,16 @@ class Trainer:
         self._logged_jaxprs: set[str] = set()
 
     @cached_property
-    def loss_fn(self):
+    def loss_fn(self) -> WrappedLossFunction:
         """
-        Wrapped loss function that casts the model to compute precision and sets the context axis mapping to compute
+        Wrapped loss function that always returns (loss, metrics_dict).
+        Casts the model to compute precision and sets the context axis mapping to compute.
         """
-
-        @functools.wraps(self._raw_loss_function)
-        def fn(model, *batch, **batch_kwargs):
-            with hax.axis_mapping(self.compute_axis_mapping):
-                model = self.mp.cast_to_compute(model)
-                return _ensure_scalar(self._raw_loss_function(model, *batch, **batch_kwargs))
-
-        return fn
+        return WrappedLossFunction(
+            self._raw_loss_function,
+            self.mp,
+            self.compute_axis_mapping,
+        )
 
     @property
     def run_id(self) -> str:
@@ -222,20 +315,16 @@ class Trainer:
         return self.config.num_train_steps
 
     @typing.overload
-    def add_hook(self, fn: Callable[[StepInfo], Any], *, every: int = 1):
-        ...
+    def add_hook(self, fn: Callable[[StepInfo], Any], *, every: int = 1): ...
 
     @typing.overload
-    def add_hook(self, fn: JitCallback, *, every: int = 1):
-        ...
+    def add_hook(self, fn: JitCallback, *, every: int = 1): ...
 
     @typing.overload
-    def add_hook(self, fn: Callback, *, every: int = 1):
-        ...
+    def add_hook(self, fn: Callback, *, every: int = 1): ...
 
     @typing.overload
-    def add_hook(self, *, every: int = 1):
-        ...
+    def add_hook(self, *, every: int = 1): ...
 
     def add_hook(self, fn: Optional[Callable[[StepInfo], Any] | Callback | JitCallback] = None, *, every: int = 1):
         return self.hooks.add_hook(fn, every=every)
@@ -269,7 +358,7 @@ class Trainer:
 
         self._cmanagers = [
             levanter.current_tracker(self.tracker),
-            self.device_mesh,
+            haliax.partitioning.set_mesh(self.device_mesh),
             hax.axis_mapping(self.parameter_axis_mapping),
         ]
 
@@ -384,15 +473,14 @@ class Trainer:
 
         with capture_time() as step_time:
             if hooks_this_time:
-                loss, new_state, metrics, cb_states = self._maybe_save_jaxpr(
-                    "train_step", self._jit_train_step_fn, state, batch, batch_kwargs
-                )
+                result = self._maybe_save_jaxpr("train_step", self._jit_train_step_fn, state, batch, batch_kwargs)
                 # force the loss so timing numbers are accurate. laziness isn't going to help here (i think?)
             else:
-                loss, new_state, metrics, _ = self._maybe_save_jaxpr(
+                result = self._maybe_save_jaxpr(
                     "train_step_hooks", self._jit_train_step_fn_no_hook, state, batch, batch_kwargs
                 )
-            loss = loss.item()  # type: ignore
+
+            loss = result.loss.item()
 
             if self.config.crash_on_nan and jnp.isnan(loss):
                 raise RuntimeError("Loss is NaN")
@@ -400,14 +488,16 @@ class Trainer:
             if self.config.crash_on_inf and jnp.isinf(loss):
                 raise RuntimeError("Loss is Inf")
 
-            info = StepInfo(new_state, loss, step_time())
+            info = StepInfo(result.new_state, loss, step_time())
 
             with capture_time() as hook_time:
                 self.run_hooks(info)
                 if hooks_this_time:
-                    self.hooks.run_jit_hooks_outside_step(info, cb_states)
+                    self.hooks.run_jit_hooks_outside_step(info, result.hook_infos)
 
-            levanter.tracker.log({**metrics, "throughput/hook_time": hook_time()}, step=info.step)
+            # Log metrics from loss function and throughput metrics
+            metrics_to_log = {**result.loss_metrics, "throughput/hook_time": hook_time()}
+            levanter.tracker.log(metrics_to_log, step=info.step)
 
         return info
 
@@ -435,8 +525,14 @@ class Trainer:
         """
         Performs training until the number of steps is reached.
         """
+        info: Optional[StepInfo[S]] = None
         for info in self.training_steps(state, train_loader):
             pass
+
+        if info is None:
+            raise RuntimeError(
+                "No training steps were executed. The dataset may be empty or there are no steps left to run."
+            )
 
         # force hooks to run at the end
         self.run_hooks(info, force=True)
@@ -542,39 +638,57 @@ class Trainer:
             donate_args=(True,),
         )
 
-    def _train_step(
-        self, state: S, batch, batch_kwargs, _no_hooks=False
-    ) -> tuple[Scalar, S, dict[str, Any], Sequence[CBInfo] | None]:
-        with levanter.tracker.defer_tracker_for_jit() as metrics:
-            key, new_key = jax.random.split(state.training_key)
-            model = inference_mode(state.model, False)
+    def _train_step(self, state: S, batch, batch_kwargs, _no_hooks=False) -> TrainStepResult[S]:
+        key, new_key = jax.random.split(state.training_key)
+        model = inference_mode(state.model, False)
 
-            loss, grads = self._compute_gradients_microbatched(self.loss_fn, model, *batch, **batch_kwargs, key=key)
+        # Returns (loss, grads, wrapped_metrics) where wrapped_metrics is Dict[str, Metric]
+        loss, grads, wrapped_metrics = self._compute_gradients_microbatched(
+            self.loss_fn, model, *batch, **batch_kwargs, key=key
+        )
 
-            # Sophia needs to be able to access the loss function in the optimizer
-            def obj_fun(trainable_model):
-                model = eqx.combine(trainable_model, state.model)
-                with hax.axis_mapping(self.compute_axis_mapping):
-                    model = self.mp.cast_to_compute(model)
-                    return self._raw_loss_function(model, *batch, **batch_kwargs, key=key).scalar()
+        # Sophia needs to be able to access the loss function in the optimizer
+        def obj_fun(trainable_model):
+            model = eqx.combine(trainable_model, state.model)
+            with hax.axis_mapping(self.compute_axis_mapping):
+                model = self.mp.cast_to_compute(model)
+                result = self._raw_loss_function(model, *batch, **batch_kwargs, key=key)
+                # result is (loss, metrics) tuple
+                loss_for_opt, _metrics = result
+                return loss_for_opt.scalar()
 
-            new_state, updates = state.take_step(grads, obj_fun=obj_fun, loss=loss, key=new_key)
-            new_state = hax.shard(new_state, self.parameter_axis_mapping)
+        new_state, updates = state.take_step(grads, obj_fun=obj_fun, loss=loss, key=new_key)
+        new_state = hax.shard(new_state, self.parameter_axis_mapping)
 
-            if not _no_hooks:
-                with hax.axis_mapping(self.parameter_axis_mapping):
-                    jit_info: InsideJitInfo = InsideJitInfo(grads=grads, updates=updates)
-                    hook_infos = self.hooks.run_jit_hooks(state, jit_info, force=False)
+        hook_infos = None
+        if not _no_hooks:
+            with hax.axis_mapping(self.parameter_axis_mapping):
+                jit_info: InsideJitInfo = InsideJitInfo(grads=grads, updates=updates)
+                hook_infos = self.hooks.run_jit_hooks(state, jit_info, force=False)
 
-        if _no_hooks:
-            return loss, new_state, metrics, None
-        else:
-            return loss, new_state, metrics, hook_infos
+        # extract plain metrics and prefix their keys
+        plain_metrics = unwrap_metrics(wrapped_metrics)
+        train_metrics = {f"train/{k}": v for k, v in plain_metrics.items()}
 
-    def _compute_gradients_microbatched(self, loss_fn, model: M, *batch, **batch_kwargs) -> tuple[Scalar, M]:
+        result = TrainStepResult(
+            loss=loss,
+            new_state=new_state,
+            loss_metrics=train_metrics,
+            hook_infos=hook_infos,
+        )
+        return hax.shard_with_axis_mapping(result, self.parameter_axis_mapping)
+
+    def _compute_gradients_microbatched(
+        self, loss_fn: WrappedLossFunction, model: M, *batch, **batch_kwargs
+    ) -> Tuple[Scalar, M, Dict[str, Metric]]:
+        """
+        Compute gradients, optionally with microbatching.
+        Returns (loss, grads, dict[str, Metric]).
+        """
         Batch = _resolve_axis_in_tree((batch, batch_kwargs), self.config.batch_axis)
 
-        grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=False)
+        # loss_fn always returns (loss, metrics), so has_aux=True
+        grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=True)
 
         mbs = self.config.microbatch_size
         if mbs is not None:
@@ -587,7 +701,9 @@ class Trainer:
             )
 
         with hax.axis_mapping(self.compute_axis_mapping):
-            return grad_fn(model, *batch, **batch_kwargs)
+            (loss, metrics), grads = grad_fn(model, *batch, **batch_kwargs)
+
+        return loss, grads, metrics
 
     def write_artifact(self, name: str, artifact: Any, type: Optional[str] = None):
         """Saves an artifact to disk (in the run dir) and logs it to the tracker."""
@@ -787,7 +903,7 @@ class TrainerConfig:
             logger.info(f"At end of run, shutting down TPU VM in {self.shutdown_at_exit} seconds")
             atexit.register(cloud_utils.shutdown_tpu_vm, self.shutdown_at_exit)
 
-    @cached_property
+    @property
     def device_mesh(self) -> Mesh:
         return create_fsdp_mesh(
             self.replica_ici_axis_size,
@@ -796,6 +912,15 @@ class TrainerConfig:
             self.replica_dcn_axis_size,
             self.data_dcn_axis_size,
         )
+
+    def use_device_mesh(self) -> ContextManager[None]:
+        """
+        Context manager that sets the device mesh for jax, using Haliax's wrapper.
+
+        In recent jax, this is the same as `jax.set_mesh(self.device_mesh)`, but we use Haliax's wrapper for
+        compatibility with older jax versions.
+        """
+        return haliax.partitioning.set_mesh(self.device_mesh)
 
     @property
     def eval_batch_size(self):
@@ -814,7 +939,10 @@ class TrainerConfig:
     @property
     def data_ici_axis_size(self):
         """size of the FSDP axis within slices"""
-        assert self.num_devices_per_slice % (self.replica_ici_axis_size * self.model_axis_size) == 0
+        assert self.num_devices_per_slice % (self.replica_ici_axis_size * self.model_axis_size) == 0, (
+            f"num_devices_per_slice ({self.num_devices_per_slice}) must be divisible by "
+            f"replica_ici_axis_size ({self.replica_ici_axis_size}) * model_axis_size ({self.model_axis_size})"
+        )
         return self.num_devices_per_slice // (self.replica_ici_axis_size * self.model_axis_size)
 
     @property

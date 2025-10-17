@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import abc
 from dataclasses import dataclass
 from typing import Tuple
@@ -26,7 +29,7 @@ class RotaryEmbeddings(eqx.Module):
 
 class DefaultRotaryEmbeddings(RotaryEmbeddings):
     HeadDim: Axis = eqx.field(static=True)
-    config: "DefaultRotaryEmbeddingsConfig"
+    config: "DefaultRotaryEmbeddingsConfig" = eqx.field(static=True)
 
     def __call__(self, q: NamedArray, position_ids: NamedArray) -> NamedArray:
         with jax.ensure_compile_time_eval():
@@ -36,8 +39,8 @@ class DefaultRotaryEmbeddings(RotaryEmbeddings):
 
         freqs = inv_freq.broadcast_axis(position_ids.axes) * position_ids
         emb = hax.concatenate(self.HeadDim, (freqs, freqs))
-        cos = hax.cos(emb)
-        sin = hax.sin(emb)
+        cos = hax.cos(emb).astype(q.dtype)
+        sin = hax.sin(emb).astype(q.dtype)
 
         q_embed = q * cos + _rotate_half(q, self.HeadDim) * sin
         return q_embed
@@ -93,14 +96,14 @@ RotaryEmbeddingsConfig.register_subclass("linear", DefaultRotaryEmbeddingsConfig
 
 class Llama3RotaryEmbeddings(RotaryEmbeddings):
     HeadDim: Axis = eqx.field(static=True)
-    config: "Llama3RotaryEmbeddingsConfig"
+    config: "Llama3RotaryEmbeddingsConfig" = eqx.field(static=True)
 
     def __call__(self, q: NamedArray, position_ids: NamedArray) -> NamedArray:
         inv_freq_llama = self._compute_inv_freq_llama()
         freqs = position_ids * inv_freq_llama.broadcast_axis(position_ids.axes)
         emb = hax.concatenate(self.HeadDim, (freqs, freqs))
-        cos = hax.cos(emb)
-        sin = hax.sin(emb)
+        cos = hax.cos(emb).astype(q.dtype)
+        sin = hax.sin(emb).astype(q.dtype)
 
         q_embed = q * cos + _rotate_half(q, self.HeadDim) * sin
         return q_embed
@@ -178,6 +181,93 @@ class Llama3RotaryEmbeddingsConfig(RotaryEmbeddingsConfig):
 
 
 RotaryEmbeddingsConfig.register_subclass("llama3", Llama3RotaryEmbeddingsConfig)
+
+
+class YarnRotaryEmbeddings(RotaryEmbeddings):
+    HeadDim: Axis = eqx.field(static=True)
+    config: "YarnRotaryEmbeddingsConfig" = eqx.field(static=True)
+
+    def __call__(self, q: NamedArray, position_ids: NamedArray) -> NamedArray:
+        import math
+
+        with jax.ensure_compile_time_eval():
+            half_dim = self.HeadDim.size // 2
+            head_dim = self.HeadDim.size
+            HeadHalfSize = self.HeadDim.resize(self.HeadDim.size // 2)
+            inv_freq: NamedArray = 1.0 / (
+                self.config.theta ** (hax.arange(HeadHalfSize, step=2, dtype=jnp.float32) / head_dim)
+            )
+
+            # YaRN β-ramp
+            def _find_dim(n_rot: float):
+                return (half_dim * math.log(self.config.original_max_position_embeddings / (n_rot * 2 * math.pi))) / (
+                    2 * math.log(self.config.theta)
+                )
+
+            low = int(math.floor(_find_dim(self.config.beta_fast)))
+            high = int(math.ceil(_find_dim(self.config.beta_slow)))
+            low, high = max(low, 0), min(high, half_dim - 1)
+            ramp = hax.clip((hax.arange(HeadHalfSize, dtype=jnp.float32) - low) / max(high - low, 1), 0.0, 1.0)
+            inv_extrap = inv_freq
+            inv_interp = inv_freq / self.config.factor
+            inv_freq = inv_interp * ramp + inv_extrap * (1 - ramp)
+            position_ids_scaled = position_ids / self.config.factor
+
+        freqs = position_ids_scaled * inv_freq.broadcast_axis(position_ids.axes)
+        emb = hax.concatenate(self.HeadDim, (freqs, freqs))
+
+        # temperature scaling
+        if self.config.factor < 1.0:
+            temperature = 1.0
+        else:
+            temperature = math.sqrt(0.1 * self.config.mscale * math.log(self.config.factor) + 1.0)
+
+        cos = hax.cos(emb).astype(q.dtype) * temperature
+        sin = hax.sin(emb).astype(q.dtype) * temperature
+
+        q_embed = q * cos + _rotate_half(q, self.HeadDim) * sin
+        return q_embed
+
+    @staticmethod
+    def init(HeadDim, config):
+        return YarnRotaryEmbeddings(HeadDim, config)
+
+
+@dataclass(frozen=True)
+class YarnRotaryEmbeddingsConfig(RotaryEmbeddingsConfig):
+    theta: float = 10000
+    factor: float = 1.0
+    beta_fast: float = 32.0
+    beta_slow: float = 1.0
+    original_max_position_embeddings: int = 2048
+    mscale: float = 1.0
+
+    def build(self, HeadSize: Axis) -> RotaryEmbeddings:
+        return YarnRotaryEmbeddings.init(HeadSize, self)
+
+    @classmethod
+    def make_from_hf_config(cls, rope_theta: float, config: dict) -> "YarnRotaryEmbeddingsConfig":
+        return YarnRotaryEmbeddingsConfig(
+            theta=rope_theta,
+            factor=float(config.get("factor", 1.0)),
+            beta_fast=float(config.get("beta_fast", 32.0)),
+            beta_slow=float(config.get("beta_slow", 1.0)),
+            original_max_position_embeddings=int(config.get("original_max_position_embeddings", 2048)),
+            mscale=float(config.get("mscale", 1.0)),
+        )
+
+    def to_hf_config(self) -> tuple[float, dict]:
+        return self.theta, {
+            "type": "yarn",
+            "factor": self.factor,
+            "beta_fast": self.beta_fast,
+            "beta_slow": self.beta_slow,
+            "original_max_position_embeddings": self.original_max_position_embeddings,
+            "mscale": self.mscale,
+        }
+
+
+RotaryEmbeddingsConfig.register_subclass("yarn", YarnRotaryEmbeddingsConfig)
 
 
 def rotary_pos_emb(

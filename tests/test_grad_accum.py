@@ -1,12 +1,16 @@
-import equinox as eqx
-import jax
-import pytest
-from chex import assert_trees_all_close
-from jax.sharding import Mesh
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
 
+import equinox as eqx
 import haliax
 import haliax as hax
 import haliax.nn as hnn
+import jax
+import pytest
+from chex import assert_trees_all_close
+from haliax.partitioning import ResourceAxis
+from jax.sharding import NamedSharding, PartitionSpec
+from test_utils import use_test_mesh
 
 from levanter.grad_accum import microbatched
 
@@ -45,32 +49,30 @@ def test_accumulate_gradients_sharded(parallelism, accum_steps):
     mlp = Mlp.init(In, Out, Mid, key=jax.random.PRNGKey(0))
 
     def loss_fn(mlp, x):
-        return mlp(x).mean().scalar()
+        return mlp(x).mean().scalar(), {}
 
     x = hax.random.normal(jax.random.PRNGKey(0), (Batch, In))
 
-    x = jax.device_put(x, jax.sharding.PositionalSharding(jax.devices()).reshape((-1, 1)))
-
-    axis_mapping = {"Batch": "data"}
-
-    mesh = Mesh(jax.devices(), ("data",))
+    axis_mapping = {"Batch": ResourceAxis.DATA}
 
     @hax.partitioning.named_jit(axis_resources=axis_mapping)
     def jit_grad_accum(mlp, x):
-        grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=False)
+        grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=True)
         grad_fn = microbatched(grad_fn, Batch, parallelism, axis_mapping, axis_mapping)
-        acc_v, acc_g = grad_fn(
+        (acc_v, acc_aux), acc_g = grad_fn(
             mlp,
             x,
         )
         return acc_v, acc_g
 
-    with mesh:
+    with use_test_mesh() as mesh:
+        x = jax.device_put(x, NamedSharding(mesh, PartitionSpec(ResourceAxis.DATA, None)))
+
         mlp = haliax.shard(mlp, axis_mapping)
         x = haliax.shard(x, axis_mapping)
-        grad_fn = eqx.filter_value_and_grad(loss_fn)
+        grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=True)
         acc_v, acc_g = jit_grad_accum(mlp, x)
-        v, g = grad_fn(mlp, x)
+        (v, aux), g = grad_fn(mlp, x)
 
         assert_trees_all_close(acc_v, v, atol=1e-3, rtol=1e-3)
 

@@ -115,17 +115,20 @@ class TrainArgs:
 
     # ... some other stuff
     hf_save_path: Optional[str] = None  # Path to save the HuggingFace checkpoint.
-    hf_upload: bool|str = False  # Name of the HuggingFace repo to upload to (if any).
+    hf_upload: bool | str = False  # Name of the HuggingFace repo to upload to (if any).
     hf_save_steps: int = 1000  # How often to save the HuggingFace checkpoint.
 
     # should we save merged (i.e. not peft) checkpoints?
     merged_hf_save_path: Optional[str] = None  # path to save merged hf checkpoints
     merged_hf_upload: Optional[str] = None
+
+
 ...
+
 
 def train(config: TrainArgs):
     ...
-    with config.trainer.device_mesh:
+    with config.trainer.use_device_mesh():
         ...
 
         @hax.named_jit(axis_resources=parameter_axis_mapping, donate_args=(True))
@@ -148,7 +151,7 @@ using the `lora_trainable_params_filter` function, which takes a model and retur
 ```python
 def train(config: TrainArgs):
     ...
-    with config.trainer.device_mesh:
+    with config.trainer.use_device_mesh():
         ...
 
         lora_param_filter = lora_trainable_params_filter(model)
@@ -197,7 +200,7 @@ Here's the complete configuration file for training the adapter. We're using the
 [Fine-Tuning tutorial](./Fine-Tuning.md), but we're using a different dataset and a different training script.
 
 ```yaml
-model_name_or_path: "meta-llama/Llama-2-7b-hf"
+model_name_or_path: "NousResearch/Llama-2-7b-hf"
 data: gsm8k
 trainer:
   mp: p=f32,c=bfloat16
@@ -372,11 +375,10 @@ helm-run --run-specs gsm:model=$MYMODEL --enable-huggingface-models $MYMODEL --s
 ```
 
 If you want to also evaluate the baseline Llama 2 model, you can do that by replacing `$MYMODEL` with
-`meta-llama/Llama-2-7b-hf`:
+`NousResearch/Llama-2-7b-hf`:
 
 ```bash
-export HUGGING_FACE_HUB_TOKEN=${YOUR TOKEN HERE}
-export MYMODEL="meta-llama/Llama-2-7b-hf"
+export MYMODEL="NousResearch/Llama-2-7b-hf"
 helm-run --run-specs gsm:model=$MYMODEL --enable-huggingface-models $MYMODEL --suite v1 --max-eval-instances 1000
 ```
 

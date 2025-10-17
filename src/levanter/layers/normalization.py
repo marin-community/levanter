@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import abc
 from dataclasses import dataclass
 from typing import Optional
@@ -9,7 +12,7 @@ from haliax.nn import LayerNorm, RmsNorm
 from haliax.nn.normalization import LayerNormBase
 
 
-@dataclass
+@dataclass(frozen=True)
 class LayerNormConfigBase(draccus.ChoiceRegistry, abc.ABC):
     """Base class for layer normalization configurations."""
 
@@ -28,7 +31,7 @@ class LayerNormConfigBase(draccus.ChoiceRegistry, abc.ABC):
 
 
 @LayerNormConfigBase.register_subclass("rms")
-@dataclass
+@dataclass(frozen=True)
 class RmsNormConfig(LayerNormConfigBase):
     """Configuration for RMS normalization."""
 
@@ -37,7 +40,7 @@ class RmsNormConfig(LayerNormConfigBase):
 
 
 @LayerNormConfigBase.register_subclass("layer")
-@dataclass
+@dataclass(frozen=True)
 class LayerNormConfig(LayerNormConfigBase):
     """Configuration for standard layer normalization."""
 

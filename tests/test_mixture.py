@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import jax
 import numpy as np
 import pytest
@@ -31,7 +34,7 @@ def key():
 
 @pytest.mark.asyncio
 async def test_mixture_dataset_getitem():
-    mixture_ds = MixtureDataset(datasets(), weights(), 10, key=key, randomize_blocks=False)
+    mixture_ds = MixtureDataset(datasets(), weights(), 10, key=key(), randomize_blocks=False)
 
     item = await mixture_ds.getitem_async(0)
     assert item in [1, 10, 100], f"Unexpected item: {item}"

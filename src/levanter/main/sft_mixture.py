@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import dataclasses
 import logging
@@ -71,8 +74,8 @@ class SFTMixtureConfig:
     hf_save_steps: int = 0
 
     max_seq_len: int = 2048
-    model_name_or_path: str = "meta-llama/Llama-2-7b-hf"
-    tokenizer: str = "meta-llama/Llama-2-7b-hf"
+    model_name_or_path: str = "marin-community/marin-8b-base"
+    tokenizer: str = "marin-community/marin-8b-base"
 
     # Add dataset type and chat-specific fields
     dataset_type: DatasetType = DatasetType.CHAT_JSONL

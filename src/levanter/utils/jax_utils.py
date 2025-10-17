@@ -1,16 +1,24 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import functools
 import json
 import warnings
+import zlib
 from dataclasses import fields
 from typing import Any, Callable, Optional, TypeVar
 
 import equinox as eqx
+import haliax.partitioning
+import humanfriendly
 import jax
 import numpy as np
 from jax import numpy as jnp
+from jax._src.mesh import get_concrete_mesh
 from jax.experimental import mesh_utils
-from jax.sharding import Mesh, NamedSharding, PartitionSpec, PositionalSharding
+from jax.experimental.multihost_utils import host_local_array_to_global_array
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jaxtyping import PRNGKeyArray, PyTree
 
 import haliax as hax
@@ -48,10 +56,8 @@ def use_cpu_device():
 def local_cpu_mesh():
     """Temporarily sets the default device to CPU and creates a mesh with a single CPU device"""
     cpu = jax.local_devices(backend="cpu")[0]
-    mesh = jax.sharding.Mesh(
-        np.array([cpu]).reshape(1, 1, 1), (ResourceAxis.REPLICA, ResourceAxis.DATA, ResourceAxis.MODEL)
-    )
-    with use_cpu_device(), mesh:
+    mesh = jax.make_mesh((1, 1, 1), (ResourceAxis.REPLICA, ResourceAxis.DATA, ResourceAxis.MODEL), devices=[cpu])
+    with use_cpu_device(), haliax.partitioning.set_mesh(mesh):
         yield mesh
 
 
@@ -136,7 +142,7 @@ def barrier_sync(timeout: float = 200):
 def _isnamedtupleinstance(x):
     t = type(x)
     b = t.__bases__
-    if len(b) != 1 or b[0] != tuple:
+    if len(b) != 1 or b[0] is not tuple:
         return False
     f = getattr(t, "_fields", None)
     if not isinstance(f, tuple):
@@ -280,8 +286,9 @@ def best_effort_sharding(shape, *, devices=None, mesh=None):
         devices = jax.devices()
 
     if mesh is None:
-        mesh = hax.partitioning._get_mesh()
-        if mesh.devices.shape == ():
+        # TODO: we shouldn't be getting a concrete mesh here. Need to fix/remove this whole function
+        mesh = get_concrete_mesh()
+        if mesh is not None and mesh.shape == ():
             mesh = None
 
     if mesh is None:
@@ -296,13 +303,15 @@ def best_effort_sharding(shape, *, devices=None, mesh=None):
             gcd = np.gcd(shape_i, num_devices)
             num_devices //= gcd
             device_shape = (num_devices, gcd) + device_shape[1:]
-        sharding = PositionalSharding(devices).reshape(list(device_shape))
-        sharding = sharding.replicate(axis=0, keepdims=False)
+
+        device_mesh = np.array(devices).reshape(list(device_shape))
+        axis_names = [f"d{i}" for i in range(len(shape))]
+        mesh = Mesh(device_mesh, ["b"] + axis_names)
+        sharding = NamedSharding(mesh, PartitionSpec(*axis_names))
         return sharding
     else:
         # get the existing mesh and find the FSDP axis
-        fsdp_axis = mesh.axis_names.index(hax.partitioning.ResourceAxis.DATA)
-        num_devices = mesh.devices.shape[fsdp_axis]
+        num_devices = mesh.shape[hax.partitioning.ResourceAxis.DATA]
 
         for i in range(len(shape) - 1, -1, -1):
             shape_i = shape[i]
@@ -342,26 +351,88 @@ def create_fsdp_mesh(
     return Mesh(devices, (ResourceAxis.REPLICA, ResourceAxis.DATA, ResourceAxis.MODEL))
 
 
-def estimated_free_device_memory(device) -> Optional[float]:
+def estimated_free_device_memory(device=None) -> Optional[float]:
     """
-    Returns free memory in GB. If the device doesn't support memory stats, returns None.
+    Returns free memory in GiB. If the device doesn't support memory stats, returns None. If no device is provided,
+    sums across all devices.
     Args:
-        device:
+        device: if None, sums all devices
 
     Returns:
 
     """
-    stats = device.memory_stats()
-    if stats is None:
-        return None
+    if device is not None:
+        devices = [device]
     else:
-        limit = stats.get("bytes_limit", None)
-        if limit is None:
+        devices = jax.devices()
+
+    total = 0.0
+    for device in devices:
+        stats = device.memory_stats()
+        if stats is None:
             return None
+        else:
+            limit = stats.get("bytes_limit", None)
+            if limit is None:
+                return None
 
-        in_use = stats.get("bytes_in_use", 0)
+            in_use = stats.get("bytes_in_use", 0)
 
-        return (limit - in_use) // (1024.0**3)
+            total += (limit - in_use) // (1024.0**3)
+
+    return total
+
+
+def memory_info_string() -> str:
+    """
+    Returns a string with memory usage information for all devices.
+    """
+    lines = []
+    total_free = 0
+    total_in_use = 0
+    for device in jax.devices():
+        info = device.memory_stats()
+        print(info)
+        limit_mem = info["bytes_limit"] if info is not None else None
+        # bytes_in_use
+        in_use_mem = info["bytes_in_use"] if info is not None else 0
+
+        if in_use_mem is not None:
+            free_mem = limit_mem - in_use_mem if limit_mem is not None else None
+            total_in_use += in_use_mem
+        else:
+            free_mem = None
+
+        if free_mem is not None:
+            total_free += free_mem
+
+        if free_mem is None:
+            free_str = "unknown"
+        else:
+            free_str = humanfriendly.format_size(free_mem)
+
+        if in_use_mem is None:
+            in_use_str = "unknown"
+        else:
+            in_use_str = humanfriendly.format_size(in_use_mem)
+
+        lines.append(
+            f"Device {device.id} ({device.platform}, {device.device_kind}): Free {free_str}, In use {in_use_str}"
+        )
+
+    if total_free == 0:
+        total_free_str = "unknown"
+    else:
+        total_free_str = humanfriendly.format_size(total_free)
+
+    if total_in_use == 0:
+        total_in_use_str = "unknown"
+    else:
+        total_in_use_str = humanfriendly.format_size(total_in_use)
+
+    lines.append(f"Total: Free {total_free_str}, In use {total_in_use_str}")
+
+    return "\n".join(lines)
 
 
 def zeros_like_tree(tree: T, axis_mapping: Optional[ResourceMapping] = None, dtype: Optional[jnp.dtype] = None) -> T:
@@ -461,3 +532,145 @@ def tree_broadcast_to(prefix: PyTree[L], t: T, *, is_leaf: Optional[Callable[[An
         t,
         is_leaf=is_leaf,
     )
+
+
+# Non-busted version of broadcast_one_to_all from jax.multihost_utils. (The issue is that  if you use a non-contiguous
+# mesh, their utility blows up because it makes a contiguous mesh.)
+
+
+def _psum(xs: Any) -> Any:
+    return jax.tree.map(lambda x: jnp.sum(x, dtype=x.dtype, axis=0), xs)
+
+
+def broadcast_one_to_all(in_tree: Any, is_source: bool | None = None) -> Any:
+    """Broadcast data from a source host (host 0 by default) to all other hosts.
+
+    Args:
+      in_tree: pytree of arrays - each array *must* have the same shape across the
+        hosts.
+      is_source: optional bool denoting whether the caller is the source. Only
+        'source host' will contribute the data for the broadcast. If None, then
+        host 0 is used.
+
+    Returns:
+      A pytree matching in_tree where the leaves now all contain the data from the
+      first host.
+    """
+    if jax.process_count() == 1:
+        return jax.tree.map(np.asarray, in_tree)
+
+    if is_source is None:
+        is_source = jax.process_index() == 0
+
+    devices: np.ndarray = np.array(jax.devices()).reshape(jax.process_count(), jax.local_device_count())
+    global_mesh = jax.sharding.Mesh(devices, ("processes", "local_devices"))
+    pspec = PartitionSpec("processes")
+
+    def pre_jit(x):
+        if is_source:
+            inp = x
+        else:
+            inp = np.zeros_like(x)
+        inp = np.expand_dims(inp, axis=0)
+        return host_local_array_to_global_array(inp, global_mesh, pspec)
+
+    def post_jit(x):
+        return jax.device_get(x.addressable_data(0))
+
+    with haliax.partitioning.set_mesh(global_mesh):
+        in_tree = jax.tree.map(pre_jit, in_tree)
+        out_tree = jax.jit(_psum, out_shardings=jax.sharding.NamedSharding(global_mesh, PartitionSpec()))(in_tree)
+        return jax.tree.map(post_jit, out_tree)
+
+
+def assert_equal(in_tree, fail_message: str = ""):
+    """Verifies that all the hosts have the same tree of values."""
+    expected = broadcast_one_to_all(in_tree)
+    if not jax.tree_util.tree_all(jax.tree_util.tree_map(lambda *x: np.all(np.equal(*x)), in_tree, expected)):
+        raise AssertionError(f"{fail_message} Expected: {expected}; got: {in_tree}.")
+
+
+def sync_global_devices(name: str):
+    """Creates a barrier across all hosts/devices."""
+    h = np.uint32(zlib.crc32(name.encode()))
+    assert_equal(h, f"sync_global_devices name mismatch ('{name}')")
+
+
+def sharded_tree_size(
+    tree, mesh: Optional[haliax.partitioning.MeshLike] | None = None, mapping: ResourceMapping | None = None
+) -> int:
+    """
+    Returns the size of a sharded tree, in bytes. If the tree is sharded, this returns the size of a per-device shard.
+
+    If mesh is None, uses the current mesh.
+    If mapping is None, uses the current mapping.
+
+    For named arrays, this uses the provided mesh and mapping to determine the sharding.
+    For real jax.Arrays, uses their existing sharding.
+    Inside jit or with ShapeDTypeStruct, see if there is a sharding. If not, assumes unsharded.
+    For other arrays, assumes unsharded.
+
+    Args:
+        tree: the tree to measure
+        mesh: the mesh to use for sharding. If None, uses the current mesh.
+    """
+    if mesh is None:
+        mesh = jax.sharding.get_abstract_mesh()
+
+    if mapping is None:
+        mapping = haliax.partitioning.current_thread_local_mapping()
+
+    def _mesh_axis_size(axis_name) -> int:
+        if mesh is None:
+            return 1
+        return mesh.shape[axis_name]
+
+    def _shards_for_pspec(pspec):
+        if mesh is None or pspec is None:
+            return 1
+
+        count = 1
+        for axis in pspec:
+            if axis is None:
+                continue
+            if isinstance(axis, tuple):
+                for sub_axis in axis:
+                    count *= _mesh_axis_size(sub_axis)
+            else:
+                count *= _mesh_axis_size(axis)
+        return count
+
+    def _size(x):
+        if isinstance(x, hax.NamedArray):
+            pspec = haliax.partitioning.pspec_for(x, mapping, preserve_existing_shardings=False)
+            num_shards = _shards_for_pspec(pspec)
+            x_a = x.array
+            if hasattr(x_a, "nbytes"):
+                return x_a.nbytes // num_shards
+            else:
+                return x_a.size * x_a.dtype.itemsize // num_shards
+        elif is_jax_array_like(x):
+            sharding = getattr(x, "sharding", None)
+            pspec = getattr(sharding, "spec", None) if sharding is not None else None
+            if pspec is None and sharding is not None:
+                warnings.warn(
+                    f"{x} has sharding {sharding} but no spec. Assuming unsharded. If you see this, please report a bug."
+                )
+            num_shards = _shards_for_pspec(pspec)
+
+            # ShapeDtypeStruct doesn't have nbytes
+            if hasattr(x, "nbytes"):
+                total = x.nbytes
+            else:
+                shape = getattr(x, "shape", None)
+                dtype = getattr(x, "dtype", None)
+                if shape is None or dtype is None:
+                    raise ValueError("Unable to determine byte size for JAX array-like leaf without shape/dtype")
+                total = int(np.prod(shape)) * np.dtype(dtype).itemsize
+
+            return total // num_shards if num_shards > 0 else total
+        else:
+            assert jnp.isscalar(x)
+            return jnp.dtype(type(x)).itemsize
+
+    return sum(jax.tree.leaves(jax.tree.map(_size, tree, is_leaf=is_named_array)))

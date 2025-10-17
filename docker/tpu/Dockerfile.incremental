@@ -1,4 +1,4 @@
-ARG IMAGE=ghcr.io/stanford-crfm/levanter-base
+ARG IMAGE=ghcr.io/marin-community/levanter-base
 ARG TAG=latest
 
 FROM ${IMAGE}:${TAG}
@@ -17,9 +17,11 @@ WORKDIR /opt/levanter
 
 ADD pyproject.toml README.md /opt/levanter/
 RUN mkdir -p /opt/levanter/src/levanter
-RUN pip install -e '.[test]'
-RUN pip install "lm-eval@git+https://github.com/dlwh/lm-evaluation-harness.git@no_torch"
-RUN pip install "draccus@git+https://github.com/dlwh/draccus.git"
+RUN touch /opt/levanter/src/levanter/__init__.py || true
+RUN uv pip install -e '/opt/levanter/[test,dev,serve]' prompt_toolkit uvicorn
+RUN uv pip install "lm-eval@git+https://github.com/dlwh/lm-evaluation-harness.git@no_torch"
+RUN uv pip install "draccus@git+https://github.com/dlwh/draccus.git"
+RUN rm /opt/levanter/src/levanter/__init__.py
 ADD . /opt/levanter
 
 # Add $EXTRA_CTX to the same location as in local machine.

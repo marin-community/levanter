@@ -283,7 +283,7 @@ To initialize with the model configuration and checkpoint from Hugging Face, you
 ```yaml
 model:
     type: llama
-initialize_from_hf: "meta-llama/Llama-2-7b-hf"
+initialize_from_hf: "NousResearch/Llama-2-7b-hf"
 use_hf_model_config: true
 ```
 

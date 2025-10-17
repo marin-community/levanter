@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -15,7 +18,7 @@ from levanter.utils.tree_utils import tree_flatten_one_level_with_keys
 # Define the state structure for the optimizer
 # We use a custom pytree so that we can load a skipstep state from a non-skipstep state.
 @register_pytree_with_keys_class
-@dataclass
+@dataclass(frozen=True)
 class SkipStepState:
     inner_opt_state: optax.OptState
     losses: jax.Array  # Stores last 'rolling_interval_length' losses
@@ -58,7 +61,7 @@ class SkipStepState:
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class SkipStepConfig:
     """
     Configuration for "skip step" logic in an optimizer.

@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import numpy as np
 import pytest
 from jax import random
@@ -64,3 +67,59 @@ def test_apply_rotary_pos_emb(test_seq_len):
 
     assert_equal_out(lev_rot_q, hf_rot_q)
     assert_equal_out(lev_rot_k, hf_rot_k)
+
+
+def test_yarn_rotary_embedding():
+    """Test that YarnRotaryEmbeddings can be created and used."""
+    from jax import random
+
+    import haliax as hax
+
+    from levanter.layers.rotary import YarnRotaryEmbeddingsConfig
+
+    # Test configuration
+    HeadSize = hax.Axis("HeadSize", 64)
+    Pos = hax.Axis("Pos", 128)
+    Batch = hax.Axis("batch", 2)
+    Heads = hax.Axis("Heads", 8)
+
+    # Create Yarn config
+    yarn_config = YarnRotaryEmbeddingsConfig(
+        theta=10000.0, factor=2.0, beta_fast=32.0, beta_slow=1.0, original_max_position_embeddings=2048, mscale=1.0
+    )
+
+    # Build the rotary embeddings
+    rope = yarn_config.build(HeadSize)
+
+    # Create test inputs
+    q = hax.random.normal(random.PRNGKey(0), (Batch, Pos, Heads, HeadSize))
+    position_ids = hax.arange(Pos)
+
+    # Apply rotary embeddings
+    q_rotated = rope(q, position_ids)
+
+    # Basic assertions
+    assert q_rotated.shape == q.shape
+    assert q_rotated.axes == q.axes
+
+    # Test that the output is different from input (rotary embeddings should modify the input)
+    assert not hax.all(hax.isclose(q, q_rotated, rtol=1e-6, atol=1e-6))
+
+    # Test HF config conversion
+    theta, config = yarn_config.to_hf_config()
+    assert theta == 10000.0
+    assert config["type"] == "yarn"
+    assert config["factor"] == 2.0
+    assert config["beta_fast"] == 32.0
+    assert config["beta_slow"] == 1.0
+    assert config["original_max_position_embeddings"] == 2048
+    assert config["mscale"] == 1.0
+
+    # Test creating from HF config
+    yarn_config_from_hf = YarnRotaryEmbeddingsConfig.make_from_hf_config(theta, config)
+    assert yarn_config_from_hf.theta == yarn_config.theta
+    assert yarn_config_from_hf.factor == yarn_config.factor
+    assert yarn_config_from_hf.beta_fast == yarn_config.beta_fast
+    assert yarn_config_from_hf.beta_slow == yarn_config.beta_slow
+    assert yarn_config_from_hf.original_max_position_embeddings == yarn_config.original_max_position_embeddings
+    assert yarn_config_from_hf.mscale == yarn_config.mscale

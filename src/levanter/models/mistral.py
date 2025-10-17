@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 from dataclasses import dataclass
 from typing import Dict, Optional, Type, Union
@@ -91,7 +94,7 @@ class MistralConfig(LlamaConfig):
     @classmethod
     def from_hf_config(cls, hf_config: HfConfig):
         rope_theta = hf_config.rope_theta
-        rope_config = RotaryEmbeddingsConfig.from_hf_config(rope_theta, hf_config.rope_scaling)
+        rope_config = RotaryEmbeddingsConfig.from_hf_config(rope_theta, None)
         return MistralConfig(
             seq_len=hf_config.max_position_embeddings,  # this might be too big...
             hidden_dim=hf_config.hidden_size,
@@ -134,7 +137,8 @@ class MistralConfig(LlamaConfig):
             sliding_window=self.sliding_window,
             vocab_size=vocab_size,
             rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
+            # Mistral 1 doesn't use rope_scaling
+            # rope_scaling=rope_scaling,
             **config_overrides,
         )
 

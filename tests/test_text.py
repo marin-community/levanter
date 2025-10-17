@@ -1,12 +1,16 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import tempfile
 from pathlib import Path
+
+from transformers import AutoTokenizer
 
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from numpy.testing import assert_array_equal
-from transformers import AutoTokenizer
 
 import haliax as hax
 
@@ -31,6 +35,8 @@ def test_dont_blow_up_without_validation_set():
             train_urls=["kaa"],
             validation_urls=[],
             cache_dir=tmpdir,
+            tokenizer="passthrough",
+            vocab_size=64,
         )
 
         Pos = hax.Axis("position", 10)
@@ -65,8 +71,8 @@ def test_lm_example_handles_ignore_id():
     assert no_ignore_loss.item() >= ignored_loss.item() + 100 / Pos.size
 
 
-def test_merge_split_encodings():
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+def test_merge_split_encodings(local_gpt2_tokenizer):
+    tokenizer = local_gpt2_tokenizer
     # make this very short for testing
 
     lorem = """Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum."""
@@ -84,9 +90,9 @@ def test_merge_split_encodings():
     assert short_out == reg_out
 
 
-@skip_if_hf_model_not_accessible("meta-llama/Llama-2-7b-hf")
+@skip_if_hf_model_not_accessible("NousResearch/Llama-2-7b-hf")
 def test_llama_tokenizer_needs_long_sequence_workaround():
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+    tokenizer = AutoTokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
     batch_tokenizer = BatchTokenizer(tokenizer)
     assert batch_tokenizer._needs_long_sequence_workaround
 
@@ -275,7 +281,7 @@ def test_chat_dataset_build_and_pack(dummy_chat_data):
         ex = packed_ds[0]
         assert ex.tokens.axes == (Pos,)
         assert ex.loss_mask.axes == (Pos,)
-        assert ex.attn_mask.segment_ids.axes == (Pos,)
+        assert ex.attn_mask.segment_ids[0].axes == (Pos,)
 
         assert_loss_mask_matches_all_assistants(ex, tokenizer)
 
@@ -289,7 +295,7 @@ def test_chat_dataset_build_and_pack(dummy_chat_data):
             # basic structural checks
             assert ex.tokens.axes == (Pos,)
             assert ex.loss_mask.axes == (Pos,)
-            assert ex.attn_mask.segment_ids.axes == (Pos,)
+            assert ex.attn_mask.segment_ids[0].axes == (Pos,)
 
             # loss_mask should coincide with assistant tokens only
             assert_loss_mask_matches_all_assistants(ex, tokenizer)
@@ -360,14 +366,14 @@ def test_supervised_processor_and_cache(dummy_supervised_file, hf_tokenizer):
         # Axis checks
         assert ex.tokens.axes == (Pos,)
         assert ex.loss_mask.axes == (Pos,)
-        assert ex.attn_mask.segment_ids.axes == (Pos,)
+        assert ex.attn_mask.segment_ids[0].axes == (Pos,)
 
         # -----------------------------------------------------------
         #  Verify that for every segment:
         #    * leading tokens (input) have loss_mask==0
         #    * trailing tokens (answer) have loss_mask==1
         # -----------------------------------------------------------
-        seg_ids: np.ndarray = ex.attn_mask.segment_ids.array
+        seg_ids: np.ndarray = ex.attn_mask.segment_ids[0].array
         mask: np.ndarray = ex.loss_mask.array
 
         for seg in np.unique(seg_ids):
@@ -403,10 +409,10 @@ def test_supervised_processor_and_cache(dummy_supervised_file, hf_tokenizer):
             # basic structural checks
             assert ex.tokens.axes == (Pos,)
             assert ex.loss_mask.axes == (Pos,)
-            assert ex.attn_mask.segment_ids.axes == (Pos,)
+            assert ex.attn_mask.segment_ids[0].axes == (Pos,)
 
-            assert set(int(i) for i in np.unique(ex.attn_mask.segment_ids.array)) == {idx, -1}
+            assert set(int(i) for i in np.unique(ex.attn_mask.segment_ids[0].array)) == {idx, -1}
 
-            assert ex.loss_mask.array.sum() == len(ex.attn_mask.segment_ids.array) - raw_ex["sources_len"] - np.sum(
-                ex.attn_mask.segment_ids.array == -1
+            assert ex.loss_mask.array.sum() == len(ex.attn_mask.segment_ids[0].array) - raw_ex["sources_len"] - np.sum(
+                ex.attn_mask.segment_ids[0].array == -1
             )

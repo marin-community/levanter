@@ -1,5 +1,5 @@
 cache_dir: "gs://marin-data/tokenized/fineweb/llama2_tokenizer/txt"
-tokenizer: "meta-llama/Llama-2-7b-hf"
+tokenizer: "NousResearch/Llama-2-7b-hf"
 stop_strategy: restart
 configs:
   "fineweb":

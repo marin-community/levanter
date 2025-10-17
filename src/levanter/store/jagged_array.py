@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import os
 from dataclasses import dataclass
@@ -549,6 +552,8 @@ def _ts_open_sync(path: Optional[str], dtype: jnp.dtype, shape, *, mode, cache_s
     # TODO: groups?
     # TODO: set chunk sizes
     try:
+        if spec.get("kvstore", {}).get("path", "").startswith("memory://"):
+            raise ValueError("No kvstore specified in spec, cannot open TensorStore")
         return ts.open(
             spec,
             dtype=jnp.dtype(dtype).name,

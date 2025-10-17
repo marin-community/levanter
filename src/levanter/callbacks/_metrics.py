@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import logging as pylogging
 from concurrent.futures import ThreadPoolExecutor
@@ -15,7 +18,6 @@ from levanter.schedule import BatchSchedule
 from levanter.tracker import log_optimizer_hyperparams
 from levanter.utils import flop_utils
 from levanter.utils.jax_utils import jnp_to_python
-
 
 logger = pylogging.getLogger(__name__)
 

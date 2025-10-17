@@ -4,7 +4,7 @@ data:
   validation_urls:
     - "gs://pubmed-mosaic/openwebtext-sharded/openwebtext_val.{1..8}-of-8.jsonl.gz"
   cache_dir: "gs://levanter-data/tokenized/openwebtext_llama/"
-  tokenizer: "meta-llama/Llama-2-70b-hf"
+  tokenizer: "NousResearch/Llama-2-7b-hf"
 model:
   type: llama
   hidden_dim: 32

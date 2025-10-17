@@ -1,4 +1,4 @@
-model_name_or_path: meta-llama/Llama-2-7b-hf
+model_name_or_path: NousResearch/Llama-2-7b-hf
 
 # Training configuration
 trainer:

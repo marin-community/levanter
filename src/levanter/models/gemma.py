@@ -1,13 +1,15 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 from dataclasses import dataclass
 from typing import Union
 
 import equinox as eqx
-import jax.numpy as jnp
-import jax.random as jrandom
-
 import haliax as hax
 import haliax.nn as hnn
+import jax.numpy as jnp
+import jax.random as jrandom
 from haliax import Axis, AxisSpec, NamedArray
 from haliax.jax_utils import maybe_rng_split, named_call, shaped_rng_split
 from haliax.nn.normalization import LayerNormBase
@@ -18,20 +20,21 @@ from levanter.compat.hf_checkpoints import HFCheckpointConverter, HFCompatConfig
 from levanter.layers.attention import Attention, AttentionBackend, AttentionConfig, AttentionMask
 from levanter.layers.normalization import LayerNormConfigBase
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
-from levanter.models.llama import LlamaEmbedding, LlamaMlp  # Gemma attention and MLP is identical to LLama
+from levanter.models.llama import (  # Gemma attention and MLP is identical to LLama
+    LlamaEmbedding,
+    LlamaMlp,
+)
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.utils.activation import ActivationFunctionEnum
 from levanter.utils.flop_utils import lm_flops_per_token
 from levanter.utils.logging import silence_transformer_nag
 from levanter.utils.types import BlockFoldable
 
-
 silence_transformer_nag()
 from transformers import Gemma2Config as HfGemma2Config  # noqa: E402
 from transformers import Gemma3Config as HfGemma3Config  # noqa: E402
 from transformers import GemmaConfig as HfGemmaConfig  # noqa: E402
 from transformers import PretrainedConfig as HfConfig  # noqa: E402
-
 
 # Gemma is... very similar to Llama, so we use much of the same modeling code.
 #
@@ -45,7 +48,7 @@ from transformers import PretrainedConfig as HfConfig  # noqa: E402
 
 
 @LayerNormConfigBase.register_subclass("gemma")
-@dataclass
+@dataclass(frozen=True)
 class GemmaNormConfig(LayerNormConfigBase):
     """Configuration for Gemma's custom RMS normalization."""
 
@@ -134,6 +137,10 @@ class GemmaConfig(HFCompatConfig):
     # See https://github.com/huggingface/transformers/pull/29402 for more detail.
     @classmethod
     def from_hf_config(cls, hf_config: HfConfig):
+        # extract the text backbone for gemma3
+        if hasattr(hf_config, "text_config"):
+            hf_config = hf_config.text_config
+
         if hf_config.hidden_activation is None:
             activation_function = "gelu_pytorch_tanh"
         else:
@@ -200,6 +207,7 @@ class GemmaConfig(HFCompatConfig):
             vocab_size=vocab_size,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
+            _attn_implementation="eager",
             **config_overrides,
         )
         return config
@@ -486,7 +494,9 @@ class Gemma2Config(GemmaConfig):
         construct the Hugging-Face config explicitly so that the intent is clear.
         """
 
-        from transformers import Gemma2Config as _HFGemma2Config  # local import (optional dependency)
+        from transformers import (
+            Gemma2Config as _HFGemma2Config,  # local import (optional dependency)
+        )
 
         if config_overrides is None:
             config_overrides = {}
@@ -526,6 +536,7 @@ class Gemma2Config(GemmaConfig):
         # Merge user-overrides last so callers can tweak anything.
         cfg = _HFGemma2Config(
             **common_args,
+            _attn_implementation="eager",
             **config_overrides,
         )
 
@@ -855,6 +866,7 @@ class Gemma3Config(Gemma2Config):
 
         cfg = _HFGemma3Config(
             **common_args,
+            _attn_implementation="eager",
             **config_overrides,
         )
         return cfg

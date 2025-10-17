@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import abc
 from dataclasses import dataclass
 from typing import Generic, Optional, Type, TypeVar
@@ -31,6 +34,7 @@ class LmExample(eqx.Module):
         ignore_id: Optional[int] = None,
         eos_id: Optional[int] = None,
         segment_ids: Optional[hax.NamedArray] = None,
+        sliding_window: int | None = None,
     ) -> "LmExample":
         if tokens.ndim != 1:
             raise ValueError("tokens must be a 1D array")
@@ -54,7 +58,7 @@ class LmExample(eqx.Module):
 
         loss_mask = loss_mask.astype(jnp.int32)
 
-        attn_mask = AttentionMask.causal()
+        attn_mask = AttentionMask.causal(sliding_window=sliding_window)
 
         if eos_id is not None and segment_ids is None:
             # the next token after an eos token is in a new segment
@@ -76,9 +80,10 @@ class LmExample(eqx.Module):
         *,
         ignore_id: Optional[int] = None,
         all_causal: bool = True,
+        sliding_window: int | None = None,
     ) -> "LmExample":
         if all_causal:
-            attn_mask = AttentionMask.causal()
+            attn_mask = AttentionMask.causal(sliding_window=sliding_window)
         else:
             # causal just for the completion part. We don't have a special structured mask for this, so we just
             raise NotImplementedError("Not implemented yet")

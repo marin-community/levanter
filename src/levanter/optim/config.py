@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import abc
 import re
 import warnings
@@ -37,14 +40,14 @@ class LrSchedule(draccus.ChoiceRegistry, abc.ABC):
 
 
 @LrSchedule.register_subclass("constant")
-@dataclass
+@dataclass(frozen=True)
 class ConstantLrSchedule(LrSchedule):
     def build(self, ctx: LrScheduleContext):
         return optax.constant_schedule(ctx.learning_rate)
 
 
 @LrSchedule.register_subclass("cosine")
-@dataclass
+@dataclass(frozen=True)
 class CosineLrSchedule(LrSchedule):
     exponent: float = 1.0
 
@@ -53,14 +56,14 @@ class CosineLrSchedule(LrSchedule):
 
 
 @LrSchedule.register_subclass("linear")
-@dataclass
+@dataclass(frozen=True)
 class LinearLrSchedule(LrSchedule):
     def build(self, ctx: LrScheduleContext):
         return optax.linear_schedule(ctx.learning_rate, ctx.min_lr, ctx.decay_steps)
 
 
 @LrSchedule.register_subclass("inv_sqrt")
-@dataclass
+@dataclass(frozen=True)
 class InvSqrtLrSchedule(LrSchedule):
     timescale: float = 10000
 
@@ -69,14 +72,14 @@ class InvSqrtLrSchedule(LrSchedule):
 
 
 @LrSchedule.register_subclass("inv")
-@dataclass
+@dataclass(frozen=True)
 class InvLrSchedule(LrSchedule):
     def build(self, ctx: LrScheduleContext):
         return _inv_decay_schedule(ctx.learning_rate, ctx.min_lr, ctx.decay_steps)
 
 
 @LrSchedule.register_subclass("power")
-@dataclass
+@dataclass(frozen=True)
 class PowerLrSchedule(LrSchedule):
     # Power Scheduler: A Batch Size and Token Number Agnostic Learning Rate Scheduler (Shen et al., 2024)
     # https://arxiv.org/abs/2408.13359
@@ -104,7 +107,7 @@ class PowerLrSchedule(LrSchedule):
         return schedule
 
 
-@dataclass
+@dataclass(frozen=True)
 class OptimizerConfig(draccus.ChoiceRegistry, abc.ABC):
     learning_rate: float = 6e-4
     weight_decay: float = 0.1
@@ -390,14 +393,14 @@ def _convert_frac_or_steps(frac_or_steps: float | int, num_train_steps: int):
     return int(frac_or_steps)
 
 
-@dataclass
+@dataclass(frozen=True)
 class HessianOptConfig(OptimizerConfig, abc.ABC):
     update_interval: int = 10
     """How often to update the hessian approximation."""
 
 
 @OptimizerConfig.register_subclass("adam")
-@dataclass
+@dataclass(frozen=True)
 class AdamConfig(OptimizerConfig):
     beta1: float = 0.9
     # cf https://docs.mosaicml.com/projects/composer/en/latest/api_reference/generated/composer.optim.DecoupledAdamW.html
@@ -432,6 +435,15 @@ class AdamConfig(OptimizerConfig):
     See https://github.com/allenai/OLMo-core/blob/main/src/olmo_core/optim/skip_step_optimizer.py
     """
 
+    adamc_weight_decay: bool = False
+    """
+    If set, use the AdamC corrected weight decay, which keeps
+    ``weight_decay / lr`` constant across training.
+
+    This follows Defazio, *On the Correct Treatment of Weight Decay in Adam*
+    (2025, https://arxiv.org/abs/2506.02285v2).
+    """
+
     def __post_init__(self):
         if self.update_rms_clipping is not None and self.update_rms_clipping <= 0:
             raise ValueError("update_rms_clipping must be a positive number or None.")
@@ -452,7 +464,12 @@ class AdamConfig(OptimizerConfig):
             components.append(optax.scale_by_adam(self.beta1, self.beta2, self.epsilon, nesterov=self.nesterov))
 
             if self.weight_decay > 0:
-                components.append(optax.add_decayed_weights(self.weight_decay, self.build_weight_decay_mask()))
+                if self.adamc_weight_decay:
+                    max_lr = self.learning_rate
+                    weight_decay = self.weight_decay * (learning_rate / max_lr)
+                else:
+                    weight_decay = self.weight_decay
+                components.append(optax.add_decayed_weights(weight_decay, self.build_weight_decay_mask()))
 
             if self.update_rms_clipping is not None:
                 components.append(log_norm_passthrough("optim/pre_clip_update_norm"))
@@ -478,7 +495,7 @@ class AdamConfig(OptimizerConfig):
 
 
 @OptimizerConfig.register_subclass("lion")
-@dataclass
+@dataclass(frozen=True)
 class LionConfig(OptimizerConfig):
     """
     Lion optimizer configuration

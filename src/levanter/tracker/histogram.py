@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import functools
 
 import equinox
@@ -11,7 +14,6 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec
 from jaxtyping import ArrayLike, Scalar
 
-import haliax
 import haliax as hax
 from haliax import NamedArray
 

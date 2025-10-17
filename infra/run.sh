@@ -9,7 +9,7 @@ fi
 
 # if we still don't have a venv, we'll look in our default
 if [ ! -d "$VENV" ]; then
-  VENV=/files/venv32
+  VENV=$LEV_ROOT/.venv
 fi
 
 source $VENV/bin/activate

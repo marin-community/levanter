@@ -1,6 +1,7 @@
 # Launches the "gpt_small_fast" model on a TPU node
 
-python infra/launch.py --foreground --tpu_name $(whoami)-levanter-itest-32 --zone us-central2-b --tpu_type v4-32 --preemptible -- \
+uv run python infra/launch.py -e JAX_COMPILATION_CACHE_DIR gs://levanter-checkpoints/compilation-cache \
+   --foreground --tpu_name $(whoami)-levanter-itest-32 --zone us-central2-b --tpu_type v4-32 --preemptible -- \
     python -m levanter.main.train_lm \
-    --config_path config/gpt2_small_fast.yaml \
+    --config_path config/llama_small_fast.yaml \
     --trainer.checkpointer.base_path gs://levanter-checkpoints/gpt-itest/ --trainer.checkpointer.save_interval 30m $*

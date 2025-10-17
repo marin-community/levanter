@@ -2,7 +2,7 @@
 data:
   cache_dir: "gs://marin-data/tokenized/OLMo-1B/dolma-v1.7"
   tokenizer: "allenai/OLMo-1B"  # requires `pip install ai2-olmo`
-  # tokenizer: "meta-llama/Llama-2-7b-hf"
+  # tokenizer: "NousResearch/Llama-2-7b-hf"
   stop_strategy: restart
   shuffle_buffer_size: 100000
   configs:

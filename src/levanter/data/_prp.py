@@ -1,10 +1,15 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import typing
 
+import jax
 import jax.numpy as jnp
 import jax.random as jrandom
 import numpy as np
 from jaxtyping import PRNGKeyArray
 
+from levanter.utils.jax_utils import local_cpu_mesh
 
 PermType = typing.Literal["feistel", "linear"]
 
@@ -72,6 +77,13 @@ class Permutation(typing.Protocol):
             raise ValueError(f"Unknown permutation kind: {kind}")
 
 
+def _np_rng_from_jax_key(prng_key: PRNGKeyArray) -> np.random.Generator:
+    # Force CPU usage to avoid jit complaining. These are not critical path in Levanter.
+    with local_cpu_mesh():
+        key = jax.device_put(jax.device_get(prng_key))
+        return np.random.Generator(np.random.PCG64(jrandom.randint(key, (), 0, 2**30).item()))
+
+
 class LcgPermutation(Permutation):
     # Pseudo-Random Permutation Code
     """A stateless pseudo-random permutation.
@@ -83,13 +95,11 @@ class LcgPermutation(Permutation):
 
     def __init__(self, length, prng_key):
         self.length = length
-        # Convert jax.random.PRNGKey to numpy.random.Generator
-        self.rng = np.random.Generator(np.random.PCG64(jrandom.randint(prng_key, (), 0, 2**30).item()))
-        self.a, self.b = self._generate_permutation_params()  # Generate a and b in init
+        rng = _np_rng_from_jax_key(prng_key)
+        self.a, self.b = self._generate_permutation_params(rng)  # Generate a and b in init
 
-    def _generate_permutation_params(self):
+    def _generate_permutation_params(self, rng):
         length = self.length
-        rng = self.rng
 
         if length == 1:
             return 1, 0
@@ -103,12 +113,10 @@ class LcgPermutation(Permutation):
         return a, b
 
     @typing.overload
-    def __call__(self, indices: int) -> int:
-        ...
+    def __call__(self, indices: int) -> int: ...
 
     @typing.overload
-    def __call__(self, indices: np.ndarray) -> np.ndarray:
-        ...
+    def __call__(self, indices: np.ndarray) -> np.ndarray: ...
 
     def __call__(self, indices):
         a = self.a
@@ -161,9 +169,8 @@ class FeistelPermutation(Permutation):
         self.right_bits = self.bits - self.left_bits
         self.R_mask = np.uint64((1 << self.right_bits) - 1)
 
-        # Convert JAX PRNG to numpy RNG and generate round keys in range [0, 2^(right_bits))
-        self.rng = np.random.Generator(np.random.PCG64(jrandom.randint(prng_key, (), 0, 2**30).item()))
-        self.keys = self.rng.integers(0, 1 << self.right_bits, size=rounds, dtype=np.uint64)
+        rng = _np_rng_from_jax_key(prng_key)
+        self.keys = rng.integers(0, 1 << self.right_bits, size=rounds, dtype=np.uint64)
 
     def _F(self, right: np.ndarray, key: np.uint64) -> np.ndarray:
         """A simple round function that mixes the right half.
@@ -191,12 +198,10 @@ class FeistelPermutation(Permutation):
         return out
 
     @typing.overload
-    def __call__(self, indices: int) -> int:
-        ...
+    def __call__(self, indices: int) -> int: ...
 
     @typing.overload
-    def __call__(self, indices: np.ndarray | jnp.ndarray) -> np.ndarray:
-        ...
+    def __call__(self, indices: np.ndarray | jnp.ndarray) -> np.ndarray: ...
 
     def __call__(self, indices):
 

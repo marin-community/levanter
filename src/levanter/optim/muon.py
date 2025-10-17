@@ -1,6 +1,10 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 from dataclasses import dataclass
-from typing import NamedTuple
+from functools import partial
+from typing import NamedTuple, Optional
 
 import chex
 import jax
@@ -18,7 +22,7 @@ from levanter.utils.jax_utils import leaf_key_paths
 
 
 @OptimizerConfig.register_subclass("muon")
-@dataclass
+@dataclass(frozen=True)
 class MuonConfig(OptimizerConfig):
     """
     Muon optimizer configuration: Momentum Orthogonalized by Newton-Schulz.
@@ -32,11 +36,15 @@ class MuonConfig(OptimizerConfig):
     nesterov: bool = True
     backend_steps: int = 5  # Number of steps for Newton-Schulz orthogonalization
     weight_decay: float = 0.0
+    adam_weight_decay: Optional[float] = None
     beta1: float = 0.9
     beta2: float = 0.95
     epsilon: float = 1e-8
     muon_epsilon: float = 1e-8
     max_grad_norm: float = 1.0
+    # Kimi scales the learning rate for every d_1 * d_2 module by 0.2 * jnp.sqrt{\max{d_1, d_2}}, instead of the jnp.sqrt{\max{1, d_1/d_2}} as in the original nanogpt speedrun.
+    # When this scaling is enabled, it is recommended to use learning rate and weight decay similar to adam
+    use_kimi_scaling: bool = False
 
     def build(self, num_train_steps):
         """
@@ -48,7 +56,11 @@ class MuonConfig(OptimizerConfig):
         def optimizer(learning_rate, adam_lr):
             def muon_transform():
                 components = []
-                components.append(scale_with_muon(self.momentum, self.nesterov, self.backend_steps, self.muon_epsilon))
+                components.append(
+                    scale_with_muon(
+                        self.momentum, self.nesterov, self.backend_steps, self.muon_epsilon, self.use_kimi_scaling
+                    )
+                )
                 if self.weight_decay > 0:
                     components.append(optax.add_decayed_weights(self.weight_decay, self.build_weight_decay_mask()))
                 components.append(optax.scale(-learning_rate))
@@ -60,8 +72,9 @@ class MuonConfig(OptimizerConfig):
                 if self.max_grad_norm:
                     components.append(optax.clip_by_global_norm(self.max_grad_norm))
                 components.append(optax.scale_by_adam(self.beta1, self.beta2, self.epsilon))
-                if self.weight_decay > 0:
-                    components.append(optax.add_decayed_weights(self.weight_decay, self.build_weight_decay_mask()))
+                adam_weight_decay = self.adam_weight_decay if self.adam_weight_decay is not None else self.weight_decay
+                if adam_weight_decay > 0:
+                    components.append(optax.add_decayed_weights(adam_weight_decay, self.build_weight_decay_mask()))
                 components.append(optax.scale(-adam_lr))
                 optimizer = optax.chain(*components)
                 return optimizer
@@ -71,11 +84,13 @@ class MuonConfig(OptimizerConfig):
                 "adamw": adamw_transform(),
             }
 
-            return optax.multi_transform(transformations, self.create_mask)
+            return optax.multi_transform(
+                transformations, partial(self.create_mask, use_kimi_scaling=self.use_kimi_scaling)
+            )
 
         return optax.inject_hyperparams(optimizer)(learning_rate=learning_rate_schedule, adam_lr=adam_lr_schedule)
 
-    def create_mask(self, params):
+    def create_mask(self, params, use_kimi_scaling=True):
         """
         Creates a mask that labels parameters as 'muon' or 'adamw' based on their
         dimensionality and module path, using AdamW for Embedding and lm_head parameters.
@@ -88,6 +103,9 @@ class MuonConfig(OptimizerConfig):
                 return "adamw"
             elif isinstance(param, Linear):
                 # muon for linear layers
+                assert (
+                    param._out_first or use_kimi_scaling
+                )  # if we don't use kimi's version of scaling, then we need to assume out_first to ensure we are scaling like Out/In
                 return dataclasses.replace(param, weight="muon", bias="adamw" if param.bias is not None else None)
             else:
                 return "adamw"
@@ -101,7 +119,7 @@ class ScaleByMuonState(NamedTuple):
     momentum_buffer: optax.Updates
 
 
-def scale_with_muon(momentum=0.95, nesterov=True, steps=5, muon_eps=1e-8):
+def scale_with_muon(momentum=0.95, nesterov=True, steps=5, muon_eps=1e-8, use_kimi_scaling=False):
     # Convert steps to concrete int at function definition time
     steps = int(steps)
 
@@ -133,7 +151,12 @@ def scale_with_muon(momentum=0.95, nesterov=True, steps=5, muon_eps=1e-8):
             array = layer.weight.array
             updated_weight_array = zeropower_via_newtonschulz5(array, steps=steps, eps=muon_eps)
 
-            scale = jnp.sqrt(jnp.maximum(1, updated_weight_array.shape[0] / updated_weight_array.shape[1]))
+            if not use_kimi_scaling:
+                scale = jnp.sqrt(
+                    jnp.maximum(1, updated_weight_array.shape[0] / updated_weight_array.shape[1])
+                )  # sqrt(Out/In)
+            else:
+                scale = 0.2 * jnp.sqrt(jnp.maximum(updated_weight_array.shape[0], updated_weight_array.shape[1]))
             updated_weight_array *= scale
 
             updated_weight = dataclasses.replace(layer.weight, array=updated_weight_array)
@@ -167,7 +190,7 @@ def zeropower_via_newtonschulz5(X, steps=5, eps=1e-7):
     # really do something even fancier.
     # It would be even smarter to stack similar layers together, but that would require more even more work
     # Let's call this good enough until we think it's not good enough
-    if len(haliax.partitioning._get_mesh().devices):
+    if not jax.sharding.get_abstract_mesh().empty:
         X = jax.lax.with_sharding_constraint(X, PartitionSpec(None, ("data", "model")))
 
     for i in range(steps):

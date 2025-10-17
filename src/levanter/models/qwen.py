@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 from dataclasses import dataclass
 from typing import Dict, Optional, Type
@@ -125,8 +128,9 @@ class QwenConfig(LlamaConfig):
             Embed=self.Embed,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
-            # qwen2 always uses bias in attention
-            use_bias=True,
+            # qwen2 uses bias for qkv projections but not for output projection
+            use_bias=True,  # Qwen2 qkv projections always have bias
+            use_output_bias=False,  # Qwen2 specifically has no bias on o_proj
             upcast_attn=self.upcast_attn,
             attn_backend=self.attn_backend,
             flash_attention_block_size=self.flash_attention_block_size,
@@ -304,6 +308,17 @@ class Qwen3Config(LlamaConfig):
     @property  # type: ignore[override]
     def model_type(self):  # noqa: D401
         return Qwen3LMHeadModel
+
+    def hf_checkpoint_converter(
+        self, ref_checkpoint: Optional[str] = None
+    ) -> HFCheckpointConverter["Qwen3Config"]:  # type: ignore
+        return HFCheckpointConverter(
+            self.__class__,
+            reference_checkpoint=self.reference_checkpoint if ref_checkpoint is None else ref_checkpoint,
+            trust_remote_code=True,
+            tokenizer=ref_checkpoint if self.tokenizer is None else self.tokenizer,
+            HfConfigClass=HfQwen3Config,
+        )
 
     def to_hf_config(self, vocab_size: int, config_overrides: Optional[Dict] = None) -> HfQwen3Config:
         if config_overrides is None:

@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import tempfile
 
@@ -7,7 +10,7 @@ import pytest
 import levanter.main.train_asr as train_asr
 import tiny_test_corpus
 from levanter.distributed import RayConfig
-from levanter.tracker.wandb import WandbConfig
+from levanter.tracker import NoopConfig
 from test_utils import skip_if_no_soundlibs
 
 
@@ -28,7 +31,7 @@ def test_train_asr():
                     num_train_steps=2,
                     train_batch_size=len(jax.devices()),
                     max_eval_batches=1,
-                    wandb=WandbConfig(mode="disabled"),
+                    tracker=NoopConfig(),
                     require_accelerator=False,
                     ray=RayConfig(auto_start_cluster=False),
                 ),

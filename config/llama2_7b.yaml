@@ -4,7 +4,7 @@ data:
   validation_urls:
     - "gs://pubmed-mosaic/openwebtext-sharded/openwebtext_val.{1..8}-of-8.jsonl.gz"
   cache_dir: "gs://levanter-data/tokenized/openwebtext_llama/"
-  tokenizer: "meta-llama/Llama-2-70b-hf"
+  tokenizer: "NousResearch/Llama-2-7b-hf"
 model:
   activation_function: silu
   attn_backend: null
@@ -18,7 +18,7 @@ model:
   num_heads: 32
   num_kv_heads: 8
   num_layers: 32
-  reference_checkpoint: meta-llama/Llama-2-7b-hf
+  reference_checkpoint: NousResearch/Llama-2-7b-hf
   rope:
     factor: 1.0
     theta: 10000

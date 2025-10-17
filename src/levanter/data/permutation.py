@@ -1,7 +1,11 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Optional, Sequence
 
 import jax.random
 from async_lru import alru_cache
+from jaxtyping import PRNGKeyArray
 
 from levanter.data import AsyncDataset
 from levanter.data._prp import PermType, Permutation
@@ -13,7 +17,7 @@ class PermutationDataset(AsyncDataset[T_co]):
 
     # TODO: add epoch reshuffling
 
-    def __init__(self, dataset: AsyncDataset[T_co], key: jax.random.PRNGKey, perm_type: PermType = "feistel"):
+    def __init__(self, dataset: AsyncDataset[T_co], key: PRNGKeyArray, perm_type: PermType = "feistel"):
         super().__init__()
         self.dataset = dataset
         self.key = key

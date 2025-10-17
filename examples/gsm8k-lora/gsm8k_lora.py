@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 # Modified version of [alpaca.py] to use LoRA instead of full finetuning.
 import copy
 import logging
@@ -52,7 +55,7 @@ class TrainArgs:
     output_key: str = "answer"  # key in the dataset for the output
     mask_inputs: bool = True  # if True, mask out the input and prompt for loss calculation
 
-    model_name_or_path: str = "meta-llama/Llama-2-7b-hf"
+    model_name_or_path: str = "NousResearch/Llama-2-7b-hf"
     trust_remote_code: bool = False  # Trust remote code when loading from HuggingFace checkpoints.
 
     model_cache_dir: Optional[str] = None  # Path to cache the model. must be local.

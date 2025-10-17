@@ -54,7 +54,7 @@ You can also find us in the #levanter channel on the unofficial [Jax LLM Discord
 ## Getting Started
 
 Here is a small set of examples to get you started. For more information about the various configuration options,
-please see the [Getting Started](./docs/Getting-Started-Training.md) guide or the [In-Depth Configuration Guide](doc./reference/Configuration.md).
+please see the [Getting Started](./docs/Getting-Started-Training.md) guide or the [In-Depth Configuration Guide](docs/reference/Configuration.md).
 You can also use `--help` or poke around other configs to see all the options available to you.
 
 
@@ -72,9 +72,7 @@ pip install levanter
 or using the latest version from GitHub:
 
 ```bash
-git clone https://github.com/stanford-crfm/levanter.git
-cd levanter
-pip install -e .
+pip install git+https://github.com/stanford-crfm/levanter.git
 wandb login  # optional, we use wandb for logging
 ```
 
@@ -89,7 +87,6 @@ cd haliax
 pip install -e .
 cd ../levanter
 ```
-
 
 <!--levanter-installation-end-->
 
@@ -110,18 +107,18 @@ python -m levanter.main.train_lm --config_path config/gpt2_nano.yaml
 python -m levanter.main.train_lm --config_path gpt2_nano
 ```
 
-This will train a GPT2-nano model on the [WikiText-103](https://blog.einstein.ai/the-wikitext-long-term-dependency-language-modeling-dataset/) dataset.
+This will train a GPT2-nano model on the [WikiText-103](https://huggingface.co/datasets/Salesforce/wikitext) dataset.
 
-### Training a GPT2-small on your own data
+### Training a Llama-small on your own data
 
 You can also change the dataset by changing the `dataset` field in the config file.
 If your dataset is a [Hugging Face dataset](https://huggingface.co/docs/datasets/loading_datasets.html), you can use the `data.id` field to specify it:
 
 ```bash
-python -m levanter.main.train_lm --config_path config/gpt2_small.yaml --data.id openwebtext
+python -m levanter.main.train_lm --config_path config/llama_small_fast.yaml --data.id openwebtext
 
 # optionally, you may specify a tokenizer and/or a cache directory, which may be local or on gcs
-python -m levanter.main.train_lm --config_path config/gpt2_small.yaml --data.id openwebtext --data.tokenizer "EleutherAI/gpt-neox-20b" --data.cache_dir "gs://path/to/cache/dir"
+python -m levanter.main.train_lm --config_path config/llama_small_fast.yaml --data.id openwebtext --data.tokenizer "NousResearch/Llama-2-7b-hf" --data.cache_dir "gs://path/to/cache/dir"
 ```
 
 If instead your data is a list of URLs, you can use the `data.train_urls` and `data.validation_urls` fields to specify them.
@@ -129,13 +126,13 @@ Data URLS can be local files, gcs files, or http(s) URLs, or anything that [fssp
 Levanter (really, fsspec) will automatically uncompress `.gz` and `.zstd` files, and probably other formats too.
 
 ```bash
-python -m levanter.main.train_lm --config_path config/gpt2_small.yaml --data.train_urls ["https://path/to/train/data_*.jsonl.gz"] --data.validation_urls ["https://path/to/val/data_*.jsonl.gz"]
+python -m levanter.main.train_lm --config_path config/llama_small_fast.yaml --data.train_urls ["https://path/to/train/data_*.jsonl.gz"] --data.validation_urls ["https://path/to/val/data_*.jsonl.gz"]
 ```
 
 ### Customizing a Config File
 
 You can modify the config file to change the model, the dataset, the training parameters, and more. Here's
-the `gpt2_small.yaml` file:
+the `llama_small_fast.yaml` file:
 
 ```yaml
 data:
@@ -145,18 +142,19 @@ data:
       - "gs://pubmed-mosaic/openwebtext-sharded/openwebtext_val.{1..8}-of-8.jsonl.gz"
   cache_dir: "gs://pubmed-mosaic/tokenized/openwebtext/"
 model:
-  gpt2:
-    hidden_dim: 768
-    num_heads: 12
-    num_layers: 12
-    seq_len: 1024
-    gradient_checkpointing: true
-    scale_attn_by_inverse_layer_idx: true
+  type: llama
+  hidden_dim: 768
+  intermediate_dim: 2048
+  num_heads: 12
+  num_kv_heads: 12
+  num_layers: 12
+  seq_len: 1024
+  gradient_checkpointing: true
 trainer:
   tracker:
     type: wandb
     project: "levanter"
-    tags: [ "openwebtext", "gpt2"]
+    tags: [ "openwebtext", "llama" ]
 
   mp: p=f32,c=bfloat16
   model_axis_size: 1

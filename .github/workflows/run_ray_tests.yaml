@@ -3,26 +3,26 @@ name: Run tests that use ray
 on: [push]
 
 jobs:
-  build:
+  ray_tests:
 
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10"]
-        jax-version: ["0.4.38"]
+        python-version: ["3.11"]
 
     steps:
-      - uses: actions/checkout@v3
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v6
         with:
+          version: "0.7.20"
           python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install
       - name: Install dependencies
+        run: uv sync --dev
+      - name: Test with pytest
         run: |
-          python -m pip install --upgrade pip
-          pip install flake8 pytest
-          pip install .[test] "jax[cpu]==${{ matrix.jax-version }}" "jaxlib==${{ matrix.jax-version }}"
-          pip install soundfile librosa
-      - name: Run ray tests with pytest
-        run: |
-          PYTHONPATH=$(pwd)/tests:$(pwd)/src:$(pwd):. pytest tests -m ray
+          PYTHONPATH=tests:src:. uv run pytest tests -m "ray" --durations=20
+

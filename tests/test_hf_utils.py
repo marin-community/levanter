@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 
 from fsspec import AbstractFileSystem
@@ -27,9 +30,9 @@ def test_load_tokenizer_in_memory_fs():
     assert len(tokenizer) == 5027
 
 
-@skip_if_hf_model_not_accessible("meta-llama/Llama-2-7b-hf")
+@skip_if_hf_model_not_accessible("NousResearch/Llama-2-7b-hf")
 def test_byte_length_of_token():
-    tok = load_tokenizer("meta-llama/Llama-2-7b-hf")
+    tok = load_tokenizer("NousResearch/Llama-2-7b-hf")
     ids = tok("this is hello a test", add_special_tokens=False)["input_ids"]
     assert byte_length_of_token(tok, ids[2]) == len(" hello".encode("utf-8"))
     assert byte_length_of_token(tok, 25) == 1
@@ -66,9 +69,9 @@ def test_byte_length_of_token():
         assert byte_length == expected_length, f"Token {i} has length {byte_length} but expected {expected_length}"
 
 
-@skip_if_hf_model_not_accessible("meta-llama/Llama-2-7b-hf")
+@skip_if_hf_model_not_accessible("NousResearch/Llama-2-7b-hf")
 def test_byte_length_of_token_multi():
-    tok = load_tokenizer("meta-llama/Llama-2-7b-hf")
+    tok = load_tokenizer("NousResearch/Llama-2-7b-hf")
     multi_checks = [
         "👍你好",
     ]

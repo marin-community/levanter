@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import logging
 import os
 import typing
@@ -16,7 +19,7 @@ from levanter.checkpoint import load_checkpoint
 from levanter.compat.hf_checkpoints import HFCheckpointConverter
 from levanter.data import DataLoader
 from levanter.data.text import LMMixtureDatasetConfig, SingleDatasetLMConfigBase
-from levanter.models.gpt2 import Gpt2Config
+from levanter.models.llama import LlamaConfig
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
 from levanter.models.loss import next_token_loss
 from levanter.trainer import TrainerConfig
@@ -34,7 +37,7 @@ class VizLmConfig:
     path: str = "logprobs.html"
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
     data: SingleDatasetLMConfigBase | LMMixtureDatasetConfig = field(default_factory=SingleDatasetLMConfigBase)
-    model: LmConfig = field(default_factory=Gpt2Config)
+    model: LmConfig = field(default_factory=LlamaConfig)
 
     num_docs: int = 32
 
@@ -62,7 +65,7 @@ def main(config: VizLmConfig):
     compute_axis_mapping = config.trainer.compute_axis_mapping
     parameter_axis_mapping = config.trainer.parameter_axis_mapping
 
-    with config.trainer.device_mesh, hax.axis_mapping(parameter_axis_mapping):
+    with config.trainer.use_device_mesh(), hax.axis_mapping(parameter_axis_mapping):
         key = jax.random.PRNGKey(0)
 
         vocab_size = len(tokenizer)

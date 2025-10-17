@@ -1,3 +1,6 @@
+# Copyright 2025 The Levanter Authors
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -17,7 +20,7 @@ from levanter.utils.jax_utils import leaf_key_paths
 
 
 @OptimizerConfig.register_subclass("scion")
-@dataclass
+@dataclass(frozen=True)
 class ScionConfig(OptimizerConfig):
     """
     Scion optimizer configuration

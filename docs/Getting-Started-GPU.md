@@ -4,75 +4,23 @@
 !!! note
     We only test on Ampere GPUs (e.g., A100s or 30xx series). If it works with JAX, it should work, though. We have done limited testing on H100 GPUs, but we do not have regular access to them.
 
+!!! tip "Deterministic Training"
+    If you want fully deterministic results when training on GPU, set `XLA_FLAGS="--xla_gpu_deterministic_ops=true"` in your environment before launching Levanter.
+
 We have two installation options for Levanter:
 
-1. [Using a Virtual Environment](#using-a-virtual-environment): This is the simplest way if you don't have root access to your machine (and don't have rootless docker installed).
+1. [Using `uv` Virtual Environments](#using-uv-virtual-environments): This is the simplest way if you don't have root access to your machine (and don't have rootless docker installed).
 2. [Using a Docker Container](#using-a-docker-container): This is the best way to achieve the fastest training speeds, because the Docker container has [TransformerEngine](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/index.html), and Levanter uses TransformerEngine's FusedAttention implementation to accelerate training.
 
-## Using a Virtual Environment
-
-### TL;DR
-
-```bash
-virtualenv -p python3.10 levanter
-source levanter/bin/activate
-pip install --upgrade "jax[cuda12]"
-git clone https://github.com/stanford-crfm/levanter.git
-cd levanter
-pip install -e .
-```
-
-### Step 1: Setting up a Virtual Environment
-
-We recommend using a virtual environment to install Levanter.
-You can use either `virtualenv` or `conda` to create a virtual environment.
-
-#### Setting up a Virtualenv
-
-Here are the steps for creating a virtual environment with `virtualenv`
-
-```bash
-virtualenv -p python3.10 levanter
-source levanter/bin/activate
-```
-
-#### Setting up a Conda Environment
-
-```bash
-conda create --name levanter python=3.10 pip
-conda activate levanter
-```
-### Step 2: Install JAX with CUDA
-
-Please refer to the [JAX Installation Guide](https://docs.jax.dev/en/latest/installation.html#nvidia-gpu). Below is one option that works as of 2025-03.
-
-```bash
-pip install --upgrade "jax[cuda12]"
-```
-
-### Step 3: Install Levanter
-
-You can install Levanter either from PyPI or from source. We recommend installing from source.
-
-
-#### Install from Source
+## Using `uv` Virtual Environments
 
 ```bash
 git clone https://github.com/stanford-crfm/levanter.git
 cd levanter
-pip install -e .
+uv run --extra gpu <command>
 ```
 
-#### Install from PyPI
-
-!!! note
-    This package is frequently out of date, so we recommend installing from source.
-
-```bash
-pip install levanter
-```
-
-### Step 4: WandB Login
+### WandB Login
 
 By default, Levanter logs training runs to Weights and Biases. You can sign up for a free WandB account at https://wandb.ai/site.
 
@@ -81,7 +29,7 @@ You can obtain an API token from [Weights and Biases](https://wandb.ai/authorize
 To use WandB, you can log in to your WandB account on the command line as follows:
 
 ```bash
-wandb login ${YOUR TOKEN HERE}
+uv run wandb login ${YOUR TOKEN HERE}
 ```
 
 For more information on getting set up with Weights and Biases, visit https://wandb.ai/site.
@@ -89,7 +37,7 @@ For more information on getting set up with Weights and Biases, visit https://wa
 If you do not want to use WandB, you can disable it by running:
 
 ```bash
-wandb offline
+uv run wandb offline
 ```
 
 #### Using a Different Tracker
@@ -138,7 +86,7 @@ Then, you can run training commands from within your Docker container as follows
 
 ```bash
 python -m levanter.main.train_lm \
-    --config_path /opt/levanter/config/gpt2_small.yaml
+    --config_path /opt/levanter/config/llama_small_fast.yaml
 ```
 
 #### Running a Job in a Docker Container
@@ -150,7 +98,7 @@ sudo docker run \
     --shm-size=16g \
     -i ghcr.io/nvidia/jax:levanter \
     python -m levanter.main.train_lm \
-    --config_path /opt/levanter/config/gpt2_small.yaml
+    --config_path /opt/levanter/config/llama_small_fast.yaml
 ```
 
 For more information on how to train models in Levanter, see our [User Guide](Getting-Started-Training.md).
@@ -185,7 +133,7 @@ Now, you should be able to run training jobs in this container using the version
 
 ```bash
 python src/levanter/main/train_lm.py \
-    --config_path config/gpt2_small.yaml
+    --config_path config/llama_small_fast.yaml
 ```
 
 
@@ -203,7 +151,7 @@ Here are some examples of running a job.
 ### Running a job locally
 
 ```bash
-python -m levanter.main.train_lm --config config/gpt2_small
+python -m levanter.main.train_lm --config config/llama_small_fast
 ```
 
 ### Running a job on Slurm
@@ -214,7 +162,7 @@ Here's a simple example of running a job on a single node. This example assumes 
 and are in the root directory of the repository.
 
 ```bash
-srun --account=nlp --cpus-per-task=128 --gpus-per-node=8 --job-name=levanter-multi-1 --mem=1000G  --open-mode=append --partition=sphinx --time=14-0 infra/run-slurm.sh python src/levanter/main/train_lm.py --config_path config/gpt2_small.yaml
+srun --account=nlp --cpus-per-task=128 --gpus-per-node=8 --job-name=levanter-multi-1 --mem=1000G  --open-mode=append --partition=sphinx --time=14-0 infra/run-slurm.sh python src/levanter/main/train_lm.py --config_path config/llama_small_fast.yaml
 ```
 
 #### Single Node: One Process Per GPU
@@ -238,7 +186,7 @@ export PATH=$(echo $PATH | sed 's|:/usr/local/cuda/bin||')
 ## Activate your virtual environment
 source levanter/bin/activate
 
-srun python -m levanter.main.train_lm --config config/gpt2_small_fast --trainer.per_device_parallelism -1
+srun python -m levanter.main.train_lm --config config/llama_small_fast --trainer.per_device_parallelism -1
 ```
 
 Then, submit the job with sbatch:
