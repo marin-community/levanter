@@ -7,7 +7,7 @@ import logging
 import os
 import struct
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Iterable
 
 import fsspec
 import humanfriendly
@@ -39,6 +39,9 @@ _SAFETENSOR_DTYPE_MAP: Dict[str, np.dtype] = {
 
 ShardingFunction = Callable[[Tuple[int, ...]], Optional[jax.sharding.Sharding]]
 
+DEFAULT_CHUNK_SIZE_BYTES = int(os.environ.get("LEVANTER_FSSPEC_CHUNK_BYTES", 2 * 1024**3))
+MAX_CONCURRENT_CHUNKS = int(os.environ.get("LEVANTER_FSSPEC_MAX_CONCURRENT_CHUNKS", "4"))
+
 
 @dataclass(frozen=True)
 class TensorRecord:
@@ -48,105 +51,6 @@ class TensorRecord:
     file_path: str
     byte_start: int
     byte_end: int
-    fs: AsyncFileSystem
-
-    async def get_slice(self, index) -> np.ndarray:
-        """Fetch the requested slice, coalescing to a single contiguous range read."""
-
-        if not isinstance(index, tuple):
-            index = (index,)
-
-        if Ellipsis in index:
-            if index.count(Ellipsis) > 1:
-                raise IndexError("only a single ellipsis is allowed in indexing")
-            ellipsis_pos = index.index(Ellipsis)
-            remaining = len(self.shape) - (len(index) - 1)
-            index = index[:ellipsis_pos] + (slice(None),) * remaining + index[ellipsis_pos + 1 :]
-
-        if len(index) < len(self.shape):
-            index = index + (slice(None),) * (len(self.shape) - len(index))
-
-        if len(index) != len(self.shape):
-            raise IndexError(f"too many indices for tensor of dimension {len(self.shape)}")
-
-        axis_entries: List[np.ndarray] = []
-        axis_kinds: List[str] = []
-        zero_extent = False
-
-        for dim, idx in zip(self.shape, index):
-            if isinstance(idx, slice):
-                start, stop, step = idx.indices(dim)
-                if step == 0:
-                    raise ValueError("slice step cannot be zero")
-                if step < 0:
-                    raise NotImplementedError("negative slice steps are not supported")
-
-                length = 0 if stop <= start else (stop - start + (step - 1)) // step
-                if length == 0:
-                    zero_extent = True
-
-                axis_entries.append(np.arange(start, start + length * step, step, dtype=np.int64))
-                axis_kinds.append("slice")
-            elif isinstance(idx, (int, np.integer)):
-                pos = int(idx)
-                if pos < 0:
-                    pos += dim
-                if pos < 0 or pos >= dim:
-                    raise IndexError(f"index {idx} is out of bounds for axis with size {dim}")
-                axis_entries.append(np.array([pos], dtype=np.int64))
-                axis_kinds.append("index")
-            else:
-                raise TypeError(f"Unsupported index type: {type(idx)}")
-
-        if zero_extent:
-            output_shape = tuple(len(arr) for arr, kind in zip(axis_entries, axis_kinds) if kind == "slice")
-            return np.empty(output_shape, dtype=self.dtype)
-
-        if not axis_entries:
-            raw = await self.fs._cat_file(self.file_path, start=self.byte_start, end=self.byte_end)
-            return np.frombuffer(raw, dtype=self.dtype, count=1).reshape(())
-
-        strides: List[int] = []
-        stride = 1
-        for dim in reversed(self.shape):
-            strides.append(stride)
-            stride *= dim
-        strides.reverse()
-
-        mesh = np.meshgrid(*axis_entries, indexing="ij", sparse=False)
-        linear_indices = np.zeros(mesh[0].shape, dtype=np.int64)
-        for coord, stride_val in zip(mesh, strides):
-            linear_indices += coord * stride_val
-
-        flat_indices = linear_indices.ravel()
-        min_index = int(flat_indices.min())
-        max_index = int(flat_indices.max())
-
-        byte_start = self.byte_start + min_index * self.dtype.itemsize
-        byte_end = self.byte_start + (max_index + 1) * self.dtype.itemsize
-
-        raw = await self.fs._cat_file(self.file_path, start=byte_start, end=byte_end)
-        buffer = np.frombuffer(raw, dtype=self.dtype)
-
-        offsets = flat_indices - min_index
-        gathered = buffer.take(offsets)
-        result = gathered.reshape(linear_indices.shape)
-
-        for axis, kind in reversed(list(enumerate(axis_kinds))):
-            if kind == "index":
-                result = np.take(result, indices=0, axis=axis)
-
-        return np.asarray(result, dtype=self.dtype, copy=False)
-
-    async def read(self) -> np.ndarray:
-        """Fetch the full tensor."""
-
-        raw = await self.fs._cat_file(self.file_path, start=self.byte_start, end=self.byte_end)
-        array = np.frombuffer(raw, dtype=self.dtype)
-        if self.shape:
-            return array.reshape(self.shape)
-        else:
-            return array.reshape(())
 
 
 class _AsyncifyingFileSystemWrapper(AsyncFileSystem):
@@ -173,6 +77,13 @@ class _AsyncifyingFileSystemWrapper(AsyncFileSystem):
         return await loop.run_in_executor(
             self._executor,
             lambda: self._fs.info(path, **kwargs),
+        )
+
+    async def _size(self, path):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            lambda: self._fs.size(path),
         )
 
 
@@ -206,67 +117,88 @@ async def _read_metadata_async(fs: AsyncFileSystem, path: str) -> Dict[str, Tens
             file_path=path,
             byte_start=data_offset_base + rel_start,
             byte_end=data_offset_base + rel_end,
-            fs=fs,
         )
 
     return tensors
 
 
-def _apply_dtype_override(array: np.ndarray, dtype_override: Optional[jnp.dtype]) -> np.ndarray:
-    if dtype_override is None:
-        return array
-    if np.issubdtype(array.dtype, np.floating):
-        return array.astype(np.dtype(dtype_override), copy=False)
-    return array
+@dataclass(frozen=True)
+class ChunkSpec:
+    file_path: str
+    byte_start: int
+    byte_end: int
+    tensors: Tuple[TensorRecord, ...]
+
+    @property
+    def size(self) -> int:
+        return self.byte_end - self.byte_start
 
 
-async def _materialize_unsharded_tensor(
-    record: TensorRecord,
-    dtype_override: Optional[jnp.dtype],
-) -> jax.Array:
-    array = await record.read()
-    array = _apply_dtype_override(array, dtype_override)
-    return jnp.asarray(array)
+def _build_chunks(tensors: Iterable[TensorRecord], chunk_limit: int) -> List[ChunkSpec]:
+    if chunk_limit <= 0:
+        raise ValueError("chunk_limit must be positive")
+
+    sorted_records = sorted(tensors, key=lambda t: (t.file_path, t.byte_start))
+    chunks: List[ChunkSpec] = []
+
+    current: List[TensorRecord] = []
+    current_start = 0
+    current_end = 0
+    current_path: Optional[str] = None
+
+    for record in sorted_records:
+        if not current:
+            current = [record]
+            current_start = record.byte_start
+            current_end = record.byte_end
+            current_path = record.file_path
+            continue
+
+        same_file = record.file_path == current_path
+        proposed_end = max(current_end, record.byte_end)
+        proposed_size = proposed_end - current_start
+
+        if (not same_file) or (proposed_size > chunk_limit):
+            chunks.append(
+                ChunkSpec(
+                    file_path=current_path or record.file_path,
+                    byte_start=current_start,
+                    byte_end=current_end,
+                    tensors=tuple(current),
+                )
+            )
+            current = [record]
+            current_start = record.byte_start
+            current_end = record.byte_end
+            current_path = record.file_path
+        else:
+            current.append(record)
+            current_end = proposed_end
+
+    if current:
+        chunks.append(
+            ChunkSpec(
+                file_path=current_path or sorted_records[-1].file_path,
+                byte_start=current_start,
+                byte_end=current_end,
+                tensors=tuple(current),
+            )
+        )
+
+    return chunks
 
 
-async def _materialize_sharded_tensor(
-    record: TensorRecord,
+def _materialize_sharded_tensor_from_host_array(
+    array: np.ndarray,
     sharding: jax.sharding.Sharding,
-    dtype_override: Optional[jnp.dtype],
 ) -> jax.Array:
-    indices_map = sharding.devices_indices_map(record.shape)
+    indices_map = sharding.devices_indices_map(array.shape)
     local_devices = sharding.addressable_devices
-
-    async def _fetch(device):
-        indices = tuple(indices_map[device])
-        tensor_slice = await record.get_slice(indices)
-        tensor_slice = _apply_dtype_override(tensor_slice, dtype_override)
-        return jax.device_put(tensor_slice, device)
-
-    per_device_arrays = await asyncio.gather(*(_fetch(device) for device in local_devices))
-    return jax.make_array_from_single_device_arrays(record.shape, sharding, per_device_arrays)
-
-
-def _bytes_to_read(record, sharding):
-    if sharding is None:
-        return record.dtype.itemsize * np.prod(record.shape)
-
-    indices_map = sharding.devices_indices_map(record.shape)
-    local_devices = sharding.addressable_devices
-
-    total_bytes = 0
+    per_device_arrays = []
     for device in local_devices:
         indices = tuple(indices_map[device])
-        # Calculate the number of elements in the slice
-        num_elements = 1
-        for idx, dim in zip(indices, record.shape):
-            if isinstance(idx, slice):
-                start, stop, step = idx.indices(dim)
-                length = 0 if stop <= start else (stop - start + (step - 1)) // step
-                num_elements *= length
-        total_bytes += num_elements * record.dtype.itemsize
-
-    return total_bytes
+        per_device_arrays.append(jax.device_put(array[indices], device))
+    return jax.make_array_from_single_device_arrays(array.shape, sharding, per_device_arrays)
 
 
 async def read_safetensors_fsspec(
@@ -274,25 +206,17 @@ async def read_safetensors_fsspec(
     *,
     dtype_override: Optional[jnp.dtype] = None,
     sharding_fn: Optional[ShardingFunction] = None,
-    fs: Optional[AsyncFileSystem] = None,
+    fs: Optional[AbstractFileSystem] = None,
 ) -> Dict[str, jax.Array]:
     """
     Stream tensors from a safetensors file using fsspec, optionally sharding the outputs.
-    In the future we could make this lazy, but for now we eagerly materialize everything, which is the only way
-    we use it currently.
-
-    Args:
-        path: The fsspec-compatible path to the safetensors file.
-        dtype_override: If provided, floating-point tensors will be cast to this dtype.
-        sharding_fn: An optional function that takes a tensor shape and returns a jax.sharding.Sharding
-            object to use for that tensor, or None for no sharding.
     """
 
-    if fs is None:
-        protocol, fs_path = fsspec.core.split_protocol(path)
-        if protocol is None:
-            protocol = "file"
+    protocol, fs_path = fsspec.core.split_protocol(path)
+    if protocol is None:
+        protocol = "file"
 
+    if fs is None:
         fs = fsspec.filesystem(protocol, asynchronous=True, anon=False)
 
     if isinstance(fs, AsyncFileSystem):
@@ -300,40 +224,67 @@ async def read_safetensors_fsspec(
     else:
         async_fs = _AsyncifyingFileSystemWrapper(fs)
 
-    async_tensors = await _read_metadata_async(async_fs, path)
+    records = await _read_metadata_async(async_fs, path)
+    chunk_specs = _build_chunks(records.values(), DEFAULT_CHUNK_SIZE_BYTES)
 
-    total_bytes_to_read = 0
-    for record in async_tensors.values():
-        sharding = sharding_fn(record.shape) if sharding_fn is not None else None
-        total_bytes_to_read += _bytes_to_read(record, sharding)
+    sharding_fn = sharding_fn or (lambda _: None)
+    sharding_map: Dict[str, Optional[jax.sharding.Sharding]] = {}
 
-    try:
-        info = await async_fs._info(path)
-        total_file_size = info.get("size", 0)
-    except Exception:
-        total_file_size = 0
+    for record in records.values():
+        sharding = sharding_fn(record.shape)
+        sharding_map[record.key] = sharding
 
-    human_readable_size = humanfriendly.format_size(total_bytes_to_read)
-    human_total = humanfriendly.format_size(total_file_size) if total_file_size else "unknown"
+    total_file_size = await async_fs._size(path)
+
+    human_total = humanfriendly.format_size(total_file_size)
     logger.info(
-        "Reading %d tensors from %s. Requesting %s (file size %s).",
-        len(async_tensors),
+        "Reading %d tensors from %s in %d chunk(s) (total size: %s)",
+        len(records),
         path,
-        human_readable_size,
+        len(chunk_specs),
         human_total,
     )
 
-    pbar = tqdm.tqdm(total=total_bytes_to_read, unit="B", unit_scale=True, desc=f"Reading {path}")
+    pbar = tqdm.tqdm(total=total_file_size, unit="B", unit_scale=True, desc=f"Reading {path}")
+    progress_lock = asyncio.Lock()
+    semaphore = asyncio.Semaphore(max(1, min(MAX_CONCURRENT_CHUNKS, len(chunk_specs))))
 
-    async def _materialize(key: str, record: TensorRecord):
-        sharding = sharding_fn(record.shape) if sharding_fn is not None else None
-        if sharding is not None:
-            array = await _materialize_sharded_tensor(record, sharding, dtype_override)
-        else:
-            array = await _materialize_unsharded_tensor(record, dtype_override)
-        pbar.update(_bytes_to_read(record, sharding))
-        return key, array
+    async def _materialize_chunk(chunk: ChunkSpec) -> Dict[str, jax.Array]:
+        async with semaphore:
+            raw = await async_fs._cat_file(chunk.file_path, start=chunk.byte_start, end=chunk.byte_end)
+            chunk_view = memoryview(raw)
+            chunk_results: Dict[str, jax.Array] = {}
 
-    tasks = [_materialize(key, record) for key, record in async_tensors.items()]
-    results = await asyncio.gather(*tasks)
-    return {key: value for key, value in results}
+            for record in chunk.tensors:
+                offset = record.byte_start - chunk.byte_start
+                count = int(np.prod(record.shape, dtype=int))
+                tensor_np = np.frombuffer(
+                    chunk_view,
+                    dtype=record.dtype,
+                    count=count,
+                    offset=offset,
+                ).reshape(record.shape)
+
+                if dtype_override is not None and np.issubdtype(tensor_np.dtype, np.floating):
+                    tensor_np = tensor_np.astype(np.dtype(dtype_override), copy=False)
+
+                sharding = sharding_map[record.key]
+                if sharding is not None:
+                    array = _materialize_sharded_tensor_from_host_array(tensor_np, sharding)
+                else:
+                    array = jnp.asarray(tensor_np)
+
+                chunk_results[record.key] = array
+
+            async with progress_lock:
+                pbar.update(chunk.size)
+
+            return chunk_results
+
+    chunk_dicts = await asyncio.gather(*(_materialize_chunk(chunk) for chunk in chunk_specs))
+    pbar.close()
+
+    result: Dict[str, jax.Array] = {}
+    for chunk_dict in chunk_dicts:
+        result.update(chunk_dict)
+    return result

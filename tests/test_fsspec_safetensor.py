@@ -7,7 +7,6 @@ import jax.numpy as jnp
 from fsspec.asyn import AsyncFileSystem
 from safetensors.numpy import load_file, save_file
 from levanter.compat.fsspec_safetensor import (
-    TensorRecord,
     read_safetensors_fsspec,
 )
 from levanter.compat.hf_checkpoints import HFCheckpointConverter
@@ -22,37 +21,6 @@ class _InMemoryAsyncFS(AsyncFileSystem):
         start = 0 if start is None else start
         end = len(self._payload) if end is None else end
         return self._payload[start:end]
-
-
-@pytest.mark.asyncio
-async def test_async_tensor_record_get_slice_handles_strides():
-    array = np.arange(24, dtype=np.float32).reshape(4, 6)
-    payload = array.tobytes()
-    fs = _InMemoryAsyncFS(payload)
-    record = TensorRecord(
-        key="foo",
-        dtype=array.dtype,
-        shape=array.shape,
-        file_path="mem://foo",
-        byte_start=0,
-        byte_end=len(payload),
-        fs=fs,
-    )
-
-    result = await record.get_slice((slice(1, 3), slice(2, 5)))
-    np.testing.assert_array_equal(result, array[1:3, 2:5])
-
-    stepped = await record.get_slice((Ellipsis, slice(None, None, 2)))
-    np.testing.assert_array_equal(stepped, array[:, ::2])
-
-    row_stepped = await record.get_slice((slice(None, None, 2), 3))
-    np.testing.assert_array_equal(row_stepped, array[::2, 3])
-
-    zero = await record.get_slice((slice(0, 0), slice(None)))
-    assert zero.shape == (0, array.shape[1])
-
-    with pytest.raises(NotImplementedError):
-        await record.get_slice((slice(None, None, -1), slice(None)))
 
 
 @pytest.mark.asyncio
@@ -87,7 +55,9 @@ def test_load_from_remote_file_url(tmp_path, monkeypatch):
 
     expected = load_file(str(path))
 
-    monkeypatch.setattr("levanter.compat.hf_checkpoints.best_effort_sharding", lambda shape: None)
+    # This monkeypatching offends me but fine
+
+    monkeypatch.setattr("levanter.compat.hf_checkpoints.best_effort_sharding", (lambda shape, mesh: None))
 
     def _jit_stub(fn, *args, **kwargs):
         def _wrapped(x):
@@ -122,7 +92,7 @@ def test_load_from_remote_file_url(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_dtype_override(tmp_path):
     data = {
-        "floaty": np.random.randn(2, 2).astype(np.float32),
+        "floaty": np.arange(start=0, stop=1, step=0.1, dtype=np.float32),
         "ints": np.arange(6, dtype=np.int32).reshape(2, 3),
     }
     path = tmp_path / "dtype.safetensors"
