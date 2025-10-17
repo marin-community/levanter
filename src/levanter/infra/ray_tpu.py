@@ -585,6 +585,7 @@ class SliceActor(ResourcePoolManager[TPUHostInfo]):
     def create_actor(self) -> ActorHandle:
         assert self._slice_info
         slice_name = self._slice_info.slice_name
+        logger.info(f"Slice actor requesting scheduling on TPU `{slice_name}`")
         return TPUHostActor.options(resources={slice_name: 1}, num_cpus=0.0).remote(self._slice_info)  # type: ignore
 
     def get_info(self) -> SliceInfo:

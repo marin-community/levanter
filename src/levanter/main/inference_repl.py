@@ -14,10 +14,15 @@ CLI Usage:
     uv run src/levanter/main/inference_repl.py --command=complete --args="The chicken liked to eat" --checkpoint=meta-llama/Llama-3.2-1B-Instruct
 """
 
+import os
+
+os.environ["JAX_DEBUG_LOG_MODULES"] = "jax._src.compiler,jax._src.lru_cache"
+os.environ["EQX_ON_ERROR"] = "nan"
+
+
 import asyncio
 import json
 import logging
-import os
 import shlex
 import time
 from dataclasses import dataclass, field
@@ -61,18 +66,7 @@ jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
-
-
-def weight_loader(server, server_config, current_model: LmHeadModel) -> LmHeadModel:
-    with use_cpu_device():
-        key = jrandom.PRNGKey(server_config.seed)
-        vocab_size = len(server.inference_context.tokenizer)
-        Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), server_config.trainer.param_axis_mapping)
-        model = eqx.filter_eval_shape(server_config.model.build, Vocab, key=key)
-        model = load_checkpoint(model, model, subpath="model")
-        model = server_config.trainer.mp.cast_to_compute(model)
-    return model
-
+jax.config.update("jax_explain_cache_misses", True)
 
 def _load_model(
     trainer_config: TrainerConfig,
@@ -125,7 +119,7 @@ def _load_model(
                 model_config.model_type,
                 ref=hf_checkpoint,
                 dtype=trainer_config.mp.compute_dtype,
-                axis_mapping=trainer_config.parameter_axis_mapping,
+                axis_mapping=trainer_config.compute_axis_mapping,
             )
             return model, tokenizer
 
@@ -139,26 +133,15 @@ class InferenceReplConfig:
 
     model: LmConfig
     tokenizer: str | None = None
+    n_generations: int = 1
 
     trainer: TrainerConfig = field(
         default_factory=lambda: TrainerConfig(
             model_axis_size=1,
             tensor_parallel_axes=["mlp", "kv_head"],
-            fsdp_axis="embed",
-            batch_axis="batch",
-            mp=jmp.get_policy("p=f32,c=f32"),
+            mp=jmp.get_policy("p=f32,c=bfloat16"),
         )
     )
-    # bad
-    #                 max_pages=32,
-    #                 max_seqs=2,
-    #                 page_size=8,
-    #                 max_pages_per_seq=8,
-    #                 max_queued_tokens=4,
-    #                 max_seqs_in_prefill=2,
-    #                 max_prefill_size=64,
-    #                 max_tokens_per_round=16,
-    #                 max_rounds=8,
     server: InferenceServerConfig = field(
         default_factory=lambda: InferenceServerConfig(
             service=InferenceEngineConfig(
@@ -175,9 +158,8 @@ class InferenceReplConfig:
     )
 
     # Generation parameters
-    temperature: float = 0.7
+    temperature: float = 1.0
     seed: int = 42
-    max_tokens: int = 64
 
     # CLI mode parameters
     command: Optional[str] = None
@@ -253,7 +235,14 @@ class ReplContext:
         if self.server is not None:
 
             def _reload(current_model: LmHeadModel) -> LmHeadModel:
-                return weight_loader(self.server, self.config.server, current_model)
+                with use_cpu_device():
+                    key = jrandom.PRNGKey(server_config.seed)
+                    vocab_size = len(server.inference_context.tokenizer)
+                    Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), server_config.trainer.param_axis_mapping)
+                    model = eqx.filter_eval_shape(server_config.model.build, Vocab, key=key)
+                    model = load_checkpoint(model, model, subpath="model")
+                    model = server_config.trainer.mp.cast_to_compute(model)
+                return model
 
             self.server.reload(_reload)
         else:
@@ -375,7 +364,6 @@ class ReplContext:
                 request = ChatCompletionRequest(
                     model=req_data.get("model", "<default model>"),
                     messages=messages,
-                    max_tokens=req_data.get("max_tokens", self.config.max_tokens),
                     temperature=req_data.get("temperature", self.config.server.temperature),
                     n=req_data.get("n", 1),
                     logprobs=req_data.get("logprobs", False),
@@ -416,7 +404,6 @@ class ReplContext:
         request = CompletionRequest(
             model=self.model_name or "model",
             prompt=prompt_text,
-            max_tokens=self.config.max_tokens,
             temperature=self.config.server.temperature,
         )
 
@@ -429,25 +416,24 @@ class ReplContext:
             loop.close()
 
     def _run_chat_completion(self, messages, print_response=True):
-        """Run async chat completion."""
         request = ChatCompletionRequest(
             model=self.model_name or "<default model>",
             messages=messages,
             stop=[self.server.inference_context.tokenizer.eos_token],
-            max_tokens=self.config.max_tokens,
             temperature=self.config.server.temperature,
+            n=self.config.n_generations,
         )
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            response = loop.run_until_complete(_create_chat_completion(self.server.inference_context, request))
-
-            if print_response:
+            for i in range(5):
+                response = loop.run_until_complete(_create_chat_completion(self.server.inference_context, request))
                 self._print_completion_response(response)
-            return response
         finally:
             loop.close()
+        
+        return response
 
     def _print_completion_response(self, response):
         """Pretty print completion response."""
@@ -571,8 +557,6 @@ def cli_mode(config: InferenceReplConfig, commands: ReplContext):
 def main(config: InferenceReplConfig):
     """Main entry point."""
     commands = ReplContext(config)
-    os.environ["EQX_ON_ERROR"] = "nan"
-
     # Determine mode
     if config.command:
         cli_mode(config, commands)

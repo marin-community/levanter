@@ -169,9 +169,9 @@ def auto_metric_from_name(name: str, value: float | jax.Array) -> Metric:
     elif any(ind in name_lower for ind in mean_indicators):
         reduction = ReductionType.MEAN
     else:
-        jax.debug.print(
-            f"Ambiguous metric name: {name}, defaulting to MEAN. Return an explicit Metric to avoid this message."
-        )
+        # jax.debug.print(
+        #     f"Ambiguous metric name: {name}, defaulting to MEAN. Return an explicit Metric to avoid this message."
+        # )
         reduction = ReductionType.MEAN
 
     return Metric.from_value(value, reduction)
