@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import abc
-import asyncio
 import contextlib
 import dataclasses
+import functools
 import json
 import logging
 import os
@@ -29,6 +29,7 @@ import safetensors
 import safetensors.numpy
 import transformers.utils.hub
 from fsspec import AbstractFileSystem
+from fsspec.asyn import get_loop, sync as fsspec_sync
 from haliax._src.state_dict import flatten_modules_for_export, to_state_dict
 from haliax.jax_utils import is_jax_array_like
 from haliax.state_dict import StateDict
@@ -47,6 +48,7 @@ from haliax.partitioning import ResourceMapping
 from haliax.state_dict import from_torch_compatible_state_dict, save_state_dict
 
 from levanter.callbacks import StepInfo
+from levanter.compat.fsspec_safetensor import read_safetensors_fsspec
 from levanter.models.asr_model import ASRMixin
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.utils.cloud_utils import temp_dir_before_upload
@@ -216,19 +218,17 @@ def _load_safe_tensors(path, dtype):
     return d
 
 
-def _sharded_load_tensorstore_async(path, dtype, fs: Optional[AbstractFileSystem] = None):
+def _sharded_load_tensorstore_async(path, dtype, fs):
     """Stream a safetensors shard from remote storage and return JAX arrays."""
 
-    from levanter.compat.fsspec_safetensor import read_safetensors_fsspec
+    from jax._src.mesh import get_concrete_mesh
 
-    return asyncio.run(
-        read_safetensors_fsspec(
-            path,
-            dtype_override=dtype,
-            fs=fs,
-            sharding_fn=best_effort_sharding,
-        )
-    )
+    mesh = get_concrete_mesh()
+
+    loop = get_loop()
+    bes = functools.partial(best_effort_sharding, mesh=mesh)
+
+    return fsspec_sync(loop, read_safetensors_fsspec, path, dtype_override=dtype, sharding_fn=bes, fs=fs)
 
 
 # NB: for large models this will be jitted several times (once for each unique subset of keys at least)
@@ -593,7 +593,7 @@ class HFCheckpointConverter(Generic[LevConfig]):
                 raise FileNotFoundError(f"Shard file {shard_path} not found")
 
             if loader is _load_safe_tensors:
-                shard_state_dict = _sharded_load_tensorstore_async(shard_path, dtype, fs=fs)
+                shard_state_dict = _sharded_load_tensorstore_async(shard_path, dtype, fs)
             else:
                 if not warned:
                     warnings.warn("Torch checkpoint loading will download the entire shard")

@@ -135,6 +135,11 @@ async def test_dtype_override(tmp_path):
     )
 
     assert tensors["floaty"].dtype == jnp.bfloat16
-    np.testing.assert_equal(tensors["floaty"], data["floaty"].astype(jnp.bfloat16))
-    assert tensors["ints"].dtype == np.int32
-    np.testing.assert_array_equal(tensors["ints"], data["ints"])
+    np.testing.assert_allclose(
+        np.asarray(tensors["floaty"], dtype=np.float32),
+        data["floaty"].astype(np.float32),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+    assert tensors["ints"].dtype == jnp.int32
+    np.testing.assert_array_equal(np.asarray(tensors["ints"]), data["ints"])

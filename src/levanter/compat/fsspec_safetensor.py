@@ -4,14 +4,17 @@
 import asyncio
 import json
 import logging
+import os
 import struct
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 import fsspec
+import humanfriendly
 import jax
 import jax.numpy as jnp
 import numpy as np
+import tqdm_loggable.auto as tqdm
 from fsspec import AbstractFileSystem
 from fsspec.asyn import AsyncFileSystem
 
@@ -154,13 +157,22 @@ class _AsyncifyingFileSystemWrapper(AsyncFileSystem):
         self._fs = fs
         import concurrent.futures
 
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        default_workers = min(64, max(8, (os.cpu_count() or 8) * 2))
+        max_workers = int(os.environ.get("LEVANTER_FSSPEC_MAX_WORKERS", default_workers))
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
 
     async def _cat_file(self, path: str, start: int | None = None, end: int | None = None, **kwargs) -> bytes:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self._executor,
             lambda: self._fs.cat_file(path, start=start, end=end, **kwargs),
+        )
+
+    async def _info(self, path, **kwargs):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            lambda: self._fs.info(path, **kwargs),
         )
 
 
@@ -235,12 +247,34 @@ async def _materialize_sharded_tensor(
     return jax.make_array_from_single_device_arrays(record.shape, sharding, per_device_arrays)
 
 
+def _bytes_to_read(record, sharding):
+    if sharding is None:
+        return record.dtype.itemsize * np.prod(record.shape)
+
+    indices_map = sharding.devices_indices_map(record.shape)
+    local_devices = sharding.addressable_devices
+
+    total_bytes = 0
+    for device in local_devices:
+        indices = tuple(indices_map[device])
+        # Calculate the number of elements in the slice
+        num_elements = 1
+        for idx, dim in zip(indices, record.shape):
+            if isinstance(idx, slice):
+                start, stop, step = idx.indices(dim)
+                length = 0 if stop <= start else (stop - start + (step - 1)) // step
+                num_elements *= length
+        total_bytes += num_elements * record.dtype.itemsize
+
+    return total_bytes
+
+
 async def read_safetensors_fsspec(
     path: str,
     *,
     dtype_override: Optional[jnp.dtype] = None,
-    fs: Optional[AbstractFileSystem] = None,
     sharding_fn: Optional[ShardingFunction] = None,
+    fs: Optional[AsyncFileSystem] = None,
 ) -> Dict[str, jax.Array]:
     """
     Stream tensors from a safetensors file using fsspec, optionally sharding the outputs.
@@ -250,17 +284,15 @@ async def read_safetensors_fsspec(
     Args:
         path: The fsspec-compatible path to the safetensors file.
         dtype_override: If provided, floating-point tensors will be cast to this dtype.
-        fs: An optional fsspec filesystem to use. If not provided, one will be created based on the path protocol.
         sharding_fn: An optional function that takes a tensor shape and returns a jax.sharding.Sharding
             object to use for that tensor, or None for no sharding.
     """
 
-    protocol, fs_path = fsspec.core.split_protocol(path)
-    if protocol is None:
-        protocol = "file"
-        fs_path = path
-
     if fs is None:
+        protocol, fs_path = fsspec.core.split_protocol(path)
+        if protocol is None:
+            protocol = "file"
+
         fs = fsspec.filesystem(protocol, asynchronous=True, anon=False)
 
     if isinstance(fs, AsyncFileSystem):
@@ -268,14 +300,38 @@ async def read_safetensors_fsspec(
     else:
         async_fs = _AsyncifyingFileSystemWrapper(fs)
 
-    target_path = fs_path if fs_path is not None else path
-    async_tensors = await _read_metadata_async(async_fs, target_path)
+    async_tensors = await _read_metadata_async(async_fs, path)
+
+    total_bytes_to_read = 0
+    for record in async_tensors.values():
+        sharding = sharding_fn(record.shape) if sharding_fn is not None else None
+        total_bytes_to_read += _bytes_to_read(record, sharding)
+
+    try:
+        info = await async_fs._info(path)
+        total_file_size = info.get("size", 0)
+    except Exception:
+        total_file_size = 0
+
+    human_readable_size = humanfriendly.format_size(total_bytes_to_read)
+    human_total = humanfriendly.format_size(total_file_size) if total_file_size else "unknown"
+    logger.info(
+        "Reading %d tensors from %s. Requesting %s (file size %s).",
+        len(async_tensors),
+        path,
+        human_readable_size,
+        human_total,
+    )
+
+    pbar = tqdm.tqdm(total=total_bytes_to_read, unit="B", unit_scale=True, desc=f"Reading {path}")
 
     async def _materialize(key: str, record: TensorRecord):
         sharding = sharding_fn(record.shape) if sharding_fn is not None else None
         if sharding is not None:
-            return key, await _materialize_sharded_tensor(record, sharding, dtype_override)
-        array = await _materialize_unsharded_tensor(record, dtype_override)
+            array = await _materialize_sharded_tensor(record, sharding, dtype_override)
+        else:
+            array = await _materialize_unsharded_tensor(record, dtype_override)
+        pbar.update(_bytes_to_read(record, sharding))
         return key, array
 
     tasks = [_materialize(key, record) for key, record in async_tensors.items()]
