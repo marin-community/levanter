@@ -144,9 +144,11 @@ class WatchCallback(JitCallback[S, M, dict[str, jax.Array | Histogram]]):
                     to_log.update(this_stats)
 
                     # log histograms of optimizer nu sums for linear layers
-                    if self.include_histogram and hasattr(v, "nu"):
-                        nu_stats = nu_dead_neuron_histograms(f"{name_to_log}/nu", v.nu, self.split_scan_layers)
+                    if self.include_histogram and name == "nu":
+                        nu_stats = nu_dead_neuron_histograms(f"{name_to_log}", v, self.split_scan_layers)
                         to_log.update(nu_stats)
+                    # else:
+                    #     raise ValueError(f"Optimizer state does not have 'nu' attribute for dead neuron histograms.")
 
         return to_log
 
