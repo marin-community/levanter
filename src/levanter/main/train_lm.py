@@ -23,7 +23,14 @@ import levanter.eval_harness
 from levanter import callbacks
 from levanter.checkpoint import load_checkpoint
 from levanter.compat.hf_checkpoints import HFCompatConfig, save_hf_checkpoint_callback
-from levanter.data.text import LMMixtureDatasetConfig, SingleDatasetLMConfig, UrlSingleDatasetLMConfig
+from levanter.data.text import (
+    LMMixtureDatasetConfig,
+    SingleDatasetLMConfig,
+    UrlSingleDatasetLMConfig,
+    SingleDatasetLMConfigBase,
+    ChatLmDatasetFormat,
+)
+from levanter.data.style_prefix import ensure_style_tokens
 from levanter.eval_harness import LmEvalHarnessConfig
 from levanter.models.llama import LlamaConfig
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, compute_next_token_loss
@@ -73,6 +80,39 @@ class TrainLmConfig:
 
 def main(config: TrainLmConfig):
     tokenizer = config.data.the_tokenizer
+
+    # Ensure any required special tokens (e.g., style prefix/suffix) are present
+    # before computing vocab size or building the model. This avoids OOV ids
+    # produced by preprocessors that add reserved tokens at caching time.
+    try:
+        data_cfg = config.data
+        # Single dataset case
+        if isinstance(data_cfg, SingleDatasetLMConfigBase):
+            fmt = data_cfg.format
+            if isinstance(fmt, ChatLmDatasetFormat) and fmt.style_prefix is not None:
+                req = [fmt.style_prefix.prefix_token]
+                if fmt.style_prefix.suffix_token is not None:
+                    req.append(fmt.style_prefix.suffix_token)
+                ensure_style_tokens(tokenizer, required_tokens=req)
+        # Mixture case
+        elif isinstance(data_cfg, LMMixtureDatasetConfig):
+            required: list[str] = []
+            for src in data_cfg.configs.values():
+                fmt = src.format
+                if isinstance(fmt, ChatLmDatasetFormat) and fmt.style_prefix is not None:
+                    if fmt.style_prefix.prefix_token not in required:
+                        required.append(fmt.style_prefix.prefix_token)
+                    if (
+                        fmt.style_prefix.suffix_token is not None
+                        and fmt.style_prefix.suffix_token not in required
+                    ):
+                        required.append(fmt.style_prefix.suffix_token)
+            if required:
+                ensure_style_tokens(tokenizer, required_tokens=required)
+    except Exception:
+        # Be defensive: token injection is a best-effort convenience.
+        # If anything goes wrong, continue with the original tokenizer.
+        pass
 
     # this is some unpleasant code to allow us to initialize from a hf checkpoint. If this is your first read through,
     # I recommend skipping it for now

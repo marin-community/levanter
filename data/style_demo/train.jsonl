@@ -1,0 +1,4 @@
+{"messages": [{"role": "system", "content": "style=wiki"}, {"role": "user", "content": "Who wrote the Odyssey?"}, {"role": "assistant", "content": "Homer wrote the Odyssey."}], "style": "wiki"}
+{"messages": [{"role": "system", "content": "style=books"}, {"role": "user", "content": "Recommend a fantasy series."}, {"role": "assistant", "content": "Try The Wheel of Time by Robert Jordan."}], "style": "books"}
+{"messages": [{"role": "system", "content": "style=news"}, {"role": "user", "content": "Summarize today's headlines."}, {"role": "assistant", "content": "Major markets rallied; new policies were announced."}], "style": "news"}
+{"messages": [{"role": "system", "content": "style=wiki"}, {"role": "user", "content": "What is photosynthesis?"}, {"role": "assistant", "content": "Photosynthesis converts light energy into chemical energy."}], "style": "wiki"}

@@ -421,6 +421,7 @@ def test_segment_ids_are_respected(impl):
     assert_trees_all_close(result.array[3:, 1], 0.0, atol=1e-3, rtol=1e-3)
 
 
+
 # TODO: fix flash attention for offsets
 @pytest.mark.parametrize("impl", ["vanilla"])
 def test_causal_offset_cross_attention(impl):

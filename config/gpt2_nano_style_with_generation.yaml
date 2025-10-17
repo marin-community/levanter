@@ -1,0 +1,48 @@
+model:
+  type: gpt2
+  seq_len: 256
+  hidden_dim: 256
+  num_layers: 4
+  num_heads: 4
+
+trainer:
+  num_train_steps: 20
+  per_device_parallelism: 1
+  train_batch_size: 2
+  steps_per_eval: 20
+
+optimizer:
+  type: adam
+  learning_rate: 1e-4
+
+data:
+  cache_dir: ./data/style_demo/cache
+  tokenizer: gpt2
+  format:
+    type: chat
+    single_turn: false
+    chat_template: |
+      {%- for message in messages -%}
+      {%- if message['role'] == 'assistant' -%}
+      {% generation %}assistant: {{ message['content'] }}
+      {% endgeneration %}
+      {%- elif message['role'] == 'user' -%}
+      user: {{ message['content'] }}
+      {%- elif message['role'] == 'system' -%}
+      system: {{ message['content'] }}
+      {%- else -%}
+      {{ message['role'] }}: {{ message['content'] }}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- if add_generation_prompt %}
+      {% generation %}assistant:
+      {% endgeneration %}
+      {%- endif %}
+    mask_user_turns: false
+    style_prefix:
+      prefix_token: "<style>"
+      suffix_token: "</style>"
+      style_field: "style"
+  train_urls:
+    - file://$PWD/data/style_demo/train.jsonl
+  validation_urls: []

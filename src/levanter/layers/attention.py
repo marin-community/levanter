@@ -530,6 +530,8 @@ def _te_flash_attention(
         fused_attn,  # noqa: F401
     )
 
+    # No special handling for prefix masks in NVTE fused attention in this branch scope.
+
     if logits_soft_cap is not None:
         raise NotImplementedError(
             "logits_soft_cap is not supported for NVTE fused attention. "
@@ -1204,6 +1206,8 @@ def _tpu_splash_attention(
         splash_attention_kernel,
         splash_attention_mask,
     )
+
+    # No special handling for prefix masks in splash attention in this branch scope.
 
     # Splash attention requires BHSD format
     # We need to reshape the input to match this format

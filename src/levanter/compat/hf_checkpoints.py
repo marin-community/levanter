@@ -49,6 +49,7 @@ from levanter.callbacks import StepInfo
 from levanter.models.asr_model import ASRMixin
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.utils import jax_utils
+from levanter.data.style_prefix import ensure_style_tokens
 from levanter.utils.cloud_utils import temp_dir_before_upload
 from levanter.utils.hf_utils import HfTokenizer
 from levanter.utils.jax_utils import best_effort_sharding, local_cpu_mesh, use_cpu_device, sync_global_devices
@@ -1061,9 +1062,17 @@ def save_hf_checkpoint_callback(
 def load_tokenizer(model_name_or_path, revision=None, local_cache_dir=None, trust_remote_code=True) -> HfTokenizer:
     """Like AutoTokenizer.from_pretrained, but works with gs:// paths or anything on fsspec"""
     with _patch_hf_hub_download():
-        return AutoTokenizer.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(
             model_name_or_path, revision=revision, cache_dir=local_cache_dir, trust_remote_code=trust_remote_code
         )
+
+        # Marin tokenizer (and derivatives) require reserved style tokens used by StylePrefixProcessor.
+        name_or_path = getattr(tokenizer, "name_or_path", "")
+        reference = str(model_name_or_path)
+        if "marin-community/marin" in reference or "marin-community/marin" in name_or_path:
+            ensure_style_tokens(tokenizer)
+
+        return tokenizer
 
 
 def load_processor(model_name_or_path, revision=None, local_cache_dir=None, trust_remote_code=True) -> ProcessorMixin:

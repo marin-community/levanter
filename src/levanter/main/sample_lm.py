@@ -112,7 +112,6 @@ def main(config: SampleLmConfig):
         vocab_size = len(tokenizer)
         Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), config.trainer.compute_axis_mapping)
         model = _load_model(config, Vocab, key=key)
-        assert isinstance(model, LlamaLMHeadModel), "Only LlamaLMHeadModel supported"
 
         prompts = config.prompts
 
