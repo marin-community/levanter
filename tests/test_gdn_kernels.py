@@ -174,12 +174,6 @@ def test_chunk_continuation_two_pass_equals_one_pass():
 
 def test_chunk_size_one_degenerates_to_recurrent_without_l2norm():
     """Degeneracy should also hold even when L2 norm is disabled."""
-    # TODO: fix edge case? although per original paper L2 norm is needed for stability
-
-    # Mismatched elements: 7 / 928 (0.754%)
-    # Max absolute difference among violations: 0.00071716
-    # Max relative difference among violations: 7.326038e-05
-    pytest.skip("not matching HF implementation")
 
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 2, 2, 29, 8, 8
@@ -520,9 +514,9 @@ def test_extreme_gates_no_nans_and_parity():
 def test_kernels_match_hf_without_l2norm():
     # TODO: fix edge case? although per original paper L2 norm is needed for stability
 
-    # Mismatched elements: 76 / 2736 (2.78%)
-    # Max absolute difference among violations: 296960.
-    # Max relative difference among violations: 0.00058013
+    # Mismatched elements: 10 / 2736 (0.365%)
+    # Max absolute difference among violations: 0.87597656
+    # Max relative difference among violations: 0.00238136
     pytest.skip("not matching HF implementation")
 
     import torch

@@ -438,7 +438,6 @@ def chunk_gated_delta_rule(
     k_cj = k_c.rename({C.name: Cj.name})  # [B,Nc,Cj,H,Dk]
 
     # Raw interactions scaled by β: -(βK) @ K^T  (per head)
-    # (negative sign matches the algebra in DeltaNet's UT derivation)
     A_raw = -hax.dot(kb_ci, k_cj, axis=Dk)  # [B,Nc,Ci,Cj,H]
 
     # Relative decay between positions i and j inside the chunk:
@@ -648,9 +647,11 @@ class GatedDeltaNet(eqx.Module):
         )
 
     def _fix_qkvz_ordering(
-        self, mixed_qkvz: NamedArray, mixed_ba: NamedArray
+        self,
+        mixed_qkvz: NamedArray,  # [B, Pos, qkvz]
+        mixed_ba: NamedArray,  # [B, Pos, 2*num_v_heads]
     ) -> Tuple[NamedArray, NamedArray, NamedArray, NamedArray, NamedArray, NamedArray]:
-        """Split packed projections into per-head tensors and align head layout.
+        """Split packed projections into per-head tensors and align head layout. (match HF version)
 
         Input shapes:
           mixed_qkvz: [B, Pos, 2*key_dim + 2*value_dim]  (Q|K|V|Z concatenated)
@@ -668,18 +669,18 @@ class GatedDeltaNet(eqx.Module):
         ratio = cfg.num_v_heads // cfg.num_k_heads
 
         per_head = Axis("per_head", 2 * cfg.head_k_dim + 2 * ratio * cfg.head_v_dim)
-        x = mixed_qkvz.unflatten_axis(cfg.mix_qkvz_axis, (cfg.KHeads, per_head))
+        x = mixed_qkvz.unflatten_axis("qkvz", (cfg.KHeads, per_head))
 
-        def sl(start, size, ax=per_head):
-            return hax.ds(start, Axis(ax.name, size))
+        def sl(start, size):
+            return hax.ds(start, size)
 
-        # Q | K | (V-chunk per K-head) | (Z-chunk per K-head)
+        # per-head order: [Q (dk)] [K (dk)] [V-chunk (ratio*dv)] [Z-chunk (ratio*dv)]
         q = x["per_head", sl(0, cfg.head_k_dim)].rename({"per_head": cfg.KHeadDim.name})
         k = x["per_head", sl(cfg.head_k_dim, cfg.head_k_dim)].rename({"per_head": cfg.KHeadDim.name})
         v_chunk = x["per_head", sl(2 * cfg.head_k_dim, ratio * cfg.head_v_dim)]
         z_chunk = x["per_head", sl(2 * cfg.head_k_dim + ratio * cfg.head_v_dim, ratio * cfg.head_v_dim)]
 
-        # (KHeads, per_head) → (VHeads, VHeadDim) by splitting per-head into (ratio, VHeadDim)
+        # (KHeads, ratio*dv) → (VHeads, VHeadDim)
         v = v_chunk.unflatten_axis(
             v_chunk.resolve_axis("per_head"), (Axis("v_group", ratio), cfg.VHeadDim)
         ).flatten_axes(("k_heads", "v_group"), cfg.VHeads)
@@ -687,9 +688,9 @@ class GatedDeltaNet(eqx.Module):
             z_chunk.resolve_axis("per_head"), (Axis("v_group", ratio), cfg.VHeadDim)
         ).flatten_axes(("k_heads", "v_group"), cfg.VHeads)
 
-        # b | a are per V-head; start from (KHeads, 2*ratio) then flatten to VHeads
+        # b | a are per V-head; shape path mirrors HF:
         per_ba = Axis("per_ba", 2 * ratio)
-        ba = mixed_ba.unflatten_axis(cfg.ba_axis, (cfg.KHeads, per_ba))
+        ba = mixed_ba.unflatten_axis("ba", (cfg.KHeads, per_ba))
         b_chunk = ba["per_ba", hax.ds(0, ratio)]
         a_chunk = ba["per_ba", hax.ds(ratio, ratio)]
         b = b_chunk.flatten_axes(("k_heads", "per_ba"), cfg.VHeads)
@@ -722,8 +723,6 @@ class GatedDeltaNet(eqx.Module):
           new_state (optional): (conv_state, S_state) if inference=True
         """
         cfg = self.config
-        Batch = x.resolve_axis("batch")
-        Pos = x.resolve_axis("position")
 
         # Zero out padding tokens early so they don't affect conv or states.
         if attention_mask is not None:
@@ -731,18 +730,19 @@ class GatedDeltaNet(eqx.Module):
             x = x * m3
 
         # 1) Project to [Q|K|V|Z] and [b|a]
-        mixed_qkvz = self.in_proj_qkvz(x)
-        mixed_ba = self.in_proj_ba(x)
+        mixed_qkvz = self.in_proj_qkvz(x)  # [B, Pos, qkvz=2*key_dim + 2*value_dim]
+        mixed_ba = self.in_proj_ba(x)  # [B, Pos, ba=2*num_v_heads]
+
+        # 1b) Re-group like HF for parity (also used for conv channel ordering)
         q, k, v, z, b, a = self._fix_qkvz_ordering(mixed_qkvz, mixed_ba)
 
         # 2) Depthwise causal conv over concatenated [Q|K|V] channels
-        Chan = "channels"
-        q_ch = q.flatten_axes((cfg.KHeads, cfg.KHeadDim), Axis(Chan, cfg.key_dim))
-        k_ch = k.flatten_axes((cfg.KHeads, cfg.KHeadDim), Axis(Chan, cfg.key_dim))
-        v_ch = v.flatten_axes((cfg.VHeads, cfg.VHeadDim), Axis(Chan, cfg.value_dim))
-        Channels = Axis(Chan, cfg.key_dim * 2 + cfg.value_dim)
-        qkv_ch = hax.concatenate(Chan, [q_ch, k_ch, v_ch])  # [B, Pos, Channels]
-        qkv_ncl = hax.rearrange(qkv_ch, (Batch, Channels, Pos)).array  # (N, C, L)
+        #    HF orders channels as: [Q_flat | K_flat | V_flat] (no Z).
+        q_ch = q.flatten_axes((cfg.KHeads, cfg.KHeadDim), Axis("channels", cfg.key_dim))
+        k_ch = k.flatten_axes((cfg.KHeads, cfg.KHeadDim), Axis("channels", cfg.key_dim))
+        v_ch = v.flatten_axes((cfg.VHeads, cfg.VHeadDim), Axis("channels", cfg.value_dim))
+        qkv_ch = hax.concatenate("channels", [q_ch, k_ch, v_ch])  # [B, Pos, channels]
+        qkv_ncl = hax.rearrange(qkv_ch, ("batch", "channels", "position")).array  # (N, C, L)
 
         S_state: Optional[jnp.ndarray] = None
         if decode_state is not None and x.axis_size("position") == 1:
@@ -757,7 +757,7 @@ class GatedDeltaNet(eqx.Module):
             # Prefill/train: full causal conv over the sequence
             y_ncl = _causal_depthwise_conv1d_full(qkv_ncl, self.conv_weight, self.conv_bias)
             if inference:
-                # Save the rightmost K samples of channels as the next conv_state
+                # cache the rightmost K samples of channels as the next conv_state
                 K = self.conv_weight.shape[-1]
                 L = x.axis_size("position")
                 if L >= K:
@@ -768,18 +768,14 @@ class GatedDeltaNet(eqx.Module):
                 new_conv_state = None
                 S_state = None
 
-        # Unpack [Q|K|V] after conv back to per-head tensors
-        y_bpc = hax.rearrange(hax.named(y_ncl, (Batch.name, Channels.name, Pos.name)), (Batch, Pos, Channels))
-        q_y = y_bpc[Channels.name, hax.ds(0, Axis("chan_k2", cfg.key_dim))].rename({Channels.name: "chan_k2"})
-        k_y = y_bpc[Channels.name, hax.ds(cfg.key_dim, Axis("chan_k2", cfg.key_dim))].rename(
-            {Channels.name: "chan_k2"}
-        )
-        v_y = y_bpc[Channels.name, hax.ds(2 * cfg.key_dim, Axis("chan_v2", cfg.value_dim))].rename(
-            {Channels.name: "chan_v2"}
-        )
-        q = q_y.unflatten_axis(q_y.resolve_axis("chan_k2"), (cfg.KHeads, cfg.KHeadDim))
-        k = k_y.unflatten_axis(k_y.resolve_axis("chan_k2"), (cfg.KHeads, cfg.KHeadDim))
-        v = v_y.unflatten_axis(v_y.resolve_axis("chan_v2"), (cfg.VHeads, cfg.VHeadDim))
+        # Unpack [Q|K|V] after conv back to per-head tensors (mirror the same channel order)
+        y_bpc = hax.rearrange(hax.named(y_ncl, ("batch", "channels", "position")), ("batch", "position", "channels"))
+        q_y = y_bpc["channels", hax.ds(0, cfg.key_dim)]
+        k_y = y_bpc["channels", hax.ds(cfg.key_dim, cfg.key_dim)]
+        v_y = y_bpc["channels", hax.ds(2 * cfg.key_dim, cfg.value_dim)]
+        q = q_y.unflatten_axis("channels", (cfg.KHeads, cfg.KHeadDim))
+        k = k_y.unflatten_axis("channels", (cfg.KHeads, cfg.KHeadDim))
+        v = v_y.unflatten_axis("channels", (cfg.VHeads, cfg.VHeadDim))
 
         # 3) Gates: β via sigmoid(b); α via g = -exp(A) * softplus(a + dt_bias), α=exp(g)
         beta = hnn.sigmoid(b)
@@ -799,7 +795,7 @@ class GatedDeltaNet(eqx.Module):
             q = q.rename({cfg.KHeads.name: cfg.VHeads.name})
             k = k.rename({cfg.KHeads.name: cfg.VHeads.name})
 
-        # 4) Core kernels expect [batch, position, heads, dim] with axis name "heads"
+        # 4) Kernels expect [batch, position, heads, dim] with axis name "heads"
         q_h = q.rename({cfg.VHeads.name: "heads"})
         k_h = k.rename({cfg.VHeads.name: "heads"})
         v_h = v.rename({cfg.VHeads.name: "heads"})
@@ -832,7 +828,7 @@ class GatedDeltaNet(eqx.Module):
                 g_h,
                 b_h,
                 chunk_size=chunk_size,
-                initial_state=None,  # optional: could feed S_state if continuing
+                initial_state=None,  # could feed S_state if continuing
                 output_final_state=inference,  # return S_T for caching if inference
                 use_qk_l2norm_in_kernel=True,
             )
