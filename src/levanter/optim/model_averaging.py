@@ -10,7 +10,6 @@ import equinox as eqx
 import jax.numpy as jnp
 import optax
 
-
 S = TypeVar("S")
 M = TypeVar("M")
 
@@ -50,7 +49,7 @@ class EmaModelAveraging(ModelAveraging[M]):
 
 
 class EmaDecaySqrtModelAveraging(ModelAveraging[M]):
-    """Hybrid EMA followed by :math:`1 - \sqrt{x}` decay.
+    """Hybrid EMA followed by :math:`1 - \\sqrt{x}` decay.
 
     This implementation keeps a running total of the weight mass so the
     average can be queried at any step. After ``decay_steps`` updates the

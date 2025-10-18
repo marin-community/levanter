@@ -19,12 +19,43 @@ import os
 os.environ["JAX_DEBUG_LOG_MODULES"] = "jax._src.compiler,jax._src.lru_cache"
 os.environ["EQX_ON_ERROR"] = "nan"
 
+import jax
+
+# TRACK HOST CALLBACKS TO IDENTIFY CACHE KILLERS
+_original_io_callback = jax.experimental.io_callback
+_original_pure_callback = jax.pure_callback
+_original_debug_print = jax.debug.print
+
+def _tracked_io_callback(callback_fn, result_shape_dtypes, *args, **kwargs):
+    """Track io_callback invocations with full traceback"""
+    tb = ''.join(traceback.format_stack())
+    print(tb)
+    return _original_io_callback(callback_fn, result_shape_dtypes, *args, **kwargs)
+
+def _tracked_pure_callback(callback_fn, result_shape_dtypes, *args, **kwargs):
+    """Track pure_callback invocations"""
+    tb = ''.join(traceback.format_stack())
+    print(tb)
+    return _original_pure_callback(callback_fn, result_shape_dtypes, *args, **kwargs)
+
+def _tracked_debug_print(fmt, *args, **kwargs):
+    """Track jax.debug.print invocations"""
+    tb = ''.join(traceback.format_stack())
+    print(tb)
+    pass
+
+jax.pure_callback = _tracked_pure_callback
+jax.experimental.io_callback = _tracked_io_callback
+jax.debug.print = _tracked_debug_print
+
 
 import asyncio
 import json
 import logging
 import shlex
 import time
+import traceback
+import unittest.mock as mock
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Optional
@@ -67,6 +98,7 @@ jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
 jax.config.update("jax_explain_cache_misses", True)
+
 
 def _load_model(
     trainer_config: TrainerConfig,
@@ -427,9 +459,8 @@ class ReplContext:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            for i in range(5):
-                response = loop.run_until_complete(_create_chat_completion(self.server.inference_context, request))
-                self._print_completion_response(response)
+            response = loop.run_until_complete(_create_chat_completion(self.server.inference_context, request))
+            self._print_completion_response(response)
         finally:
             loop.close()
         
