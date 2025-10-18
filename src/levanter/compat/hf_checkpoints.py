@@ -23,10 +23,9 @@ import huggingface_hub
 import humanfriendly
 import jax
 import jax.numpy as jnp
+from jax._src.mesh import get_concrete_mesh
 import mergedeep
 import numpy as np
-import safetensors
-import safetensors.numpy
 import transformers.utils.hub
 from fsspec import AbstractFileSystem
 from fsspec.asyn import get_loop, sync as fsspec_sync
@@ -191,11 +190,32 @@ KEYS_TO_COPY_FROM_BASE_CONFIG = {
 }
 
 
-def _load_torch(path, dtype):
-    import torch
+def _load_torch(path, dtype, fs: AbstractFileSystem | None = None):
+    import torch  # noqa: F401
 
     device = torch.device("cpu")
-    state_dict = torch.load(path, map_location=device)
+    with contextlib.ExitStack() as stack:
+        load_path = path
+        if fs is not None:
+            protocol = getattr(fs, "protocol", None)
+            if isinstance(protocol, (list, tuple, set)):
+                protocols = protocol
+            else:
+                protocols = (protocol,)
+            if not any(p in ("file", "", None) for p in protocols):
+                tmp = stack.enter_context(tempfile.NamedTemporaryFile())
+                fs.get(path, tmp.name)
+                load_path = tmp.name
+                if not getattr(_load_torch, "_warned_download", False):
+                    warnings.warn("Torch checkpoint loading requires downloading shards locally")
+                    _load_torch._warned_download = True  # type: ignore[attr-defined]
+            else:
+                try:
+                    load_path = fs._strip_protocol(path)  # type: ignore[attr-defined]
+                except AttributeError:
+                    load_path = path
+
+        state_dict = torch.load(load_path, map_location=device)
     d = {}
 
     for k, v in tqdm(state_dict.items(), total=len(state_dict), desc="Loading weights"):
@@ -207,21 +227,16 @@ def _load_torch(path, dtype):
     return d
 
 
-def _load_safe_tensors(path, dtype):
-    d = {}
-    with safetensors.safe_open(path, framework="np", device="cpu") as f:
-        keys = list(f.keys())
-        for key in tqdm(keys, total=len(keys), desc="Loading weights"):
-            tensor_slice = f.get_slice(key)
-            d[key] = _shard_best_effort(tensor_slice, dtype)
-
-    return d
-
-
-def _sharded_load_tensorstore_async(path, dtype, fs):
+def _load_safe_tensors(path, dtype, fs: AbstractFileSystem | None = None):
     """Stream a safetensors shard from remote storage and return JAX arrays."""
-
-    from jax._src.mesh import get_concrete_mesh
+    if fs is None:
+        fs, stripped = fsspec.core.url_to_fs(path, asynchronous=True)
+        path = stripped
+    else:
+        try:
+            path = fs._strip_protocol(path)  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
 
     mesh = get_concrete_mesh()
 
@@ -554,7 +569,6 @@ class HFCheckpointConverter(Generic[LevConfig]):
             shard_files = list(dict.fromkeys(index["weight_map"].values()))
             final_state_dict = {}
 
-            # right now we do safe tensors thing
             # where we load into memory then update some dict
             if "safetensors" in index_file:
                 loader = _load_safe_tensors
@@ -585,24 +599,16 @@ class HFCheckpointConverter(Generic[LevConfig]):
         if not shard_files:
             raise FileNotFoundError(f"No HF-ish checkpoint files found in {url}")
 
-        warned = False
-
         for shard_file in shard_files:
             shard_path = os.path.join(path, shard_file)
             if not fs.exists(shard_path):
                 raise FileNotFoundError(f"Shard file {shard_path} not found")
 
             if loader is _load_safe_tensors:
-                shard_state_dict = _sharded_load_tensorstore_async(shard_path, dtype, fs)
+                shard_state_dict = _load_safe_tensors(shard_path, dtype, fs=fs)
             else:
-                if not warned:
-                    warnings.warn("Torch checkpoint loading will download the entire shard")
-                    warned = True
-
-                with tempfile.NamedTemporaryFile() as tmp:
-                    fs.get(shard_path, tmp.name)
-                    assert loader is not None
-                    shard_state_dict = loader(tmp.name, dtype)
+                assert loader is not None
+                shard_state_dict = _load_torch(shard_path, dtype, fs=fs)
 
             final_state_dict.update(shard_state_dict)
 
