@@ -19,7 +19,7 @@ from levanter.optim.config import OptimizerConfig
 from levanter.optim.util import map_flattened_linear_layers
 from levanter.utils.jax_utils import leaf_key_paths
 from levanter.optim.adamh import scale_by_adamh
-
+from levanter.optim.muon import zeropower_via_newtonschulz5
 
 @OptimizerConfig.register_subclass("muonH")
 @dataclass(frozen=True)
@@ -189,37 +189,3 @@ def scale_with_muonh(momentum=0.95, nesterov=True, steps=5, muon_eps=1e-8, learn
         return muonh_updates, ScaleByMuonHState(momentum_buffer=buf)
 
     return optax.GradientTransformation(init_fn, update_fn)
-
-
-def zeropower_via_newtonschulz5(X, steps=5, eps=1e-7):
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G.
-    """
-    chex.assert_rank(X, 2)
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X /= jnp.linalg.norm(X) + eps  # Ensure top singular value <= 1
-    transpose = False
-    # assert X.shape[0] <= X.shape[1], "X should have more columns than rows for this implementation."
-    # TODO: we should be smarter and also transpose if they're ~the same and X is already sharded along first axis
-    if X.shape[0] > X.shape[1]:
-        X = X.T
-        transpose = True
-
-    # TODO: because most things are in fact scan layers [L, m, n] (we vmap L)
-    # it would be smarter to shard the layers so that basically each device gets its own layer
-    # This doesn't quite optimally use the compute because there are usually more devices than layers, so we should
-    # really do something even fancier.
-    # It would be even smarter to stack similar layers together, but that would require more even more work
-    # Let's call this good enough until we think it's not good enough
-    if not jax.sharding.get_abstract_mesh().empty:
-        X = jax.lax.with_sharding_constraint(X, PartitionSpec(None, ("data", "model")))
-
-    for i in range(steps):
-        A = X @ X.T
-        # doesn't seem to be necessary, so leaving it out. When I used inspect_sharding it was a problem, but I dunno
-        # A = jax.lax.with_sharding_constraint(A, PartitionSpec(None, None))  # ensure it's desharded
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-    if transpose:
-        X = X.T
-    return X
