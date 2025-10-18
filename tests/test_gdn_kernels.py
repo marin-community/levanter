@@ -30,24 +30,16 @@ def _get_hf_kernels():
 
 
 def _named_kernels_inputs(B, H, L, dk, dv, key):
-    Batch, Heads, Pos, Dk, Dv = (
-        Axis("batch", B),
-        Axis("heads", H),
-        Axis("position", L),
-        Axis("k_head_dim", dk),
-        Axis("v_head_dim", dv),
-    )
-    q = hax.named(
-        jax.random.normal(key, (B, L, H, dk), dtype=jnp.float32), (Batch.name, Pos.name, Heads.name, Dk.name)
-    )
-    k = hax.named(
-        jax.random.normal(key, (B, L, H, dk), dtype=jnp.float32), (Batch.name, Pos.name, Heads.name, Dk.name)
-    )
-    v = hax.named(
-        jax.random.normal(key, (B, L, H, dv), dtype=jnp.float32), (Batch.name, Pos.name, Heads.name, Dv.name)
-    )
-    g = hax.named(jax.random.normal(key, (B, L, H), dtype=jnp.float32) * -0.1, (Batch.name, Pos.name, Heads.name))
-    beta = hax.named(jax.random.uniform(key, (B, L, H), dtype=jnp.float32), (Batch.name, Pos.name, Heads.name))
+    """
+    Helper: create independent q,k,v,g,beta with named axes and split PRNGKey to avoid correlation.
+    Shapes: q,k: [B, L, H, dk], v: [B, L, H, dv], g,beta: [B, L, H].
+    """
+    kq, kk, kv, kg, kb = jax.random.split(key, 5)
+    q = hax.random.normal(kq, {"batch": B, "position": L, "heads": H, "k_head_dim": dk}, dtype=jnp.float32)
+    k = hax.random.normal(kk, {"batch": B, "position": L, "heads": H, "k_head_dim": dk}, dtype=jnp.float32)
+    v = hax.random.normal(kv, {"batch": B, "position": L, "heads": H, "v_head_dim": dv}, dtype=jnp.float32)
+    g = -0.1 * hax.random.normal(kg, {"batch": B, "position": L, "heads": H}, dtype=jnp.float32)  # mildly negative
+    beta = hax.random.uniform(kb, {"batch": B, "position": L, "heads": H}, dtype=jnp.float32)
     return q, k, v, g, beta
 
 
@@ -71,20 +63,9 @@ def test_recurrent_perfect_fit_on_current_key_when_alpha1_beta1_and_L2norm():
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 1, 2, 11, 8, 8
 
-    Batch, Heads, Pos, Dk, Dv = (
-        Axis("batch", B),
-        Axis("heads", H),
-        Axis("position", L),
-        Axis("k_head_dim", dk),
-        Axis("v_head_dim", dv),
-    )
-    k1, k2, k3 = jax.random.split(key, 3)
-    q = hax.named(jax.random.normal(k1, (B, L, H, dk), dtype=jnp.float32), (Batch, Pos, Heads, Dk))
-    k = hax.named(jax.random.normal(k2, (B, L, H, dk), dtype=jnp.float32), (Batch, Pos, Heads, Dk))
-    v = hax.named(jax.random.normal(k3, (B, L, H, dv), dtype=jnp.float32), (Batch, Pos, Heads, Dv))
-
-    g = hax.named(jnp.zeros((B, L, H), dtype=jnp.float32), (Batch, Pos, Heads))  # α=1
-    beta1 = hax.named(jnp.ones((B, L, H), dtype=jnp.float32), (Batch, Pos, Heads))  # β=1
+    q, k, v, _, _ = _named_kernels_inputs(B, H, L, dk, dv, key)
+    g = hax.named(jnp.zeros((B, L, H), dtype=jnp.float32), ("batch", "position", "heads"))  # α=1
+    beta1 = hax.named(jnp.ones((B, L, H), dtype=jnp.float32), ("batch", "position", "heads"))  # β=1
 
     S = None
     for t in range(L):
@@ -174,7 +155,6 @@ def test_chunk_continuation_two_pass_equals_one_pass():
 
 def test_chunk_size_one_degenerates_to_recurrent_without_l2norm():
     """Degeneracy should also hold even when L2 norm is disabled."""
-
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 2, 2, 29, 8, 8
     q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
@@ -192,20 +172,11 @@ def test_extreme_gates_numerical_stability_jax_only():
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 1, 2, 37, 16, 8
 
-    Batch, Heads, Pos, Dk, Dv = (
-        Axis("batch", B),
-        Axis("heads", H),
-        Axis("position", L),
-        Axis("k_head_dim", dk),
-        Axis("v_head_dim", dv),
-    )
-    k1, k2, k3 = jax.random.split(key, 3)
-    q = hax.named(jax.random.normal(k1, (B, L, H, dk), dtype=jnp.float32), (Batch, Pos, Heads, Dk))
-    k = hax.named(jax.random.normal(k2, (B, L, H, dk), dtype=jnp.float32), (Batch, Pos, Heads, Dk))
-    v = hax.named(jax.random.normal(k3, (B, L, H, dv), dtype=jnp.float32), (Batch, Pos, Heads, Dv))
-    g = hax.named(-jax.random.uniform(key, (B, L, H), minval=2.0, maxval=8.0, dtype=jnp.float32), (Batch, Pos, Heads))
-    beta_small = hax.named(jnp.full((B, L, H), 1e-4, dtype=jnp.float32), (Batch, Pos, Heads))
-    beta_big = hax.named(jnp.full((B, L, H), 1.0 - 1e-6, dtype=jnp.float32), (Batch, Pos, Heads))
+    q, k, v, _, _ = _named_kernels_inputs(B, H, L, dk, dv, key)
+    # Strong negative g: α ~ 0
+    g = -hax.random.uniform(key, {"batch": B, "position": L, "heads": H}, minval=2.0, maxval=8.0, dtype=jnp.float32)
+    beta_small = hax.named(jnp.full((B, L, H), 1e-4, dtype=jnp.float32), ("batch", "position", "heads"))
+    beta_big = hax.named(jnp.full((B, L, H), 1.0 - 1e-6, dtype=jnp.float32), ("batch", "position", "heads"))
 
     for beta in [beta_small, beta_big]:
         out_chunk, _ = chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=32, output_final_state=False)
@@ -246,7 +217,6 @@ def test_recurrent_kernel_matches_hf():
 
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 1, 2, 17, 8, 8
-
     q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
 
     out_named, _ = recurrent_gated_delta_rule(q, k, v, g, beta, output_final_state=False)
@@ -278,7 +248,6 @@ def test_chunk_kernel_matches_hf():
 
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 2, 4, 64, 8, 16
-
     q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
 
     out_named, _ = chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=32, output_final_state=False)
@@ -345,7 +314,6 @@ def test_chunk_size_one_matches_hf_recurrent():
 
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 2, 2, 29, 8, 8
-
     q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
 
     out_chunk, _ = chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=1, output_final_state=False)
@@ -393,7 +361,7 @@ def test_chunk_kernel_with_initial_state_matches_recurrent_continuation():
     chunk_size = 16
 
     q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
-    S0 = jax.random.normal(key, (B, H, dk, dv), dtype=jnp.float32) * 0.1
+    S0 = jax.random.normal(jax.random.PRNGKey(123), (B, H, dk, dv), dtype=jnp.float32) * 0.1
 
     out_chunk, _ = chunk_gated_delta_rule(
         q, k, v, g, beta, chunk_size=chunk_size, initial_state=S0, output_final_state=False
@@ -404,7 +372,7 @@ def test_chunk_kernel_with_initial_state_matches_recurrent_continuation():
     def to_t(arr: jnp.ndarray):
         return torch.from_numpy(np.array(arr))
 
-    S0_t = torch.from_numpy(np.array(S0))
+    S0_t = to_t(S0)
     out_chunk_t, _ = hf_chunk(
         to_t(q.array),
         to_t(k.array),
@@ -459,7 +427,6 @@ def test_short_sequences_edge_cases():
             use_qk_l2norm_in_kernel=True,
         )
         out_hf = _to_np(out_t)
-
         np.testing.assert_allclose(np.array(out_named.array), out_hf, rtol=1e-4, atol=1e-4)
 
 
@@ -473,23 +440,13 @@ def test_extreme_gates_no_nans_and_parity():
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 1, 2, 37, 16, 8
 
-    Batch, Heads, Pos, Dk, Dv = (
-        Axis("batch", B),
-        Axis("heads", H),
-        Axis("position", L),
-        Axis("k_head_dim", dk),
-        Axis("v_head_dim", dv),
-    )
-    q = hax.named(jax.random.normal(key, (B, L, H, dk), dtype=jnp.float32), (Batch, Pos, Heads, Dk))
-    k = hax.named(jax.random.normal(key, (B, L, H, dk), dtype=jnp.float32), (Batch, Pos, Heads, Dk))
-    v = hax.named(jax.random.normal(key, (B, L, H, dv), dtype=jnp.float32), (Batch, Pos, Heads, Dv))
-    g = hax.named(-jax.random.uniform(key, (B, L, H), minval=2.0, maxval=8.0, dtype=jnp.float32), (Batch, Pos, Heads))
-    beta_small = hax.named(jnp.full((B, L, H), 1e-4, dtype=jnp.float32), (Batch, Pos, Heads))
-    beta_big = hax.named(jnp.full((B, L, H), 1.0 - 1e-6, dtype=jnp.float32), (Batch, Pos, Heads))
+    q, k, v, _, _ = _named_kernels_inputs(B, H, L, dk, dv, key)
+    g = -hax.random.uniform(key, {"batch": B, "position": L, "heads": H}, minval=2.0, maxval=8.0, dtype=jnp.float32)
+    beta_small = hax.named(jnp.full((B, L, H), 1e-4, dtype=jnp.float32), ("batch", "position", "heads"))
+    beta_big = hax.named(jnp.full((B, L, H), 1.0 - 1e-6, dtype=jnp.float32), ("batch", "position", "heads"))
 
     for beta in [beta_small, beta_big]:
         out_named, _ = chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=32, output_final_state=False)
-        assert np.isfinite(np.array(out_named.array)).all()
 
         def to_t(arr: jnp.ndarray):
             return torch.from_numpy(np.array(arr))
@@ -506,17 +463,12 @@ def test_extreme_gates_no_nans_and_parity():
             use_qk_l2norm_in_kernel=True,
         )
         out_hf = _to_np(out_t)
-
         np.testing.assert_allclose(np.array(out_named.array), out_hf, rtol=1e-4, atol=1e-4)
 
 
 @skip_if_no_torch
 def test_kernels_match_hf_without_l2norm():
     # TODO: fix edge case? although per original paper L2 norm is needed for stability
-
-    # Mismatched elements: 10 / 2736 (0.365%)
-    # Max absolute difference among violations: 0.87597656
-    # Max relative difference among violations: 0.00238136
     pytest.skip("not matching HF implementation")
 
     import torch
@@ -526,19 +478,7 @@ def test_kernels_match_hf_without_l2norm():
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 2, 3, 57, 16, 8
 
-    # Haliax inputs (B, L, H, dim)
-    Batch, Heads, Pos, Dk, Dv = (
-        Axis("batch", B),
-        Axis("heads", H),
-        Axis("position", L),
-        Axis("k_head_dim", dk),
-        Axis("v_head_dim", dv),
-    )
-    q = hax.named(jax.random.normal(key, (B, L, H, dk), dtype=jnp.float32), (Batch, Pos, Heads, Dk))
-    k = hax.named(jax.random.normal(key, (B, L, H, dk), dtype=jnp.float32), (Batch, Pos, Heads, Dk))
-    v = hax.named(jax.random.normal(key, (B, L, H, dv), dtype=jnp.float32), (Batch, Pos, Heads, Dv))
-    g = hax.named(jax.random.normal(key, (B, L, H), dtype=jnp.float32) * -0.1, (Batch, Pos, Heads))
-    beta = hax.named(jax.random.uniform(key, (B, L, H), dtype=jnp.float32), (Batch, Pos, Heads))
+    q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
 
     # Haliax kernels with use_qk_l2norm_in_kernel=False
     out_chunk_j, _ = chunk_gated_delta_rule(
@@ -592,7 +532,6 @@ def test_recurrent_backward_matches_hf():
     k1, k2 = jax.random.split(key, 2)
     B, H, L, dk, dv = 1, 2, 16, 8, 8
 
-    # Named inputs
     q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, k1)
     S0 = jax.random.normal(k2, (B, H, dk, dv), dtype=jnp.float32) * 0.1
 

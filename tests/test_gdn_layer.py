@@ -1,7 +1,6 @@
 # Copyright 2025 The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
-import dataclasses
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -77,60 +76,28 @@ def _init_small_lev_layer(hidden_size=128, nk=4, nv=8, dk=8, dv=8, ksz=4, key=ja
     return cfg, layer
 
 
-def _assign_linear_weight(named_linear, np_weight, out_axis, in_axis):
-    """
-    Haliax Linear stores weight as NamedArray with axes (Out, In).
-    """
-    w_named = hax.named(np_weight, (out_axis.name, in_axis.name))
-    return dataclasses.replace(named_linear, weight=w_named)
-
-
-def _load_hf_weights_into_lev(lev_layer: GatedDeltaNet, hf_layer) -> GatedDeltaNet:
-    """
-    Load weights from HF layer into Levanter layer (avoid module-level transformers imports).
-    """
-    cfg = lev_layer.config
-    # in_proj_qkvz
-    w_qkvz = hf_layer.in_proj_qkvz.weight.detach().cpu().numpy()  # [proj, hidden]
-    lev_layer = dataclasses.replace(
-        lev_layer,
-        in_proj_qkvz=_assign_linear_weight(lev_layer.in_proj_qkvz, w_qkvz, cfg.mix_qkvz_axis, cfg.Embed),
-    )
-    # in_proj_ba
+def _lev_state_from_hf_layer(lev_cfg: GatedDeltaNetConfig, hf_layer) -> dict[str, jnp.ndarray]:
+    w_qkvz = hf_layer.in_proj_qkvz.weight.detach().cpu().numpy()
     w_ba = hf_layer.in_proj_ba.weight.detach().cpu().numpy()
-    lev_layer = dataclasses.replace(
-        lev_layer,
-        in_proj_ba=_assign_linear_weight(lev_layer.in_proj_ba, w_ba, cfg.ba_axis, cfg.Embed),
-    )
-    # conv weight (C,1,K) in HF -> (C,K) here
-    conv_w = hf_layer.conv1d.weight.detach().cpu().numpy().squeeze(1)  # (C, K)
-    lev_layer = dataclasses.replace(lev_layer, conv_weight=conv_w.astype(np.float32))
-    # A_log, dt_bias
-    lev_layer = dataclasses.replace(
-        lev_layer,
-        A_log=hf_layer.A_log.detach().cpu().numpy().astype(np.float32),
-        dt_bias=hf_layer.dt_bias.detach().cpu().numpy().astype(np.float32),
-    )
-    # o_norm weight
-    w_norm = hf_layer.norm.weight.detach().cpu().numpy()  # [v_head_dim]
-    lev_layer = dataclasses.replace(
-        lev_layer, o_norm=dataclasses.replace(lev_layer.o_norm, weight=hax.named(w_norm, (cfg.VHeadDim.name,)))
-    )
-    # out_proj
-    w_out = hf_layer.out_proj.weight.detach().cpu().numpy().astype(np.float32)  # [hidden, value_dim]
-    hidden = cfg.Embed.size
-    value_dim = cfg.value_dim
+    conv_w = hf_layer.conv1d.weight.detach().cpu().numpy().squeeze(1).astype(np.float32)
+    A_log = hf_layer.A_log.detach().cpu().numpy().astype(np.float32)
+    dt_bias = hf_layer.dt_bias.detach().cpu().numpy().astype(np.float32)
+    w_norm = hf_layer.norm.weight.detach().cpu().numpy().astype(np.float32)
+    w_out = hf_layer.out_proj.weight.detach().cpu().numpy().astype(np.float32)
+    hidden = lev_cfg.Embed.size
+    value_dim = lev_cfg.value_dim
     assert w_out.shape == (hidden, value_dim)
-    w_out_3d = w_out.reshape(hidden, cfg.num_v_heads, cfg.head_v_dim)  # [embed, v_heads, v_head_dim]
+    w_out_3d = w_out.reshape(hidden, lev_cfg.num_v_heads, lev_cfg.head_v_dim)
 
-    lev_layer = dataclasses.replace(
-        lev_layer,
-        out_proj=dataclasses.replace(
-            lev_layer.out_proj,
-            weight=hax.named(w_out_3d, (cfg.Embed.name, cfg.VHeads.name, cfg.VHeadDim.name)),
-        ),
-    )
-    return lev_layer
+    return {
+        "in_proj_qkvz.weight": w_qkvz,
+        "in_proj_ba.weight": w_ba,
+        "conv_weight": conv_w,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "o_norm.weight": w_norm,
+        "out_proj.weight": w_out_3d,
+    }
 
 
 # -------------------------------
@@ -263,17 +230,15 @@ def test_layer_gradients_exist():
 def test_gdn_layer_matches_hf_prefill():
     import torch  # local import for environments without torch
 
-    # helper imports happen inside helper functions
-
     def _to_torch(x):
         return torch.from_numpy(np.array(x))
 
     hidden_size, nk, nv, dk, dv, ksz = 128, 4, 8, 8, 8, 4
     hf_cfg, hf_layer = _init_small_hf_layer(hidden_size, nk, nv, dk, dv, ksz)
-    lev_cfg, lev_layer = _init_small_lev_layer(hidden_size, nk, nv, dk, dv, ksz)
+    lev_cfg, _ = _init_small_lev_layer(hidden_size, nk, nv, dk, dv, ksz)
 
-    # copy HF weights into Levanter layer
-    lev_layer = _load_hf_weights_into_lev(lev_layer, hf_layer)
+    lev_state = _lev_state_from_hf_layer(lev_cfg, hf_layer)
+    lev_layer = GatedDeltaNet.from_state_dict(lev_cfg, lev_state, key=jax.random.PRNGKey(0))
 
     # random input
     B, L = 2, 64
@@ -286,14 +251,13 @@ def test_gdn_layer_matches_hf_prefill():
         qkvz = hf_layer.in_proj_qkvz(x_t)  # [B,L,qkvz]
         ba = hf_layer.in_proj_ba(x_t)  # [B,L,2*nv]
         q_t, k_t, v_t, z_t, b_t, a_t = hf_layer.fix_query_key_value_ordering(qkvz, ba)
-        # bring to numpy
         q_hf, k_hf, v_hf = map(_np, (q_t, k_t, v_t))
         b_hf, a_hf = map(_np, (b_t, a_t))
         z_hf = _np(z_t)
 
     q_lev, k_lev, v_lev, z_lev, b_lev, a_lev = lev_layer._fix_qkvz_ordering(
-        hax.named(qkvz.numpy(), ("batch", "position", "qkvz")),
-        hax.named(ba.numpy(), ("batch", "position", "ba")),
+        hax.named(qkvz.detach().cpu().numpy(), ("batch", "position", "qkvz")),
+        hax.named(ba.detach().cpu().numpy(), ("batch", "position", "ba")),
     )
 
     np.testing.assert_allclose(q_lev.array, q_hf, atol=1e-4, rtol=1e-4)
@@ -307,7 +271,6 @@ def test_gdn_layer_matches_hf_prefill():
     y_lev, _ = lev_layer(x_named, inference=True, chunk_size=32)
 
     # HF forward (prefill)
-    # Use torch CPU fallback path: by default `is_fast_path_available` will be False on CPU-only test envs.
     x_t = _to_torch(x_j)
     with torch.no_grad():
         y_hf = hf_layer(
@@ -316,7 +279,6 @@ def test_gdn_layer_matches_hf_prefill():
             cache_position=None,
             attention_mask=None,
         )
-        # hf_layer returns [B,L,H] torch tensor
         y_hf = y_hf.detach().cpu().numpy()
 
     np.testing.assert_allclose(np.array(y_lev.array), y_hf, rtol=1e-4, atol=1e-4)
@@ -341,10 +303,9 @@ def test_gdn_layer_decode_matches_hf_one_step():
         head_v_dim=dv,
         conv_kernel_size=ksz,
     )
-    lev_layer = GatedDeltaNet.init(lev_cfg, key=jax.random.PRNGKey(0))
 
-    # copy HF weights into Levanter layer
-    lev_layer = _load_hf_weights_into_lev(lev_layer, hf_layer)
+    lev_state = _lev_state_from_hf_layer(lev_cfg, hf_layer)
+    lev_layer = GatedDeltaNet.from_state_dict(lev_cfg, lev_state, key=jax.random.PRNGKey(0))
 
     B, L = 2, 37
     x_full = jax.random.normal(jax.random.PRNGKey(1), (B, L, hidden_size), dtype=jnp.float32)
@@ -365,15 +326,12 @@ def test_gdn_layer_decode_matches_hf_one_step():
     x_next_named = hax.named(np.array(x_next), ("batch", "position", "embed"))
     y_lev_step, new_state2 = lev_layer(x_next_named, inference=True, decode_state=(conv_state, S_state))
     assert new_state2 is not None, "expected state tuple for decode step"
-    conv_state2, S_state2 = new_state2
 
     # ---------- HF prefill with cache ----------
     cache = Qwen3NextDynamicCache(hf_cfg)
     with torch.no_grad():
         x_t = torch.from_numpy(np.array(x_full))
-        # cache_position not strictly used in the layer prefill; pass something sensible
         _ = hf_layer(hidden_states=x_t, cache_params=cache, cache_position=torch.arange(L))
-        # After prefill, cache must contain conv and recurrent states
         assert cache.conv_states[0] is not None and cache.recurrent_states[0] is not None
 
     # ---------- HF decode one token ----------
@@ -434,8 +392,9 @@ def test_ratio_equal_one_and_greater_than_one():
             head_v_dim=dv,
             conv_kernel_size=ksz,
         )
-        lev_layer = GatedDeltaNet.init(lev_cfg, key=jax.random.PRNGKey(0))
-        lev_layer = _load_hf_weights_into_lev(lev_layer, hf_layer)
+
+        lev_state = _lev_state_from_hf_layer(lev_cfg, hf_layer)
+        lev_layer = GatedDeltaNet.from_state_dict(lev_cfg, lev_state, key=jax.random.PRNGKey(0))
 
         B, L = 2, 64
         x_j = jax.random.normal(jax.random.PRNGKey(0), (B, L, hidden_size), dtype=jnp.float32)
@@ -464,8 +423,9 @@ def test_linear_mask_zeroes_padded_tokens_prefill():
         head_v_dim=dv,
         conv_kernel_size=ksz,
     )
-    lev_layer = GatedDeltaNet.init(lev_cfg, key=jax.random.PRNGKey(0))
-    lev_layer = _load_hf_weights_into_lev(lev_layer, hf_layer)
+
+    lev_state = _lev_state_from_hf_layer(lev_cfg, hf_layer)
+    lev_layer = GatedDeltaNet.from_state_dict(lev_cfg, lev_state, key=jax.random.PRNGKey(0))
 
     B, L_core, L_pad = 2, 16, 8
     x_core = jax.random.normal(jax.random.PRNGKey(0), (B, L_core, hidden_size), dtype=jnp.float32)

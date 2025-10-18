@@ -28,6 +28,7 @@ Follows the GDN implementation for Qwen3-Next. Notably most math is performed in
 from __future__ import annotations
 
 from dataclasses import dataclass
+import dataclasses
 from typing import Optional, Tuple
 
 import equinox as eqx
@@ -627,7 +628,7 @@ class GatedDeltaNet(eqx.Module):
         conv_bias = None
 
         # GDN discretization parameters (per V-head)
-        A_log = jnp.log(jax.random.uniform(k_out, (config.num_v_heads,), minval=0.0, maxval=16.0, dtype=jnp.float32))
+        A_log = jnp.log(jax.random.uniform(k_out, (config.num_v_heads,), minval=1e-6, maxval=16.0, dtype=jnp.float32))
         dt_bias = jnp.ones((config.num_v_heads,), dtype=jnp.float32)
 
         o_norm = GatedRmsNorm.init(config.VHeadDim, eps=config.rms_norm_eps)
@@ -847,3 +848,55 @@ class GatedDeltaNet(eqx.Module):
         if inference and (new_conv_state is not None) and (S_new is not None):
             new_state = (new_conv_state, S_new)
         return y_out, new_state
+
+    def to_state_dict(self) -> dict[str, jnp.ndarray]:
+        return {
+            "in_proj_qkvz.weight": jnp.array(self.in_proj_qkvz.weight.array),
+            "in_proj_ba.weight": jnp.array(self.in_proj_ba.weight.array),
+            "conv_weight": jnp.array(self.conv_weight),
+            "A_log": jnp.array(self.A_log),
+            "dt_bias": jnp.array(self.dt_bias),
+            "o_norm.weight": jnp.array(self.o_norm.weight.array),
+            "out_proj.weight": jnp.array(self.out_proj.weight.array),
+        }
+
+    def load_state_dict(self, state: dict[str, jnp.ndarray]) -> "GatedDeltaNet":
+        cfg = self.config
+
+        def _assign_linear_weight(named_linear: hnn.Linear, np_weight: jnp.ndarray, out_axis: Axis, in_axis: Axis):
+            w_named = hax.named(jnp.asarray(np_weight, dtype=jnp.float32), (out_axis.name, in_axis.name))
+            return dataclasses.replace(named_linear, weight=w_named)
+
+        new_in_proj_qkvz = _assign_linear_weight(
+            self.in_proj_qkvz, state["in_proj_qkvz.weight"], cfg.mix_qkvz_axis, cfg.Embed
+        )
+        new_in_proj_ba = _assign_linear_weight(self.in_proj_ba, state["in_proj_ba.weight"], cfg.ba_axis, cfg.Embed)
+        new_conv_weight = jnp.asarray(state["conv_weight"], dtype=jnp.float32)
+        new_A_log = jnp.asarray(state["A_log"], dtype=jnp.float32)
+        new_dt_bias = jnp.asarray(state["dt_bias"], dtype=jnp.float32)
+        new_o_norm = dataclasses.replace(
+            self.o_norm, weight=hax.named(jnp.asarray(state["o_norm.weight"], dtype=jnp.float32), (cfg.VHeadDim.name,))
+        )
+        out_w = jnp.asarray(state["out_proj.weight"], dtype=jnp.float32)  # (embed, v_heads, v_head_dim)
+        new_out_proj = dataclasses.replace(
+            self.out_proj, weight=hax.named(out_w, (cfg.Embed.name, cfg.VHeads.name, cfg.VHeadDim.name))
+        )
+
+        return dataclasses.replace(
+            self,
+            in_proj_qkvz=new_in_proj_qkvz,
+            in_proj_ba=new_in_proj_ba,
+            conv_weight=new_conv_weight,
+            A_log=new_A_log,
+            dt_bias=new_dt_bias,
+            o_norm=new_o_norm,
+            out_proj=new_out_proj,
+        )
+
+    @classmethod
+    def from_state_dict(cls, config: GatedDeltaNetConfig, state: dict[str, jnp.ndarray], *, key) -> "GatedDeltaNet":
+        """
+        Build a fresh layer from config + state dict.
+        """
+        layer = cls.init(config, key=key)
+        return layer.load_state_dict(state)
