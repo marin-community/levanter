@@ -61,9 +61,7 @@ class _AsyncifyingFileSystemWrapper(AsyncFileSystem):
         self._fs = fs
         import concurrent.futures
 
-        default_workers = min(64, max(8, (os.cpu_count() or 8) * 2))
-        max_workers = int(os.environ.get("LEVANTER_FSSPEC_MAX_WORKERS", default_workers))
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CHUNKS)
 
     async def _cat_file(self, path: str, start: int | None = None, end: int | None = None, **kwargs) -> bytes:
         loop = asyncio.get_running_loop()
