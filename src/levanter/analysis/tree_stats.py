@@ -110,7 +110,7 @@ def nu_dead_neuron_tracking(
     *,
     include_histograms: bool,
     split_scan_layers: bool = True,
-) -> dict[str, Histogram | jnp.array]:
+) -> dict[str, Histogram | jnp.ndarray]:
     """
     Compute stats and histograms of per-row and per-column gradient flow for Linear layers.
 
