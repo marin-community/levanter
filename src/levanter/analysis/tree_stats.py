@@ -4,6 +4,7 @@
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import optax
 
 import haliax
@@ -103,8 +104,15 @@ def summary_statistics_for_tree(
     return to_log
 
 
-def nu_dead_neuron_histograms(prefix: str, tree: Any, split_scan_layers: bool) -> dict[str, Histogram]:
-    """Compute histograms of per-row and per-column gradient flow for Linear layers.
+def nu_dead_neuron_tracking(
+    prefix: str,
+    tree: Any,
+    *,
+    include_histograms: bool,
+    split_scan_layers: bool = True,
+) -> dict[str, Histogram | jnp.array]:
+    """
+    Compute stats and histograms of per-row and per-column gradient flow for Linear layers.
 
     This looks at the optimizer second-moment (``nu``) values and sums over the
     input and output dimensions of each Linear layer. If either sum is nearly
@@ -113,14 +121,14 @@ def nu_dead_neuron_histograms(prefix: str, tree: Any, split_scan_layers: bool) -
     Args:
         prefix: Prefix to use when constructing log keys.
         tree: PyTree containing ``nu`` values structured like the model.
-        split_scan_layers: Whether to split ``Stacked`` layers into individual
-            histograms.
+        split_scan_layers: Whether to split ``Stacked`` layers into individual layers
+
 
     Returns:
         A mapping from key names to histograms.
     """
 
-    hists: dict[str, Histogram] = {}
+    hists: dict[str, Histogram | jnp.ndarray] = {}
 
     def _rec(path_prefix: str | None, subtree: Any):
         is_leaf = lambda n: isinstance(n, haliax.nn.Linear) or isinstance(n, haliax.nn.Stacked)
@@ -139,8 +147,20 @@ def nu_dead_neuron_histograms(prefix: str, tree: Any, split_scan_layers: bool) -
                     continue
                 row_flow = haliax.ones(node.Out).dot(node.weight, axis=node.Out)
                 col_flow = node.weight.dot(haliax.ones(node.In), axis=node.In)
-                hists[f"{key_path}.row"] = Histogram.from_named_array(row_flow)
-                hists[f"{key_path}.col"] = Histogram.from_named_array(col_flow)
+                if include_histograms:
+                    hists[f"{key_path}/row"] = Histogram.from_named_array(row_flow)
+                    hists[f"{key_path}/col"] = Histogram.from_named_array(col_flow)
+                # compute z-scores of log transformed flows and log outliers
+                log_row = haliax.log(row_flow + 1e-14)  # this should be very small because row_flow is
+                log_col = haliax.log(col_flow + 1e-14)
+                mean_row = haliax.mean(log_row)
+                std_row = haliax.std(log_row)
+                mean_col = haliax.mean(log_col)
+                std_col = haliax.std(log_col)
+                z_row = (log_row - mean_row) / (std_row + 1e-14)
+                z_col = (log_col - mean_col) / (std_col + 1e-14)
+                hists[f"{key_path}/row/dead"] = haliax.sum(z_row < -3).scalar() / z_row.size
+                hists[f"{key_path}/col/dead"] = haliax.sum(z_col < -3).scalar() / z_col.size
 
     _rec(None, tree)
 
