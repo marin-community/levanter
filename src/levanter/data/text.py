@@ -644,7 +644,8 @@ def dataset_for_format(
             pad_token_id = 0
             max_segments_per_example = 64
             slice_strategy = "left"
-            return Ul2rDataset(cache, Pos, task_configs, task_probs, key, pad_token_id, max_segments_per_example, slice_strategy)
+            KPos = Pos.alias("key_position")
+            return Ul2rDataset(cache, Pos, KPos, task_configs, task_probs, key, pad_token_id, max_segments_per_example, slice_strategy)
         case TextLmDatasetFormat():
             return CausalLmDataset(TokenSeqDataset(cache, Pos.size), Pos, eos_id=eos_id, ignore_index=ignore_index)
         case ChatLmDatasetFormat(single_turn=single_turn, pack=pack, mask_user_turns=mask_user_turns):
