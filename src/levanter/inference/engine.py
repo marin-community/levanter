@@ -24,8 +24,8 @@ from haliax.jax_utils import is_jax_array_like
 import levanter.tracker
 from levanter.inference.jit_scheduler import (
     DecodeState,
-    SequenceTable,
     SeqDecodingParams,
+    SequenceTable,
     TokenQueue,
     _DecodeOutputs,
 )
@@ -444,9 +444,14 @@ def _apply_prefill_work(gen_state: GenState, work: PrefillWork) -> GenState:
             def do_primary(gs_primary: GenState) -> GenState:
                 decode_state = gs_primary.decode_state
                 decode_state, assigned = decode_state.reserve_slot(slot_val)
+                # Get the prompt length for this sequence
+                prompt_len = work.prompt_lengths.array[i].astype(jnp.int32)
                 decode_state = decode_state.assign_seq(
                     local_slot_id=slot_val,
                     tokens=work.prompt_tokens["seq", i],
+                    seq_len=prompt_len,
+                    kv_pages=None,  # Will be allocated later in allocate_for_seq
+                    page_indices=None,  # Will be set during page allocation
                     seq_params=seq_params,
                 )
                 return dataclasses.replace(gs_primary, decode_state=decode_state)
@@ -550,9 +555,8 @@ def _handle_clones(
         decode_state, cache = state
         src_slot_id = src_ids["position", i].scalar()
         dst_slot_id = tgt_ids["position", i].scalar()
-        decode_state = decode_state.clone_pages_from(src_slot_id, dst_slot_id)
 
-        src_len = decode_state.seq_lens["seq", src_slot_id].scalar()
+        src_len = decode_state.seq_lens["seq", dst_slot_id].scalar()
         used_pages = (src_len + size - 1) // size
         last_idx = jnp.maximum(used_pages - 1, 0)
 
@@ -1124,7 +1128,20 @@ class InferenceEngine:
         logger.info(f"Initial prefill and extraction took {initial_prefill_out - time_in:.3f}s")
 
         # Autoregressive generation loop with periodic extraction
+        num_outer_rounds = 0
+
         def _all_done() -> bool:
+            nonlocal num_outer_rounds
+            if num_outer_rounds * self.config.max_rounds >= self.config.max_seq_len:
+                logger.warning(
+                    f"Breaking decode loop after {num_outer_rounds} rounds."
+                    f" max_rounds={self.config.max_rounds} "
+                    f" outer_rounds={num_outer_rounds}"
+                    f" max_needed_tokens={max_needed}"
+                    f" max_seq_len={self.config.max_seq_len}"
+                )
+                return True
+            num_outer_rounds += 1
             for rid, n_kids in expected_children.items():
                 kid_map = self.results.get(rid, {})
                 for cid in range(n_kids):

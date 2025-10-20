@@ -41,7 +41,8 @@ def baby_llama_config():
             max_seq_len=16,
             max_seqs=2,
             page_size=4,
-            max_queued_tokens=8,
+            max_queued_tokens=32,
+            hbm_utilization=0.1,
         ),
         temperature=0.7,
         seed=42,
@@ -73,19 +74,94 @@ def loaded_model(trainer_config):
 
 
 @pytest.fixture(scope="module")
-def inference_server(baby_llama_config, loaded_model):
+def inference_server(trainer_config, baby_llama_config, loaded_model):
     """Create an InferenceServer instance."""
     model, tokenizer = loaded_model
-    return InferenceServer.create(baby_llama_config, model, tokenizer)
+    with trainer_config.use_device_mesh(), hax.axis_mapping(trainer_config.compute_axis_mapping):
+        return InferenceServer.create(baby_llama_config, model, tokenizer)
 
 
 @pytest.fixture(scope="module")
-def test_client(baby_llama_config, loaded_model):
+def test_client(baby_llama_config, loaded_model, inference_server):
     """Create a test client for the inference server."""
-    model, tokenizer = loaded_model
-    server = InferenceServer.create(baby_llama_config, model, tokenizer)
-    with TestClient(server.app) as client:
-        yield client, server
+    with TestClient(inference_server.app) as client:
+        yield client, inference_server
+
+
+@pytest.fixture(scope="module")
+def hf_reference_model_and_tokenizer():
+    """Load the HF reference model used for correctness comparisons."""
+    pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+
+    model_name = "timinar/baby-llama-58m"
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = transformers.AutoModelForCausalLM.from_pretrained(model_name)
+    model.to("cpu")
+    model.eval()
+
+    return model, tokenizer
+
+
+def test_greedy_correctness_against_hf(test_client, hf_reference_model_and_tokenizer):
+    """Ensure deterministic (greedy) Levanter generations match HF reference outputs."""
+    (client, _server) = test_client
+    hf_model, hf_tokenizer = hf_reference_model_and_tokenizer
+    torch = pytest.importorskip("torch")
+
+    prompts = [
+        "Hello, my name is",
+        "The capital of France is",
+        "In a distant future, humanity",
+    ]
+    max_tokens = 10
+    levanter_generations: list[tuple[list[int], str]] = []
+
+    for prompt in prompts:
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "timinar/baby-llama-58m",
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "logprobs": True,
+                "seed": 0,
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        choice = payload["choices"][0]
+        logprobs = choice.get("logprobs") or {}
+
+        tokens = logprobs.get("tokens") or []
+        token_ids = hf_tokenizer.convert_tokens_to_ids(tokens)
+        levanter_generations.append((token_ids, choice["text"]))
+
+    for prompt, (levanter_ids, levanter_text) in zip(prompts, levanter_generations, strict=True):
+        inputs = hf_tokenizer(prompt, return_tensors="pt")
+        inputs = {k: v.to(hf_model.device) for k, v in inputs.items()}
+        input_length = inputs["input_ids"].shape[-1]
+
+        with torch.no_grad():
+            output_ids = hf_model.generate(
+                **inputs,
+                do_sample=False,
+                max_new_tokens=max_tokens,
+                pad_token_id=hf_tokenizer.eos_token_id,
+                eos_token_id=hf_tokenizer.eos_token_id,
+            )[0]
+
+        generated_ids = output_ids[input_length:].tolist()
+        hf_text = hf_tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+        assert levanter_ids == generated_ids, f"Token mismatch for prompt '{prompt}'"
+        assert levanter_text == hf_text, f"Text mismatch for prompt '{prompt}'"
 
 
 def test_endpoints_exist(test_client):
@@ -503,12 +579,10 @@ def test_logprobs_match_full_forward_pass(test_client, loaded_model, trainer_con
     print(f"Server returned {len(choice.logprobs.content)} tokens:")
     for i, token_logprob in enumerate(choice.logprobs.content):
         token_str = token_logprob.token
-        # Encode the token string to get the ID
-        token_ids = tokenizer.encode(token_str, add_special_tokens=False)
-        print(f"  Token {i}: '{token_str}' -> {token_ids}, logprob={token_logprob.logprob}")
-        if len(token_ids) == 1:
-            generated_token_ids.append(token_ids[0])
-            server_logprobs.append(token_logprob.logprob)
+        token_id = tokenizer.convert_tokens_to_ids(token_str)
+        print(f"  Token {i}: '{token_str}' -> {token_id}, logprob={token_logprob.logprob}")
+        generated_token_ids.append(token_id)
+        server_logprobs.append(token_logprob.logprob)
 
     print(f"Generated {len(generated_token_ids)} tokens: {generated_token_ids}")
     print(f"Server logprobs: {server_logprobs}")
