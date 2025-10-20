@@ -32,7 +32,7 @@ def ragged_paged_attention(
 Key attributes here are that:
 
 * Ragged paged attention operates on _pages_ at a time, so we need to work with that
-* Pages are separately indexed by page_indeices, presumably mapping [seq, offset_of_page]
+* Pages are separately indexed by page_indices, presumably mapping [seq, offset_of_page]
 * Query does _not_ have a sequence dimension. Instead we're flattened for some reason, presumably to allow different sequence lengths.
 - We don't care about this for RL, but important for serving I suppose.
 

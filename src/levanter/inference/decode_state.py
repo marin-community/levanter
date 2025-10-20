@@ -132,6 +132,18 @@ class BatchInfo(eqx.Module):
 
     num_seqs: jnp.ndarray
 
+    seq_lens: ht.i32[NamedArray, " seq"]  # type: ignore[name-defined]
+    """The length of each sequence."""
+
+    tokens: ht.i32[NamedArray, " seq position"]  # type: ignore[name-defined]
+    """The token IDs for each sequence in the batch."""
+
+    pos_ids: ht.i32[NamedArray, " seq position"]  # type: ignore[name-defined]
+    """The position IDs for each sequence in the batch."""
+
+    cu_q_lens: ht.i32[NamedArray, " seq"]  # type: ignore[name-defined]
+    """..."""
+
     new_token_dests: NamedArray
     """(num_seq, seq_len) array containing target locations for KV cache updates.
 
@@ -201,6 +213,7 @@ class DecodeState(eqx.Module):
     """Decoding state for a batch of sequences."""
 
     kv_cache: KvPageCache
+    page_spec: PageTableSpec = eqx.field(static=True)
 
     seq_lens: ht.i32[NamedArray, " seq"]  # type: ignore[name-defined]
     """The length of each sequence."""
@@ -220,37 +233,22 @@ class DecodeState(eqx.Module):
     iteration: jnp.ndarray
     """The current iteration of the generation loop, used to index token locations."""
 
-    page_size: int = eqx.field(static=True)
-
-    batch_info: BatchInfo
+    new_token_dests: ht.i32[NamedArray, " position"]
 
     @property
     def num_seqs(self):
         return self.seq_lens.shape[0]
 
-    @classmethod
-    def init(
-        cls: Type[Self],
-        kv_cache: KvPageCache,
-        page_table: PageTableSpec,
-        seq_lens: jnp.ndarray,
-        tokens: jnp.ndarray,
-        pos_ids: jnp.ndarray,
-        cu_q_lens: jnp.ndarray,
-        batch_info: BatchInfo,
-    ) -> Self:
-        Seq = hax.Axis("seq", size=len(seq_lens))
-        Position = hax.Axis("position", size=tokens.shape[-1])
-        return cls(
-            iteration=0,
-            kv_cache=kv_cache,
-            seq_lens=hax.NamedArray(seq_lens, (Seq,)),
-            tokens=hax.NamedArray(tokens, (Seq, Position)),
-            pos_ids=hax.NamedArray(pos_ids, (Seq, Position)),
-            cu_q_lens=hax.NamedArray(cu_q_lens, (Seq)),
-            logprobs=hax.zeros((Seq, Position)),
-            page_size=page_table.page_size,
-            batch_info=batch_info,
+    def batch_info(self, iteration: int):
+        return BatchInfo(
+            kv_cache=self.kv_cache,
+            page_size=self.page_spec.page_size,
+            new_token_dests=self.new_token_dests,
+            num_seqs=self.seq_lens.shape["seq"],
+            seq_lens=self.seq_lens,
+            tokens=self.tokens,
+            pos_ids=self.pos_ids,
+            cu_q_lens=self.cu_q_lens,
         )
 
     @named_call

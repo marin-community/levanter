@@ -278,7 +278,7 @@ def _prefill_kernel(
     _, cache = model.decode(
         gen_state.decode_state.tokens,
         gen_state.cache,
-        gen_state.decode_state.batch_info,
+        gen_state.decode_state.batch_info(iteration=0),
         gen_state.decode_state.pos_ids,
     )
     return dataclasses.replace(gen_state, cache=cache, decode_state=decode_state)
@@ -478,6 +478,7 @@ class InferenceEngine:
 
         q_len_offset = 0
         total_len = sum([len(req.prompt_tokens) for req in requests])
+        num_seqs = len(requests)
 
         for i, req in enumerate(requests):
             seq_lens.append(len(req.prompt_tokens))
@@ -487,24 +488,24 @@ class InferenceEngine:
             cu_q_lens[i] = q_len_offset
             q_len_offset += len(req.prompt_tokens)
 
-        token_dests = hax.NamedArray(np.arange(total_len), {"position", }
+        print(seq_lens)
+        print(tokens)
+
+        token_dests = hax.NamedArray(np.arange(total_len), {"position": total_len})
 
         # now run prefill. this will fill the KV cache for all of the sequences. we'll then
         # build a new decode state with these pages as the baseline, and new page indices for
         # the newly decoded tokens.
-        decode_state = DecodeState.init(
+        decode_state = DecodeState(
             kv_cache=self.cache,
-            page_table=self.page_spec,
-            seq_lens=seq_lens,
-            tokens=tokens,
-            pos_ids=pos_ids,
-            cu_q_lens=cu_q_lens,
-            batch_info=BatchInfo(
-                kv_cache=self.cache,
-                page_size=self.page_spec.page_size,
-                new_token_dests=token_dests,
-                num_seqs=len(requests),
-            ),
+            page_spec=self.page_spec,
+            seq_lens=hax.NamedArray(np.array(seq_lens), {"seq": num_seqs}),
+            tokens=hax.NamedArray(np.array(tokens), {"position": total_len}),
+            pos_ids=hax.NamedArray(np.array(pos_ids), {"position": total_len}),
+            cu_q_lens=hax.NamedArray(np.array(cu_q_lens), {"seq": num_seqs}),
+            logprobs=hax.zeros({"position": total_len}),
+            new_token_dests=token_dests,
+            iteration=0,
         )
 
         gen_state = GenState(self.cache, decode_state)
