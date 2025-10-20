@@ -196,8 +196,17 @@ class KvPageCache(PageCache):
         batch_info: BatchInfo,
     ) -> "KvPageCache":
         """Append keys and values to the cache based on *batch_info*."""
-        K = jnp.asarray(batch_info.num_seqs, jnp.int32)
+        # K should be the number of tokens, not the number of sequences
+        K = jnp.asarray(new_k.array.shape[0], jnp.int32)
         t_pages, t_slots = batch_info.pages_and_slots()  # [T] int32 (first K valid)
+
+        jax.debug.print(
+            "[KV_UPDATE] K={k} new_token_dests={d} t_pages={p} t_slots={s}",
+            k=K,
+            d=batch_info.new_token_dests.array,
+            p=t_pages.array,
+            s=t_slots.array,
+        )
 
         updated = kv_update_unified_prefix(
             self.kv_pages.array,
@@ -304,5 +313,5 @@ class DecodeState(eqx.Module):
             seq_lens=self.seq_lens,
             tokens=self.tokens,
             pos_ids=self.pos_ids,
-            new_token_dests=self.seq_lens,
+            new_token_dests=self.pos_ids,
         )

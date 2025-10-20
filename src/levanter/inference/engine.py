@@ -547,8 +547,6 @@ class InferenceEngine:
         q_len_offset = 0
         total_len = sum([len(req.prompt_tokens) for req in requests])
         num_seqs = len(requests)
-        total_pages = num_seqs * self.page_spec.pages_per_seq
-        page_indices = np.arange(total_pages).reshape((num_seqs, self.page_spec.pages_per_seq))
 
         for i, req in enumerate(requests):
             seq_lens.append(len(req.prompt_tokens))
