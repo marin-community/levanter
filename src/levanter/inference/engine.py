@@ -13,17 +13,16 @@ import haliax as hax
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax import lax
 
-from levanter.inference import decode_state
 from levanter.inference.decode_state import (
     DecodeState,
-    GenState,
     KvPageCache,
+    PageCache,
     PageTableSpec,
     SeqDecodingParams,
 )
 from levanter.inference.utils import INVALID
-from levanter.layers.attention import BatchInfo
 from levanter.layers.sampler import Sampler
 from levanter.models.llama import LlamaLMHeadModel
 from levanter.models.lm_model import LmHeadModel
@@ -270,116 +269,90 @@ def _compute_sample_indices(pos_ids, slot_ids, seq_lens, max_sample_indices):
 
 
 @functools.partial(jax.jit, donate_argnums=0)
-def _prefill_kernel(
-    gen_state: GenState,
-    model: LlamaLMHeadModel,
-) -> GenState:
-    """Run prefill using a fresh, local token queue. Only populates the KV-cache."""
-    _, cache = model.decode(
-        gen_state.decode_state.tokens,
-        gen_state.cache,
-        gen_state.decode_state.batch_info(iteration=0),
-        gen_state.decode_state.pos_ids,
-    )
-    return dataclasses.replace(gen_state, cache=cache, decode_state=decode_state)
-
-
 def _run_prefill(
-    gen_state: GenState,
+    cache: PageCache,
+    decode_state: DecodeState,
     model: LlamaLMHeadModel,
-) -> GenState:
-    gen_state = _prefill_kernel(gen_state, model)
+) -> PageCache:
+    """Run prefill using a fresh, local token queue. Only populates the KV-cache."""
+    batch_info = decode_state.batch_info(inner_iteration=0, kv_cache=cache)
+    _, cache = model.decode(
+        input_ids=batch_info.tokens,
+        kv_cache=cache,
+        batch_info=batch_info,
+        pos_ids=batch_info.pos_ids,
+    )
+    return cache
 
-    # Now iterate over each input sequence, and construct clones which share the parents KV cache
-    # pages for each of then `n_generations`.
-    for i in range(gen_state.decode_state.num_seqs):
-        pass
-    return gen_state
+
+class DecodeOutputs(eqx.Module):
+    tokens: jnp.ndarray
+    logprobs: jnp.ndarray
+
+    def update(self, new_tokens: hax.NamedArray, new_logprobs: hax.NamedArray, step: jnp.ndarray) -> "DecodeOutputs":
+        jax.debug.print(
+            "Updating outputs at step {step} {tokens} {logprobs}", step=step, tokens=new_tokens, logprobs=new_logprobs
+        )
+        return DecodeOutputs(
+            tokens=lax.dynamic_update_slice(self.tokens, jnp.expand_dims(new_tokens.array, 1), (step, 0)),
+            logprobs=lax.dynamic_update_slice(self.logprobs, jnp.expand_dims(new_logprobs.array, 1), (step, 0)),
+        )
+
+
+class DecodeLoopState(eqx.Module):
+    step: jnp.ndarray
+    cache: PageCache
+    decode_state: DecodeState
+    outputs: DecodeOutputs
 
 
 # @hax.named_jit(donate_args=(True, False, False))
-@functools.partial(jax.jit, static_argnums=(3, 4), donate_argnames=("gen_state",))
+@functools.partial(jax.jit, static_argnums=(3, 4), donate_argnames=("page_cache",))
 def _run_generation_loop(
-    gen_state: GenState,
-    model: LmHeadModel,
+    page_cache: PageCache,
+    decode_state: DecodeState,
+    model: LlamaLMHeadModel,
     sampler: Sampler,
-    max_tokens_per_round: int,
-    max_rounds: int,
-) -> GenState:
+    num_rounds: int,
+) -> tuple[PageCache, DecodeOutputs]:
     """Run autoregressive generation until all sequences finish or `max_rounds` reached."""
 
-    def cond(state: tuple[GenState, jax.Array]):
-        _gen_state, step = state
-        return (
-            (step < max_rounds)
-            & (_gen_state.decode_state.num_queued_tokens > 0)
-            & (~hax.all(_gen_state.decode_state.finished)).scalar()
-        )
-
-    def body(state: tuple[GenState, _DecodeOutputs, jax.Array]) -> tuple[GenState, _DecodeOutputs, jax.Array]:
-        gen_state, outputs, step = state
-
-        # Pack the next chunk from the queue via DecodeState
-        decode_state, packed_seq = gen_state.decode_state.pack_next_sequence(max_tokens_per_round)
-
-        tokens = packed_seq.tokens
-        pos_ids = packed_seq.pos_ids
-        slot_ids = packed_seq.slot_ids
-
-        # jax.debug.print(
-        #     "[_run_gen_loop] tokens={tokens} slots={slots} pos={pos} seq_lens={lens}",
-        #     tokens=tokens.array,
-        #     slots=slot_ids.array,
-        #     pos=pos_ids.array,
-        #     lens=gen_state.decode_state.seq_lens.array,
-        # )
-
-        decode_state, binfo = decode_state.allocate_for_seq(token_slot_ids=slot_ids, token_pos_ids=pos_ids)
-
-        seq_lens = decode_state.seq_lens
-
-        max_sample_indices = min(decode_state.page_table.max_seqs, max_tokens_per_round)
-        sample_indices = _compute_sample_indices(pos_ids, slot_ids, seq_lens, max_sample_indices)
+    def body(state: DecodeLoopState) -> DecodeLoopState:
+        binfo = state.decode_state.batch_info(inner_iteration=state.step, kv_cache=state.cache)
 
         # Decode logits and sample new tokens
-        logits, cache = model.decode(tokens, gen_state.cache, binfo, pos_ids)
-        logits_at_samples = logits["position", sample_indices]
+        logits, cache = model.decode(binfo.tokens, state.cache, binfo, binfo.pos_ids)
 
-        num_new_tokens = hax.sum(sample_indices != INVALID).scalar().astype(jnp.int32)
-        new_slot_ids = slot_ids["position", sample_indices]
-        new_pos_ids = pos_ids["position", sample_indices]
-        prng_keys = decode_state.prng_keys_for(new_slot_ids, new_pos_ids)
+        seed = jax.random.PRNGKey(state.step)
+        seed = jnp.tile(seed, binfo.num_seqs)
+        seed = seed.reshape(binfo.num_seqs, 2)
+        prng_keys = jax.vmap(jax.random.fold_in)(seed, binfo.pos_ids.array)
+        temps = 0.7  # state.decode_state.temperature["seq", new_slot_ids]
+        new_tokens, logprobs = hax.vmap(sampler, "position")(logits, temps, key=prng_keys)
 
-        temps = decode_state.temperature["seq", new_slot_ids]
+        # Update decode state with the sampled tokens
+        decode_state = state.decode_state.update_tokens(new_tokens=new_tokens, new_logprobs=logprobs, step=state.step)
+        outputs = state.outputs.update(new_tokens=new_tokens, new_logprobs=logprobs, step=state.step)
 
-        new_tokens, log_probs = hax.vmap(sampler, "position")(logits_at_samples, temps, key=prng_keys)
+        return DecodeLoopState(
+            step=state.step + 1,
+            cache=cache,
+            outputs=outputs,
+            decode_state=decode_state,
+        )
 
-        # Update decode state with the freshly sampled tokens (also enqueues them)
-        decode_state = decode_state.update_tokens(new_tokens, new_slot_ids, log_probs, num_new_tokens)
-
-        # Update the gen_state with all the new components
-        new_gen_state = dataclasses.replace(gen_state, cache=cache, decode_state=decode_state)
-        # Append non-stateful outputs for host-side extraction
-        outputs = outputs.append(new_tokens, new_slot_ids, log_probs, num_new_tokens, decode_state.finished)
-
-        # jax.debug.print(
-        #     "[gen] step={step} outputs_size={size} queued_after={queued}",
-        #     step=step,
-        #     size=outputs.num_tokens,
-        #     queued=new_gen_state.decode_state.num_queued_tokens,
-        # )
-        return new_gen_state, outputs, step + 1
+    def cond(state):
+        return state.step < num_rounds
 
     # Allocate an outputs buffer sized for this run
-    outputs_buf = _DecodeOutputs.init(
-        max_tokens=max(max_tokens_per_round * max_rounds, 1),
-        max_seqs=gen_state.decode_state.max_seqs,
-        with_logprobs=True,
+    outputs_buf = DecodeOutputs(
+        logprobs=jnp.zeros((decode_state.num_seqs, num_rounds), dtype=jnp.float32),
+        tokens=jnp.zeros((decode_state.num_seqs, num_rounds), dtype=jnp.int32),
     )
-    init_state = (gen_state, outputs_buf, jnp.array(0, dtype=jnp.int32))
-    final_gen_state, final_outputs, _ = jax.lax.while_loop(cond, body, init_state)
-    # jax.debug.print("[gen] final outputs_size={size}", size=final_outputs.num_tokens)
-    return final_gen_state, final_outputs
+    init_state = DecodeLoopState(step=0, cache=page_cache, outputs=outputs_buf, decode_state=decode_state)
+    final_state = jax.lax.while_loop(cond, body, init_state)
+    jax.debug.print("[gen] final outputs_size={outputs}", outputs=final_state.outputs)
+    return final_state.cache, final_state.outputs
 
 
 @dataclass
@@ -470,7 +443,6 @@ class InferenceEngine:
         # construct the DecodeState inputs for the batch of requests, run prefill, then prepare the clones
         # N.B. Llama decode doesn't support the "batch" axis. We're therefore forced
         # to pack all sequences into linear arrays.
-
         seq_lens = []
         tokens = []
         pos_ids = []
@@ -479,6 +451,8 @@ class InferenceEngine:
         q_len_offset = 0
         total_len = sum([len(req.prompt_tokens) for req in requests])
         num_seqs = len(requests)
+        total_pages = num_seqs * self.page_spec.pages_per_seq
+        page_indices = np.arange(total_pages).reshape((num_seqs, self.page_spec.pages_per_seq))
 
         for i, req in enumerate(requests):
             seq_lens.append(len(req.prompt_tokens))
@@ -488,26 +462,72 @@ class InferenceEngine:
             cu_q_lens[i] = q_len_offset
             q_len_offset += len(req.prompt_tokens)
 
-        print(seq_lens)
-        print(tokens)
-
-        token_dests = hax.NamedArray(np.arange(total_len), {"position": total_len})
-
         # now run prefill. this will fill the KV cache for all of the sequences. we'll then
         # build a new decode state with these pages as the baseline, and new page indices for
         # the newly decoded tokens.
         decode_state = DecodeState(
-            kv_cache=self.cache,
             page_spec=self.page_spec,
             seq_lens=hax.NamedArray(np.array(seq_lens), {"seq": num_seqs}),
             tokens=hax.NamedArray(np.array(tokens), {"position": total_len}),
             pos_ids=hax.NamedArray(np.array(pos_ids), {"position": total_len}),
             cu_q_lens=hax.NamedArray(np.array(cu_q_lens), {"seq": num_seqs}),
+            page_indices=hax.NamedArray(page_indices, {"seq": num_seqs, "page": self.page_spec.pages_per_seq}),
             logprobs=hax.zeros({"position": total_len}),
-            new_token_dests=token_dests,
-            iteration=0,
+            offset=0,
         )
 
-        gen_state = GenState(self.cache, decode_state)
-        gen_state = _run_prefill(gen_state, self.model)
-        return GenerationResult(tokens=tokens, logprobs=logprobs, total_generated=sum(seq_lens))
+        self.cache = _run_prefill(self.cache, decode_state, self.model)
+
+        # The prefill kernel has now populated the KV cache for our initial set
+        # of prompts. For clones (n_generations > 1), we populate the
+        # `page_indices` of the clone for the first N tokens to refer to the
+        # parent sequence.
+        # TODO(prefill expansion)
+
+        seq_lens = []
+        tokens = []
+        pos_ids = []
+        cu_q_lens = []
+
+        q_len_offset = 0
+        total_len = sum([len(req.prompt_tokens) for req in requests])
+        num_seqs = len(requests)
+        total_pages = num_seqs * self.page_spec.pages_per_seq
+        page_indices = np.arange(total_pages).reshape((num_seqs, self.page_spec.pages_per_seq))
+
+        for i, req in enumerate(requests):
+            seq_lens.append(len(req.prompt_tokens))
+            tokens.append(req.prompt_tokens[-1])
+            pos_ids.append(len(req.prompt_tokens))
+            cu_q_lens.append(q_len_offset)
+            cu_q_lens[i] = q_len_offset
+            q_len_offset += len(req.prompt_tokens)
+
+        decode_state = DecodeState(
+            page_spec=self.page_spec,
+            seq_lens=hax.NamedArray(np.array(seq_lens), {"seq": num_seqs}),
+            tokens=hax.NamedArray(np.array(tokens), {"position": num_seqs}),
+            pos_ids=hax.NamedArray(np.array(pos_ids), {"position": num_seqs}),
+            cu_q_lens=hax.NamedArray(np.array(cu_q_lens), {"seq": num_seqs}),
+            page_indices=hax.NamedArray(page_indices, {"seq": num_seqs, "page": self.page_spec.pages_per_seq}),
+            logprobs=hax.zeros({"position": num_seqs}),
+            offset=0,
+        )
+
+        # Now that we have the prefill, we can run our generation loop.
+        # We run until we hit our maximum sequence size or all sequences hit their stop criteria.
+        gen_state, decoded_outputs = _run_generation_loop(
+            page_cache=self.cache,
+            decode_state=decode_state,
+            sampler=self.sampler,
+            model=self.model,
+            num_rounds=8,
+        )
+
+        outputs = jax.device_get(decoded_outputs)
+        print(outputs.tokens)
+        print(outputs.logprobs)
+        import os
+
+        os._exit(0)
+        return outputs

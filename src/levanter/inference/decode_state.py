@@ -3,7 +3,7 @@
 
 import dataclasses
 import functools
-from typing import Generic, Iterable, Iterator, Self, Type, TypeVar
+from typing import Generic, Iterable, Iterator, TypeVar
 
 import equinox as eqx
 import haliax as hax
@@ -150,6 +150,8 @@ class BatchInfo(eqx.Module):
     page = v // page_size,  offset_in_page = v % page_size
     """
 
+    page_indices: NamedArray
+
     def pages_and_slots(self):
         token_dests = self.new_token_dests
 
@@ -212,53 +214,57 @@ class KvPageCache(PageCache):
 class DecodeState(eqx.Module):
     """Decoding state for a batch of sequences."""
 
-    kv_cache: KvPageCache
     page_spec: PageTableSpec = eqx.field(static=True)
 
     seq_lens: ht.i32[NamedArray, " seq"]  # type: ignore[name-defined]
     """The length of each sequence."""
 
-    tokens: ht.i32[NamedArray, " seq position"]  # type: ignore[name-defined]
-    """The token IDs for each sequence in the batch."""
-
-    pos_ids: ht.i32[NamedArray, " seq position"]  # type: ignore[name-defined]
-    """The position IDs for each sequence in the batch."""
-
-    logprobs: ht.f32[NamedArray, " seq position"]  # type: ignore[name-defined]
-    """The log probabilities for each token in the sequences."""
-
     cu_q_lens: ht.i32[NamedArray, " seq"]  # type: ignore[name-defined]
     """The cumulative lengths for the sequences, including new tokens."""
 
-    iteration: jnp.ndarray
-    """The current iteration of the generation loop, used to index token locations."""
+    tokens: ht.i32[NamedArray, "position"]  # type: ignore[name-defined]
+    """The token IDs for each sequence."""
 
-    new_token_dests: ht.i32[NamedArray, " position"]
+    logprobs: ht.f32[NamedArray, "position"]  # type: ignore[name-defined]
+    """The log probabilities for each sequence."""
+
+    pos_ids: ht.i32[NamedArray, "position"]  # type: ignore[name-defined]
+    """The position of each token in `tokens` in the sequence."""
+
+    # page_indices: NamedArray,  # i32[Seq, PagePerSeq]
+    # CAN BE STATIC FOR US???
+    page_indices: NamedArray
+
+    offset: jnp.ndarray
+    """Offset in the iteration space for storing KV pages."""
+
+    #         decode_state = decode_state.update_tokens(new_tokens, new_slot_ids, log_probs, num_new_tokens)
+    def update_tokens(self, step: jnp.ndarray, new_tokens: NamedArray, new_logprobs: NamedArray):
+        jax.debug.print("Step: {step}", step=step)
+        tokens = new_tokens
+        new_logprobs = new_logprobs
+        seq_lens = self.seq_lens + 1
+        pos_ids = self.pos_ids + 1
+        cu_q_lens = hax.NamedArray(jnp.cumsum(seq_lens.array), self.cu_q_lens.axes)
+        return dataclasses.replace(
+            self, tokens=tokens, logprobs=new_logprobs, pos_ids=pos_ids, seq_lens=seq_lens, cu_q_lens=cu_q_lens
+        )
 
     @property
     def num_seqs(self):
-        return self.seq_lens.shape[0]
+        return self.seq_lens.shape["seq"]
 
-    def batch_info(self, iteration: int):
+    def batch_info(self, inner_iteration: jnp.ndarray, kv_cache: KvPageCache):
+        iteration = inner_iteration + self.offset
+        pos_id_offset = iteration * self.num_seqs
         return BatchInfo(
-            kv_cache=self.kv_cache,
+            kv_cache=kv_cache,
             page_size=self.page_spec.page_size,
-            new_token_dests=self.new_token_dests,
+            cu_q_lens=self.cu_q_lens,
+            page_indices=self.page_indices,
             num_seqs=self.seq_lens.shape["seq"],
             seq_lens=self.seq_lens,
             tokens=self.tokens,
             pos_ids=self.pos_ids,
-            cu_q_lens=self.cu_q_lens,
+            new_token_dests=hax.NamedArray(pos_id_offset + jnp.arange(self.num_seqs), {"position": self.num_seqs}),
         )
-
-    @named_call
-    def decode_sequences(self) -> NamedArray:
-        """Decode all sequences in the batch from their token ID and length information."""
-        pass
-
-
-class GenState(eqx.Module):
-    """Container for generation state used during decoding."""
-
-    cache: PageCache
-    decode_state: DecodeState
