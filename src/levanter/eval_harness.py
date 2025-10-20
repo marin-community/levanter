@@ -654,8 +654,7 @@ class LevanterHarnessLM(TemplateLM):
 
         # Convert to named array with proper dimensions
         stop_tokens_array = jnp.asarray(padded_tokens, dtype=jnp.int32)
-        result = haliax.named(stop_tokens_array, ("stop_seq", "position"))
-        return result
+        return haliax.named(stop_tokens_array, ("stop_seq", "position"))
 
     def loglikelihood_rolling(self, requests) -> List[Tuple[float]]:
         raise NotImplementedError()
@@ -707,31 +706,16 @@ class LevanterHarnessLM(TemplateLM):
         # Truncate from left if needed to fit model max length, accounting for generation tokens
         max_length = self.EvalPos.size
         for i, (toks, gen_kwargs) in enumerate(zip(prompt_token_lists, processed_kwargs_list)):
-            # Dynamically compute max_gen_toks based on actual prompt length
-            # Use the full remaining context for generation after accounting for prompt
-            prompt_len = len(toks)
-            max_gen_toks = max_length - prompt_len
+            # Reserve space for generation tokens
+            max_gen_toks = gen_kwargs["max_gen_toks"]
+            max_ctx_len = max_length - max_gen_toks
 
-            # Ensure we have at least some space for generation (minimum 1 token)
-            if max_gen_toks <= 0:
-                # Prompt is too long, truncate it to leave space for generation
-                min_gen_space = 1  # Reserve at least 1 token for generation
-                max_prompt_len = max_length - min_gen_space
-                if prompt_len > max_prompt_len:
-                    overflow = prompt_len - max_prompt_len
-                    logger.warning(
-                        f"Prompt {i} too long ({prompt_len}). Truncating left by {overflow} to fit in max_length={max_length}."
-                    )
-                    prompt_token_lists[i] = toks[-max_prompt_len:]
-                    max_gen_toks = min_gen_space
-                else:
-                    max_gen_toks = min_gen_space
-
-            # Update the generation kwargs with the computed max_gen_toks
-            gen_kwargs["max_gen_toks"] = max_gen_toks
+            if len(toks) > max_ctx_len:
+                overflow = len(toks) - max_ctx_len
+                logger.warning(f"Prompt {i} too long ({len(toks)}). Truncating left by {overflow}.")
+                prompt_token_lists[i] = toks[-max_ctx_len:]
 
         # Process stop sequences for each request individually
-
         # Get EOS token for stop sequence handling
         eos = self.tokenizer.decode(self.eot_token_id)
 
