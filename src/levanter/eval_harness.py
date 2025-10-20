@@ -47,9 +47,9 @@ from levanter.data.packing import (
     per_segment_correct,
     per_segment_loss,
 )
+from levanter.inference.decode_state import SeqDecodingParams
 from levanter.inference.engine import InferenceEngine, InferenceEngineConfig
 from levanter.inference.engine import Request as GenRequest
-from levanter.inference.jit_scheduler import SeqDecodingParams
 from levanter.inference.utils import INVALID
 from levanter.models.gpt2 import Gpt2Config
 from levanter.models.loss import next_token_loss

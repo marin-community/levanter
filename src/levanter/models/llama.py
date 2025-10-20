@@ -6,22 +6,20 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Type, Union
 
 import equinox as eqx
-import jax
-import jax.random as jrandom
-from jaxtyping import PRNGKeyArray
-
 import haliax as hax
 import haliax.nn as hnn
+import jax
+import jax.random as jrandom
 from haliax import Axis, AxisSpec, NamedArray
 from haliax.jax_utils import maybe_rng_split, named_call, shaped_rng_split
 from haliax.nn.scan import ScanCheckpointPolicy, Stacked
 from haliax.state_dict import ModuleWithStateDictSerialization
+from jaxtyping import PRNGKeyArray
 
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, HFCompatConfig
-from levanter.inference.page_table import PageBatchInfo, PageTableSpec
+from levanter.inference.decode_state import KvPageCache, ListCache, PageTableSpec
 from levanter.layers import LayerNormConfigBase, RmsNormConfig
-from levanter.layers.attention import Attention, AttentionBackend, AttentionConfig, AttentionMask
-from levanter.layers.kv_cache import KvPageCache, ListCache
+from levanter.layers.attention import Attention, AttentionBackend, AttentionConfig, AttentionMask, BatchInfo
 from levanter.layers.rotary import DefaultRotaryEmbeddingsConfig, RotaryEmbeddingsConfig
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.utils.activation import ActivationFunctionEnum
@@ -346,7 +344,7 @@ class LlamaDecoderLayer(eqx.Module):
         self,
         x: NamedArray,
         kv_cache: KvPageCache,
-        batch_info: PageBatchInfo,
+        batch_info: BatchInfo,
         pos_ids: NamedArray,
         *,
         key=None,
@@ -414,7 +412,7 @@ class LlamaTransformer(eqx.Module):
         self,
         kv_cache: ListCache[KvPageCache],
         x: NamedArray,
-        batch_info: PageBatchInfo,
+        batch_info: BatchInfo,
         pos_ids: NamedArray,
         *,
         key=None,
@@ -622,7 +620,7 @@ class LlamaLMHeadModel(ModuleWithStateDictSerialization, LmHeadModel[LlamaConfig
         self,
         input_ids: NamedArray,  # token IDs for *this* step (shape {Pos} or {Batch, Pos})
         kv_cache: ListCache[KvPageCache],
-        batch_info: PageBatchInfo,
+        batch_info: BatchInfo,
         pos_ids: NamedArray,
         *,
         key=None,

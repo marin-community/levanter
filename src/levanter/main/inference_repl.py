@@ -16,7 +16,7 @@ CLI Usage:
 
 import os
 
-os.environ["JAX_DEBUG_LOG_MODULES"] = "jax._src.compiler,jax._src.lru_cache"
+# os.environ["JAX_DEBUG_LOG_MODULES"] = "jax._src.compiler,jax._src.lru_cache"
 os.environ["EQX_ON_ERROR"] = "nan"
 
 import jax
@@ -26,23 +26,27 @@ _original_io_callback = jax.experimental.io_callback
 _original_pure_callback = jax.pure_callback
 _original_debug_print = jax.debug.print
 
+
 def _tracked_io_callback(callback_fn, result_shape_dtypes, *args, **kwargs):
     """Track io_callback invocations with full traceback"""
-    tb = ''.join(traceback.format_stack())
+    tb = "".join(traceback.format_stack())
     print(tb)
     return _original_io_callback(callback_fn, result_shape_dtypes, *args, **kwargs)
 
+
 def _tracked_pure_callback(callback_fn, result_shape_dtypes, *args, **kwargs):
     """Track pure_callback invocations"""
-    tb = ''.join(traceback.format_stack())
+    tb = "".join(traceback.format_stack())
     print(tb)
     return _original_pure_callback(callback_fn, result_shape_dtypes, *args, **kwargs)
 
+
 def _tracked_debug_print(fmt, *args, **kwargs):
     """Track jax.debug.print invocations"""
-    tb = ''.join(traceback.format_stack())
+    tb = "".join(traceback.format_stack())
     print(tb)
     pass
+
 
 jax.pure_callback = _tracked_pure_callback
 jax.experimental.io_callback = _tracked_io_callback
@@ -55,7 +59,6 @@ import logging
 import shlex
 import time
 import traceback
-import unittest.mock as mock
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Optional
@@ -182,7 +185,6 @@ class InferenceReplConfig:
                 max_seqs=2,
                 max_queued_tokens=64,
                 max_seqs_in_prefill=1,
-                max_prefill_size=64,
                 max_rounds=4,
                 hbm_utilization=0.2,
             ),
@@ -270,7 +272,9 @@ class ReplContext:
                 with use_cpu_device():
                     key = jrandom.PRNGKey(server_config.seed)
                     vocab_size = len(server.inference_context.tokenizer)
-                    Vocab = round_axis_for_partitioning(Axis("vocab", vocab_size), server_config.trainer.param_axis_mapping)
+                    Vocab = round_axis_for_partitioning(
+                        Axis("vocab", vocab_size), server_config.trainer.param_axis_mapping
+                    )
                     model = eqx.filter_eval_shape(server_config.model.build, Vocab, key=key)
                     model = load_checkpoint(model, model, subpath="model")
                     model = server_config.trainer.mp.cast_to_compute(model)
@@ -463,7 +467,7 @@ class ReplContext:
             self._print_completion_response(response)
         finally:
             loop.close()
-        
+
         return response
 
     def _print_completion_response(self, response):

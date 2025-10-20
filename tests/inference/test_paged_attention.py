@@ -2,25 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # tests/test_ragged_paged_attention.py
-import jax
 import math
 
+import haliax as hax
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import jax.random as jrandom
 import numpy as np
 import pytest
 from chex import assert_trees_all_close
-
-import haliax as hax
-from haliax import NamedArray, Axis
-
-from levanter.inference.page_table import PageBatchInfo, PageTable
+from haliax import Axis, NamedArray
 from levanter.inference.jit_scheduler import SequenceTable
-from levanter.inference.utils import INVALID
-from levanter.layers import AttentionConfig, AttentionBackend, Attention
-from levanter.layers.attention import AttentionMask, ragged_paged_attention, simple_attention_with_dropout
+from levanter.inference.page_table import DecodeState, PageTable
 from levanter.layers.kv_cache import KvPageCache
+
+from levanter.inference.utils import INVALID
+from levanter.layers import Attention, AttentionBackend, AttentionConfig
+from levanter.layers.attention import AttentionMask, ragged_paged_attention, simple_attention_with_dropout
 
 SLOT = hax.Axis("slot", 4)  # page size
 NUM_SLOTS = SLOT.size
@@ -215,7 +214,7 @@ def test_ragged_paged_attention_incremental_multi_seq():
 
 
 @jax.jit
-def _jit_paged_decode(attn, x, pos_ids, cache: KvPageCache, binfo: PageBatchInfo) -> tuple[NamedArray, KvPageCache]:
+def _jit_paged_decode(attn, x, pos_ids, cache: KvPageCache, binfo: DecodeState) -> tuple[NamedArray, KvPageCache]:
     return attn.paged_decode(x, cache, binfo, pos_ids=pos_ids, key=jrandom.PRNGKey(2))
 
 

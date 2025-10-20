@@ -39,8 +39,7 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec
 from jaxtyping import PRNGKeyArray
 
-from ..inference.page_table import PageBatchInfo, PageTableSpec
-from .kv_cache import KvPageCache
+from ..inference.decode_state import BatchInfo, KvPageCache, PageTableSpec
 from .normalization import LayerNormConfigBase
 from .rotary import RotaryEmbeddings, RotaryEmbeddingsConfig
 
@@ -1623,7 +1622,7 @@ class Attention(eqx.Module):
         self,
         x: NamedArray,
         kv_cache: "KvPageCache",
-        batch_info: PageBatchInfo,
+        batch_info: BatchInfo,
         *,
         pos_ids: NamedArray,
         key=None,

@@ -36,8 +36,8 @@ from openai.types.completion_choice import CompletionChoice, Logprobs
 from pydantic import BaseModel, Field
 from transformers import PreTrainedTokenizer
 
+from levanter.inference.decode_state import SeqDecodingParams
 from levanter.inference.engine import InferenceEngine, InferenceEngineConfig, Request
-from levanter.inference.jit_scheduler import SeqDecodingParams
 from levanter.models.lm_model import LmHeadModel
 from levanter.trainer import TrainerConfig
 from levanter.utils.hf_utils import HfTokenizer

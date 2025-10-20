@@ -17,8 +17,8 @@ import levanter
 from levanter.callbacks import profile_ctx
 from levanter.checkpoint import load_checkpoint
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, RepoRef, load_tokenizer
+from levanter.inference.decode_state import SeqDecodingParams
 from levanter.inference.engine import InferenceEngine, InferenceEngineConfig, Request
-from levanter.inference.jit_scheduler import SeqDecodingParams
 from levanter.inference.utils import INVALID
 from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
 from levanter.models.lm_model import LmConfig, LmHeadModel
