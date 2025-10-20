@@ -11,7 +11,7 @@ import haliax.haxtyping as ht
 import jax
 import jax.numpy as jnp
 import jaxtyping
-from haliax import Axis, NamedArray, named
+from haliax import Axis, NamedArray
 from haliax.jax_utils import named_call
 from jax import lax
 
@@ -130,9 +130,11 @@ class BatchInfo(eqx.Module):
     kv_cache: PageCache
     page_size: int = eqx.field(static=True)
 
+    num_seqs: jnp.ndarray
+
     new_token_dests: NamedArray
-    """(num_seq, seq_len) array containing target locations for KV cache updates. 
-    
+    """(num_seq, seq_len) array containing target locations for KV cache updates.
+
     page = v // page_size,  offset_in_page = v % page_size
     """
 
@@ -143,8 +145,6 @@ class BatchInfo(eqx.Module):
         t_slots = hax.where(is_valid(token_dests), token_dests % self.page_size, INVALID)
 
         return t_pages, t_slots
-        page_idx = 0
-
 
 
 class KvPageCache(PageCache):
@@ -182,9 +182,7 @@ class KvPageCache(PageCache):
         batch_info: BatchInfo,
     ) -> "KvPageCache":
         """Append keys and values to the cache based on *batch_info*."""
-        page_size = self.kv_pages.array.shape[1]
-
-        K = jnp.asarray(num_seqs, jnp.int32)
+        K = jnp.asarray(batch_info.num_seqs, jnp.int32)
         t_pages, t_slots = batch_info.pages_and_slots()  # [T] int32 (first K valid)
 
         updated = kv_update_unified_prefix(
@@ -233,24 +231,24 @@ class DecodeState(eqx.Module):
     @classmethod
     def init(
         cls: Type[Self],
+        kv_cache: KvPageCache,
         page_table: PageTableSpec,
         seq_lens: jnp.ndarray,
         tokens: jnp.ndarray,
         pos_ids: jnp.ndarray,
         cu_q_lens: jnp.ndarray,
         batch_info: BatchInfo,
-        dtype=jnp.bfloat16,
     ) -> Self:
+        Seq = hax.Axis("seq", size=len(seq_lens))
+        Position = hax.Axis("position", size=tokens.shape[-1])
         return cls(
-            kv_cache=hax.zeros(
-                {"page": page_table.num_pages, "position": max_len, "kvhead": kv_heads, "head": head_size}, dtype=dtype
-            ),
             iteration=0,
-            seq_lens=hax.NamedArray(seq_lens, axes=("seq")),
-            tokens=hax.NamedArray(tokens, ("seq, position")),
-            pos_ids=hax.NamedArray(pos_ids, ("seq", "position")),
-            cu_q_lens=hax.NamedArray(cu_q_lens, ("seq",)),
-            logprobs=hax.zeros({"seq": seq_lens.shape[0], "position": page_table.tokens_per_seq}, dtype=jnp.float32),
+            kv_cache=kv_cache,
+            seq_lens=hax.NamedArray(seq_lens, (Seq,)),
+            tokens=hax.NamedArray(tokens, (Seq, Position)),
+            pos_ids=hax.NamedArray(pos_ids, (Seq, Position)),
+            cu_q_lens=hax.NamedArray(cu_q_lens, (Seq)),
+            logprobs=hax.zeros((Seq, Position)),
             page_size=page_table.page_size,
             batch_info=batch_info,
         )

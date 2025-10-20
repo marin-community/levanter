@@ -1637,8 +1637,7 @@ class Attention(eqx.Module):
         key_proj, key_o = maybe_rng_split(key, 2)
 
         q, k, v = self._compute_qkv(x, key=key_proj, pos_ids=pos_ids)
-
-        kv_cache = kv_cache.update(batch_info, k, v)
+        kv_cache = kv_cache.update(k, v, batch_info)
 
         sm_scale = (
             self.config.scaling_factor

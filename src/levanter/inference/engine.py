@@ -276,7 +276,10 @@ def _prefill_kernel(
 ) -> GenState:
     """Run prefill using a fresh, local token queue. Only populates the KV-cache."""
     _, cache = model.decode(
-        gen_state.decode_state.tokens, gen_state.cache, gen_state.decode_state, gen_state.decode_state.pos_ids
+        gen_state.decode_state.tokens,
+        gen_state.cache,
+        gen_state.decode_state.batch_info,
+        gen_state.decode_state.pos_ids,
     )
     return dataclasses.replace(gen_state, cache=cache, decode_state=decode_state)
 
@@ -465,41 +468,42 @@ class InferenceEngine:
             )
 
         # construct the DecodeState inputs for the batch of requests, run prefill, then prepare the clones
+        # N.B. Llama decode doesn't support the "batch" axis. We're therefore forced
+        # to pack all sequences into linear arrays.
+
         seq_lens = []
         tokens = []
         pos_ids = []
-        logprobs = []
-        page_indices = []
         cu_q_lens = []
 
-        cu_q_len = 0
+        q_len_offset = 0
+        total_len = sum([len(req.prompt_tokens) for req in requests])
 
-        max_len = max([len(req.prompt_tokens) for req in requests])
-        new_token_dests = np.arange(max_len * len(requests)).reshape((len(requests), -1))
-
-        for req in requests:
+        for i, req in enumerate(requests):
             seq_lens.append(len(req.prompt_tokens))
-            tokens.append(req.prompt_tokens)
-            pos_ids.append(np.arange(len(req.prompt_tokens), dtype=np.int32))
+            tokens.extend(req.prompt_tokens)
+            pos_ids.extend(np.arange(len(req.prompt_tokens)))
+            cu_q_lens.append(q_len_offset)
+            cu_q_lens[i] = q_len_offset
+            q_len_offset += len(req.prompt_tokens)
 
-            cu_q_lens.append(cu_q_len + len(req.prompt_tokens))
-            cu_q_len += len(req.prompt_tokens)
-
-            for _ in range(0, self.page_spec.pages_needed_for_prompt(len(req.prompt_tokens))):
-                page_indices.append(page_idx)
-                page_idx += 1
+        token_dests = hax.NamedArray(np.arange(total_len), {"position", }
 
         # now run prefill. this will fill the KV cache for all of the sequences. we'll then
         # build a new decode state with these pages as the baseline, and new page indices for
         # the newly decoded tokens.
         decode_state = DecodeState.init(
+            kv_cache=self.cache,
             page_table=self.page_spec,
             seq_lens=seq_lens,
             tokens=tokens,
             pos_ids=pos_ids,
             cu_q_lens=cu_q_lens,
             batch_info=BatchInfo(
-                kv_cache=self.cache, page_size=self.page_spec.page_size, new_token_dests=new_token_dests
+                kv_cache=self.cache,
+                page_size=self.page_spec.page_size,
+                new_token_dests=token_dests,
+                num_seqs=len(requests),
             ),
         )
 

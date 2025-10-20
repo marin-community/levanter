@@ -100,7 +100,7 @@ jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
-jax.config.update("jax_explain_cache_misses", True)
+# jax.config.update("jax_explain_cache_misses", True)
 
 
 def _load_model(
@@ -246,25 +246,25 @@ class ReplContext:
         if not tokenizer:
             tokenizer = self.config.tokenizer
 
-        if is_hf_model:
-            model, tokenizer = _load_model(
-                trainer_config=self.config.trainer,
-                model_config=self.config.model,
-                hf_checkpoint=path,
-                levanter_checkpoint=None,
-                key=jrandom.PRNGKey(self.config.server.seed),
-            )
-        else:
-            if not tokenizer:
-                console.print("[red]Must specify --tokenizer for local checkpoints[/red]")
-                return
-            model, tokenizer = _load_model(
-                trainer_config=self.config.trainer,
-                model_config=self.config.model,
-                hf_checkpoint=None,
-                levanter_checkpoint=path,
-                key=jrandom.PRNGKey(self.config.server.seed),
-            )
+        # if is_hf_model:
+        model, tokenizer = _load_model(
+            trainer_config=self.config.trainer,
+            model_config=self.config.model,
+            hf_checkpoint=path,
+            levanter_checkpoint=None,
+            key=jrandom.PRNGKey(self.config.server.seed),
+        )
+        # else:
+        #     if not tokenizer:
+        #         console.print("[red]Must specify --tokenizer for local checkpoints[/red]")
+        #         return
+        #     model, tokenizer = _load_model(
+        #         trainer_config=self.config.trainer,
+        #         model_config=self.config.model,
+        #         hf_checkpoint=None,
+        #         levanter_checkpoint=path,
+        #         key=jrandom.PRNGKey(self.config.server.seed),
+        #     )
 
         if self.server is not None:
 
