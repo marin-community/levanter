@@ -268,6 +268,41 @@ def _compute_sample_indices(pos_ids, slot_ids, seq_lens, max_sample_indices):
     return sample_indices
 
 
+def _check_stop_sequences(
+    generated_tokens: np.ndarray,  # [num_seqs, num_generated]
+    stop_tokens: list[list[int]],  # per-sequence stop token lists
+    max_stop_len: int,
+) -> np.ndarray:  # [num_seqs] bool array
+    """Check if any sequence has generated a stop token.
+
+    Args:
+        generated_tokens: Array of shape [num_seqs, num_generated] containing all generated tokens so far
+        stop_tokens: List of stop token lists per sequence
+        max_stop_len: Maximum length of stop sequences to check
+
+    Returns:
+        Boolean array of shape [num_seqs] indicating which sequences are finished
+    """
+    num_seqs = generated_tokens.shape[0]
+    finished = np.zeros(num_seqs, dtype=bool)
+
+    for seq_idx in range(num_seqs):
+        if not stop_tokens[seq_idx]:
+            continue
+
+        # Get tokens for this sequence
+        seq_tokens = generated_tokens[seq_idx]
+
+        # Check if any stop token appears in the generated tokens
+        for stop_token in stop_tokens[seq_idx]:
+            # Simple single-token check
+            if np.any(seq_tokens == stop_token):
+                finished[seq_idx] = True
+                break
+
+    return finished
+
+
 @functools.partial(jax.jit, donate_argnums=0)
 def _run_prefill(
     cache: PageCache,
@@ -290,12 +325,9 @@ class DecodeOutputs(eqx.Module):
     logprobs: jnp.ndarray
 
     def update(self, new_tokens: hax.NamedArray, new_logprobs: hax.NamedArray, step: jnp.ndarray) -> "DecodeOutputs":
-        jax.debug.print(
-            "Updating outputs at step {step} {tokens} {logprobs}", step=step, tokens=new_tokens, logprobs=new_logprobs
-        )
         return DecodeOutputs(
-            tokens=lax.dynamic_update_slice(self.tokens, jnp.expand_dims(new_tokens.array, 1), (step, 0)),
-            logprobs=lax.dynamic_update_slice(self.logprobs, jnp.expand_dims(new_logprobs.array, 1), (step, 0)),
+            tokens=lax.dynamic_update_slice(self.tokens, jnp.expand_dims(new_tokens.array, 1), (0, step)),
+            logprobs=lax.dynamic_update_slice(self.logprobs, jnp.expand_dims(new_logprobs.array, 1), (0, step)),
         )
 
 
@@ -314,11 +346,23 @@ def _run_generation_loop(
     model: LlamaLMHeadModel,
     sampler: Sampler,
     num_rounds: int,
-) -> tuple[PageCache, DecodeOutputs]:
+) -> tuple[PageCache, DecodeOutputs, DecodeState]:
     """Run autoregressive generation until all sequences finish or `max_rounds` reached."""
 
     def body(state: DecodeLoopState) -> DecodeLoopState:
+        jax.debug.print("[DECODE_LOOP] step={s} offset={o}", s=state.step, o=state.decode_state.offset)
+
         binfo = state.decode_state.batch_info(inner_iteration=state.step, kv_cache=state.cache)
+
+        jax.debug.print(
+            "[BATCH_INFO] tokens={t} pos_ids={p} seq_lens={sl}",
+            t=binfo.tokens.array,
+            p=binfo.pos_ids.array,
+            sl=binfo.seq_lens.array,
+        )
+        jax.debug.print(
+            "[BATCH_INFO] cu_q_lens={c} new_token_dests={d}", c=binfo.cu_q_lens.array, d=binfo.new_token_dests.array
+        )
 
         # Decode logits and sample new tokens
         logits, cache = model.decode(binfo.tokens, state.cache, binfo, binfo.pos_ids)
@@ -330,9 +374,18 @@ def _run_generation_loop(
         temps = 0.7  # state.decode_state.temperature["seq", new_slot_ids]
         new_tokens, logprobs = hax.vmap(sampler, "position")(logits, temps, key=prng_keys)
 
+        jax.debug.print("[SAMPLED] new_tokens={t} logprobs={lp}", t=new_tokens.array, lp=logprobs.array)
+
         # Update decode state with the sampled tokens
         decode_state = state.decode_state.update_tokens(new_tokens=new_tokens, new_logprobs=logprobs, step=state.step)
         outputs = state.outputs.update(new_tokens=new_tokens, new_logprobs=logprobs, step=state.step)
+
+        jax.debug.print(
+            "[AFTER_UPDATE] tokens={t} pos_ids={p} seq_lens={sl}",
+            t=decode_state.tokens.array,
+            p=decode_state.pos_ids.array,
+            sl=decode_state.seq_lens.array,
+        )
 
         return DecodeLoopState(
             step=state.step + 1,
@@ -351,8 +404,7 @@ def _run_generation_loop(
     )
     init_state = DecodeLoopState(step=0, cache=page_cache, outputs=outputs_buf, decode_state=decode_state)
     final_state = jax.lax.while_loop(cond, body, init_state)
-    jax.debug.print("[gen] final outputs_size={outputs}", outputs=final_state.outputs)
-    return final_state.cache, final_state.outputs
+    return final_state.cache, final_state.outputs, final_state.decode_state
 
 
 @dataclass
@@ -436,7 +488,7 @@ class InferenceEngine:
         max_needed = max(int(r.n_generations) for r in requests)
         if max_needed > int(self.page_spec.max_seqs):
             raise ValueError(
-                f"Total sequences needed ({max_needed}) exceeds max_seqs ({self.table.max_seqs})."
+                f"Total sequences needed ({max_needed}) exceeds max_seqs ({self.page_spec.max_seqs})."
                 "Decompose your request into smaller batches or increase max_seqs when building the service."
             )
 
@@ -459,8 +511,10 @@ class InferenceEngine:
             tokens.extend(req.prompt_tokens)
             pos_ids.extend(np.arange(len(req.prompt_tokens)))
             cu_q_lens.append(q_len_offset)
-            cu_q_lens[i] = q_len_offset
             q_len_offset += len(req.prompt_tokens)
+
+        # Add terminal element to cu_q_lens (required by ragged paged attention kernel)
+        cu_q_lens.append(q_len_offset)
 
         # now run prefill. this will fill the KV cache for all of the sequences. we'll then
         # build a new decode state with these pages as the baseline, and new page indices for
@@ -470,10 +524,11 @@ class InferenceEngine:
             seq_lens=hax.NamedArray(np.array(seq_lens), {"seq": num_seqs}),
             tokens=hax.NamedArray(np.array(tokens), {"position": total_len}),
             pos_ids=hax.NamedArray(np.array(pos_ids), {"position": total_len}),
-            cu_q_lens=hax.NamedArray(np.array(cu_q_lens), {"seq": num_seqs}),
+            cu_q_lens=hax.named(np.array(cu_q_lens, dtype=np.int32), "seq"),  # size is num_seqs + 1
             page_indices=hax.NamedArray(page_indices, {"seq": num_seqs, "page": self.page_spec.pages_per_seq}),
             logprobs=hax.zeros({"position": total_len}),
             offset=0,
+            finished=hax.zeros({"seq": num_seqs}, dtype=jnp.bool_),
         )
 
         self.cache = _run_prefill(self.cache, decode_state, self.model)
@@ -498,36 +553,113 @@ class InferenceEngine:
         for i, req in enumerate(requests):
             seq_lens.append(len(req.prompt_tokens))
             tokens.append(req.prompt_tokens[-1])
-            pos_ids.append(len(req.prompt_tokens))
-            cu_q_lens.append(q_len_offset)
-            cu_q_lens[i] = q_len_offset
-            q_len_offset += len(req.prompt_tokens)
+            pos_ids.append(len(req.prompt_tokens) - 1)  # Position of last prompt token
+            cu_q_lens.append(i)  # Offset in current batch (0, 1, 2, ...)
+
+        # Add terminal element to cu_q_lens (required by ragged paged attention kernel)
+        cu_q_lens.append(num_seqs)
 
         decode_state = DecodeState(
             page_spec=self.page_spec,
             seq_lens=hax.NamedArray(np.array(seq_lens), {"seq": num_seqs}),
             tokens=hax.NamedArray(np.array(tokens), {"position": num_seqs}),
             pos_ids=hax.NamedArray(np.array(pos_ids), {"position": num_seqs}),
-            cu_q_lens=hax.NamedArray(np.array(cu_q_lens), {"seq": num_seqs}),
+            cu_q_lens=hax.named(np.array(cu_q_lens, dtype=np.int32), "seq"),  # size is num_seqs + 1
             page_indices=hax.NamedArray(page_indices, {"seq": num_seqs, "page": self.page_spec.pages_per_seq}),
             logprobs=hax.zeros({"position": num_seqs}),
             offset=0,
+            finished=hax.zeros({"seq": num_seqs}, dtype=jnp.bool_),
         )
 
-        # Now that we have the prefill, we can run our generation loop.
-        # We run until we hit our maximum sequence size or all sequences hit their stop criteria.
-        gen_state, decoded_outputs = _run_generation_loop(
-            page_cache=self.cache,
-            decode_state=decode_state,
-            sampler=self.sampler,
-            model=self.model,
-            num_rounds=8,
+        # Extract stop tokens for each request
+        stop_tokens_per_seq = []
+        for req in requests:
+            if req.decode_params.stop_tokens is not None:
+                # Extract stop tokens from SeqDecodingParams
+                stop_tok = req.decode_params.stop_tokens
+                if isinstance(stop_tok, hax.NamedArray):
+                    stop_tokens_per_seq.append(stop_tok.array.tolist())
+                else:
+                    stop_tokens_per_seq.append(stop_tok)
+            else:
+                stop_tokens_per_seq.append([])
+
+        # Outer generation loop: run until all sequences finish or we hit max length
+        max_outer_rounds = (self.config.max_seq_len + self.config.max_rounds - 1) // self.config.max_rounds
+        all_tokens = []
+        all_logprobs = []
+        finished_mask = np.zeros(num_seqs, dtype=bool)
+
+        for outer_round in range(max_outer_rounds):
+            logger.info(f"[OUTER_LOOP] Starting outer_round={outer_round}, offset={decode_state.offset}")
+
+            # Run one batch of generation (inner loop)
+            self.cache, decoded_outputs, decode_state = _run_generation_loop(
+                page_cache=self.cache,
+                decode_state=decode_state,
+                sampler=self.sampler,
+                model=self.model,
+                num_rounds=self.config.max_rounds,
+            )
+
+            # Transfer outputs to host
+            outputs = jax.device_get(decoded_outputs)
+            all_tokens.append(outputs.tokens)
+            all_logprobs.append(outputs.logprobs)
+
+            logger.info(f"[OUTER_LOOP] Generated tokens: {outputs.tokens}")
+
+            # Check for stop sequences
+            # Concatenate all tokens generated so far for each sequence
+            tokens_so_far = np.concatenate([t for t in all_tokens], axis=1)
+            finished_mask = _check_stop_sequences(tokens_so_far, stop_tokens_per_seq, self.config.max_stop_tokens)
+
+            # Check if all sequences are done
+            if np.all(finished_mask):
+                logger.info(f"All sequences finished after {outer_round + 1} outer rounds")
+                break
+
+            # Update decode_state for next round
+            # Increment offset so next round knows where to write KV cache
+            decode_state = dataclasses.replace(
+                decode_state,
+                offset=decode_state.offset + self.config.max_rounds,
+            )
+
+            logger.info(f"[OUTER_LOOP] Updated offset to {decode_state.offset}")
+
+        # Aggregate all tokens across rounds
+        all_tokens_concat = np.concatenate(all_tokens, axis=1)  # [num_seqs, total_rounds]
+        all_logprobs_concat = np.concatenate(all_logprobs, axis=1)
+
+        # Trim to actual lengths (remove padding zeros or tokens after stop)
+        tokens_list = []
+        logprobs_list = []
+        total_generated = 0
+
+        for i in range(num_seqs):
+            seq_tokens = all_tokens_concat[i]
+            seq_logprobs = all_logprobs_concat[i]
+
+            # Find where to stop: either at first zero (padding) or when finished
+            if finished_mask[i]:
+                # Find first occurrence of stop token
+                valid_len = len(seq_tokens)
+                for stop_tok in stop_tokens_per_seq[i]:
+                    first_stop = np.where(seq_tokens == stop_tok)[0]
+                    if len(first_stop) > 0:
+                        valid_len = min(valid_len, first_stop[0] + 1)  # Include stop token
+            else:
+                # Not finished, take all non-zero tokens
+                nonzero_indices = np.where(seq_tokens != 0)[0]
+                valid_len = len(nonzero_indices) if len(nonzero_indices) > 0 else 0
+
+            tokens_list.append(seq_tokens[:valid_len].tolist())
+            logprobs_list.append(seq_logprobs[:valid_len].tolist())
+            total_generated += valid_len
+
+        return GenerationResult(
+            tokens=tokens_list,
+            logprobs=logprobs_list,
+            total_generated=total_generated,
         )
-
-        outputs = jax.device_get(decoded_outputs)
-        print(outputs.tokens)
-        print(outputs.logprobs)
-        import os
-
-        os._exit(0)
-        return outputs

@@ -238,16 +238,41 @@ class DecodeState(eqx.Module):
     offset: jnp.ndarray
     """Offset in the iteration space for storing KV pages."""
 
-    #         decode_state = decode_state.update_tokens(new_tokens, new_slot_ids, log_probs, num_new_tokens)
+    finished: ht.bool_[NamedArray, " seq"]  # type: ignore[name-defined]
+    """Whether each sequence has completed generation."""
+
     def update_tokens(self, step: jnp.ndarray, new_tokens: NamedArray, new_logprobs: NamedArray):
-        jax.debug.print("Step: {step}", step=step)
+        jax.debug.print(
+            "[UPDATE_TOKENS] step={s} new_tokens={t} self.tokens_before={tb} self.pos_ids_before={pb}",
+            s=step,
+            t=new_tokens.array,
+            tb=self.tokens.array,
+            pb=self.pos_ids.array,
+        )
+
         tokens = new_tokens
         new_logprobs = new_logprobs
         seq_lens = self.seq_lens + 1
         pos_ids = self.pos_ids + 1
-        cu_q_lens = hax.NamedArray(jnp.cumsum(seq_lens.array), self.cu_q_lens.axes)
+        # cu_q_lens is static for decode: always [0, 1, 2, ..., N] for N sequences
+        # It represents offsets into the current batch's token array, not global positions
+        cu_q_lens = hax.named(jnp.arange(self.num_seqs + 1, dtype=jnp.int32), self.cu_q_lens.axes)
+
+        jax.debug.print(
+            "[UPDATE_TOKENS] tokens_after={ta} pos_ids_after={pa} seq_lens_after={sla}",
+            ta=tokens.array,
+            pa=pos_ids.array,
+            sla=seq_lens.array,
+        )
+
         return dataclasses.replace(
-            self, tokens=tokens, logprobs=new_logprobs, pos_ids=pos_ids, seq_lens=seq_lens, cu_q_lens=cu_q_lens
+            self,
+            tokens=tokens,
+            logprobs=new_logprobs,
+            pos_ids=pos_ids,
+            seq_lens=seq_lens,
+            cu_q_lens=cu_q_lens,
+            finished=self.finished,
         )
 
     @property
@@ -256,7 +281,20 @@ class DecodeState(eqx.Module):
 
     def batch_info(self, inner_iteration: jnp.ndarray, kv_cache: KvPageCache):
         iteration = inner_iteration + self.offset
-        pos_id_offset = iteration * self.num_seqs
+
+        jax.debug.print(
+            "[BATCH_INFO_BUILD] inner_iter={i} offset={o} iteration={it}",
+            i=inner_iteration,
+            o=self.offset,
+            it=iteration,
+        )
+        jax.debug.print(
+            "[BATCH_INFO_BUILD] self.tokens={t} self.pos_ids={p} self.seq_lens={sl}",
+            t=self.tokens.array,
+            p=self.pos_ids.array,
+            sl=self.seq_lens.array,
+        )
+
         return BatchInfo(
             kv_cache=kv_cache,
             page_size=self.page_spec.page_size,
@@ -266,5 +304,5 @@ class DecodeState(eqx.Module):
             seq_lens=self.seq_lens,
             tokens=self.tokens,
             pos_ids=self.pos_ids,
-            new_token_dests=hax.NamedArray(pos_id_offset + jnp.arange(self.num_seqs), {"position": self.num_seqs}),
+            new_token_dests=self.seq_lens,
         )
