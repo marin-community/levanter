@@ -310,7 +310,7 @@ def _run_prefill(
     model: LlamaLMHeadModel,
 ) -> PageCache:
     """Run prefill using a fresh, local token queue. Only populates the KV-cache."""
-    batch_info = decode_state.batch_info(inner_iteration=0, kv_cache=cache)
+    batch_info = decode_state.batch_info(kv_cache=cache, prefill=True)
     _, cache = model.decode(
         input_ids=batch_info.tokens,
         kv_cache=cache,
@@ -352,7 +352,7 @@ def _run_generation_loop(
     def body(state: DecodeLoopState) -> DecodeLoopState:
         jax.debug.print("[DECODE_LOOP] step={s} offset={o}", s=state.step, o=state.decode_state.offset)
 
-        binfo = state.decode_state.batch_info(inner_iteration=state.step, kv_cache=state.cache)
+        binfo = state.decode_state.batch_info(kv_cache=state.cache)
 
         jax.debug.print(
             "[BATCH_INFO] tokens={t} pos_ids={p} seq_lens={sl}",

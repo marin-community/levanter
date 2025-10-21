@@ -200,13 +200,13 @@ class KvPageCache(PageCache):
         K = jnp.asarray(new_k.array.shape[0], jnp.int32)
         t_pages, t_slots = batch_info.pages_and_slots()  # [T] int32 (first K valid)
 
-        jax.debug.print(
-            "[KV_UPDATE] K={k} new_token_dests={d} t_pages={p} t_slots={s}",
-            k=K,
-            d=batch_info.new_token_dests.array,
-            p=t_pages.array,
-            s=t_slots.array,
-        )
+        # jax.debug.print(
+        #     "[KV_UPDATE] K={k} new_token_dests={d} t_pages={p} t_slots={s}",
+        #     k=K,
+        #     d=batch_info.new_token_dests.array,
+        #     p=t_pages.array,
+        #     s=t_slots.array,
+        # )
 
         updated = kv_update_unified_prefix(
             self.kv_pages.array,
@@ -284,39 +284,41 @@ class DecodeState(eqx.Module):
     def num_seqs(self):
         return self.seq_lens.shape["seq"]
 
-    def batch_info(self, inner_iteration: jnp.ndarray, kv_cache: KvPageCache):
-        iteration = inner_iteration + self.offset
-
-        token_dests = jnp.arange(self.num_seqs * self.page_spec.tokens_per_seq, dtype=jnp.int32).reshape(
-            self.page_spec.tokens_per_seq, self.num_seqs
+    def batch_info(self, kv_cache: KvPageCache, prefill: bool = False) -> BatchInfo:
+        # define unique token positions for all sequences
+        token_dests = jnp.arange(self.page_spec.pages_per_seq * self.page_spec.page_size * self.num_seqs).reshape(
+            self.num_seqs, -1
         )
+        page_indices = token_dests // self.page_spec.page_size
 
-        page_indices = hax.NamedArray(
-            (token_dests // self.page_spec.page_size).reshape(self.num_seqs, -1),
-            {"seq": self.num_seqs, "page": self.page_spec.tokens_per_seq},
-        )
+        # now, where do we write for _each_ sequence, at this iteration?
+        # we need to index into _token dests_ based on the _current length_ of each sequence
+        # during prefill, we generate a (padded) array for _all_ tokens for each sequence
+        # we use the full token array as the maximal length across all sequences
+        if prefill:
+            new_token_dests = hax.full_like(self.tokens, INVALID, dtype=jnp.int32)
+            for i in range(self.num_seqs):
+                new_token_dests = new_token_dests.at[i, : self.seq_lens[i]].set(token_dests[i, : self.seq_lens[i]])
+        else:
+            new_token_dests = token_dests[jnp.arange(self.num_seqs), self.seq_lens.array + 1]
 
         jax.debug.print(
-            "[BATCH_INFO_BUILD] inner_iter={i} offset={o} iteration={it}",
-            i=inner_iteration,
+            "[BATCH_INFO_BUILD]  offset={o} tokens={t} pos_ids={p} seq_lens={sl} new_token_dests={ntd}",
             o=self.offset,
-            it=iteration,
-        )
-        jax.debug.print(
-            "[BATCH_INFO_BUILD] self.tokens={t} self.pos_ids={p} self.seq_lens={sl}",
             t=self.tokens.array,
             p=self.pos_ids.array,
             sl=self.seq_lens.array,
+            ntd=new_token_dests,
         )
 
         return BatchInfo(
             kv_cache=kv_cache,
             page_size=self.page_spec.page_size,
             cu_q_lens=self.cu_q_lens,
-            page_indices=page_indices,
+            page_indices=hax.NamedArray(page_indices, {"seq": self.num_seqs, "page": page_indices.shape[1]}),
             num_seqs=self.seq_lens.shape["seq"],
             seq_lens=self.seq_lens,
             tokens=self.tokens,
             pos_ids=self.pos_ids,
-            new_token_dests=hax.NamedArray(token_dests[iteration], {"position": self.num_seqs}),
+            new_token_dests=new_token_dests,
         )

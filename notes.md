@@ -34,6 +34,18 @@ Key attributes here are that:
 * Ragged paged attention operates on _pages_ at a time, so we need to work with that
 * Pages are separately indexed by page_indices, presumably mapping [seq, offset_of_page]
 * Query does _not_ have a sequence dimension. Instead we're flattened for some reason, presumably to allow different sequence lengths.
+
+
+_We assume pages are fully packed!_
+* The page_indices & kv_lens must be symmetric with where we _write_ our page updates in new_token_dests
+
+There's a few implications for this:
+
+We can't be "too dumb" in our allocation strategy for pages and sequences.  We need to ensure our page descriptions are always fully packed.
+Since sequences are independent, we _can_ and should assign a different page for each sequence and slot.
+We should be able to statically assign the maximal set of pages ahead of time, since we index on the kv_lens and not the pages, those are just a static lookup
+
+
 - We don't care about this for RL, but important for serving I suppose.
 
 The code flow from here is:
