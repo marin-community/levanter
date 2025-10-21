@@ -704,9 +704,13 @@ class LevanterHarnessLM(TemplateLM):
             # Copy and process generation kwargs
             processed_gen_kwargs = gen_kwargs.copy()
 
-            # Apply defaults from generation_kwargs (user config) first
+            # Override lm-eval defaults with our generation_kwargs (user config)
+            # This ensures our parameters take precedence over lm-eval's defaults
             for key, value in self.generation_kwargs.items():
-                processed_gen_kwargs.setdefault(key, value)
+                old_value = processed_gen_kwargs.get(key)
+                processed_gen_kwargs[key] = value
+                if old_value != value:
+                    logger.info(f"Overriding lm-eval config {key}={old_value} with {key}={value}")
 
             # Standardize kwargs using our _modify_gen_kwargs method
             processed_gen_kwargs = self._modify_gen_kwargs(processed_gen_kwargs)
