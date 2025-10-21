@@ -503,8 +503,6 @@ class InferenceEngine:
         q_len_offset = 0
         total_len = sum([len(req.prompt_tokens) for req in requests])
         num_seqs = len(requests)
-        total_pages = num_seqs * self.page_spec.pages_per_seq
-        page_indices = np.arange(total_pages).reshape((num_seqs, self.page_spec.pages_per_seq))
 
         for i, req in enumerate(requests):
             seq_lens.append(len(req.prompt_tokens))
@@ -525,7 +523,6 @@ class InferenceEngine:
             tokens=hax.NamedArray(np.array(tokens), {"position": total_len}),
             pos_ids=hax.NamedArray(np.array(pos_ids), {"position": total_len}),
             cu_q_lens=hax.named(np.array(cu_q_lens, dtype=np.int32), "seq"),  # size is num_seqs + 1
-            page_indices=hax.NamedArray(page_indices, {"seq": num_seqs, "page": self.page_spec.pages_per_seq}),
             logprobs=hax.zeros({"position": total_len}),
             offset=0,
             finished=hax.zeros({"seq": num_seqs}, dtype=jnp.bool_),
@@ -563,7 +560,6 @@ class InferenceEngine:
             tokens=hax.NamedArray(np.array(tokens), {"position": num_seqs}),
             pos_ids=hax.NamedArray(np.array(pos_ids), {"position": num_seqs}),
             cu_q_lens=hax.named(np.array(cu_q_lens, dtype=np.int32), "seq"),  # size is num_seqs + 1
-            page_indices=hax.NamedArray(page_indices, {"seq": num_seqs, "page": self.page_spec.pages_per_seq}),
             logprobs=hax.zeros({"position": num_seqs}),
             offset=0,
             finished=hax.zeros({"seq": num_seqs}, dtype=jnp.bool_),

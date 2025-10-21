@@ -79,7 +79,7 @@ class PageTableSpec:
 
     @property
     def pages_per_seq(self) -> int:
-        return (self.num_pages + self.page_size - 1) // self.page_size
+        return self.num_pages // self.max_seqs
 
     @property
     def tokens_per_seq(self) -> int:
@@ -240,10 +240,6 @@ class DecodeState(eqx.Module):
     pos_ids: ht.i32[NamedArray, "position"]  # type: ignore[name-defined]
     """The position of each token in `tokens` in the sequence."""
 
-    # page_indices: NamedArray,  # i32[Seq, PagePerSeq]
-    # CAN BE STATIC FOR US???
-    page_indices: NamedArray
-
     offset: jnp.ndarray
     """Offset in the iteration space for storing KV pages."""
 
@@ -291,6 +287,15 @@ class DecodeState(eqx.Module):
     def batch_info(self, inner_iteration: jnp.ndarray, kv_cache: KvPageCache):
         iteration = inner_iteration + self.offset
 
+        token_dests = jnp.arange(self.num_seqs * self.page_spec.tokens_per_seq, dtype=jnp.int32).reshape(
+            self.page_spec.tokens_per_seq, self.num_seqs
+        )
+
+        page_indices = hax.NamedArray(
+            (token_dests // self.page_spec.page_size).reshape(self.num_seqs, -1),
+            {"seq": self.num_seqs, "page": self.page_spec.tokens_per_seq},
+        )
+
         jax.debug.print(
             "[BATCH_INFO_BUILD] inner_iter={i} offset={o} iteration={it}",
             i=inner_iteration,
@@ -308,10 +313,10 @@ class DecodeState(eqx.Module):
             kv_cache=kv_cache,
             page_size=self.page_spec.page_size,
             cu_q_lens=self.cu_q_lens,
-            page_indices=self.page_indices,
+            page_indices=page_indices,
             num_seqs=self.seq_lens.shape["seq"],
             seq_lens=self.seq_lens,
             tokens=self.tokens,
             pos_ids=self.pos_ids,
-            new_token_dests=self.pos_ids,
+            new_token_dests=hax.NamedArray(token_dests[iteration], {"position": self.num_seqs}),
         )
