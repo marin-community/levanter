@@ -160,38 +160,30 @@ class InferenceEngineConfig:
 
 
 def _check_stop_sequences(
-    generated_tokens: np.ndarray,  # [num_seqs, num_generated]
-    stop_tokens: list[list[int]],  # per-sequence stop token lists
-    max_stop_len: int,
-) -> np.ndarray:  # [num_seqs] bool array
-    """Check if any sequence has generated a stop token.
-
-    Args:
-        generated_tokens: Array of shape [num_seqs, num_generated] containing all generated tokens so far
-        stop_tokens: List of stop token lists per sequence
-        max_stop_len: Maximum length of stop sequences to check
-
-    Returns:
-        Boolean array of shape [num_seqs] indicating which sequences are finished
-    """
+    generated_tokens: np.ndarray,
+    requests: Sequence[Request],
+    final_position: np.ndarray,
+) -> np.ndarray:
+    """Return the stop index for each for sequence, or -1 if not found."""
     num_seqs = generated_tokens.shape[0]
-    finished = np.zeros(num_seqs, dtype=bool)
 
     for seq_idx in range(num_seqs):
-        if not stop_tokens[seq_idx]:
+        if final_position[seq_idx] != -1:
             continue
 
-        # Get tokens for this sequence
-        seq_tokens = generated_tokens[seq_idx]
+        stop_sequences = requests[seq_idx].decode_params.stop_tokens
+        if not stop_sequences:
+            continue
+        stop_sequences = stop_sequences.array
+        tokens = generated_tokens[seq_idx]
+        for stop_idx in range(stop_sequences.shape[0]):
+            stop_tokens = stop_sequences[stop_idx].tolist()
+            for i in range(len(tokens) - len(stop_tokens) + 1):
+                if tokens[i : i + len(stop_tokens)].tolist() == stop_tokens:
+                    final_position[seq_idx] = i + len(stop_tokens)
+                    break
 
-        # Check if any stop token appears in the generated tokens
-        for stop_token in stop_tokens[seq_idx]:
-            # Simple single-token check
-            if np.any(seq_tokens == stop_token):
-                finished[seq_idx] = True
-                break
-
-    return finished
+    return final_position
 
 
 @functools.partial(jax.jit, donate_argnums=0)
@@ -338,9 +330,9 @@ class InferenceEngine:
             config = dataclasses.replace(
                 config, max_pages=(config.max_seqs * max(1, config.max_seq_len // config.page_size))
             )
-            assert config.max_pages > 0, "Imputed max_pages must be > 0"
+            assert config.max_pages > 0, "Imputed max_pages must be > 0"  # type: ignore
 
-        spec = PageTableSpec(config.max_pages, config.page_size, config.max_seqs)
+        spec = PageTableSpec(config.max_pages, config.page_size, config.max_seqs)  # type: ignore
         cache = hax.named_jit(model.initial_cache)(spec, dtype=config.compute_dtype)
         vocab_axis = model.Vocab
         sampler = Sampler(vocab_axis)
@@ -409,7 +401,6 @@ class InferenceEngine:
         # of prompts. For clones (n_generations > 1), we populate the
         # `page_indices` of the clone for the first N tokens to refer to the
         # parent sequence.
-        # TODO(prefill expansion)
         seq_lens = []
         tokens = []
         pos_ids = []
@@ -435,24 +426,11 @@ class InferenceEngine:
             finished=hax.zeros({"seq": num_seqs}, dtype=jnp.bool_),
         )
 
-        # Extract stop tokens for each request
-        stop_tokens_per_seq = []
-        for req in requests:
-            if req.decode_params.stop_tokens is not None:
-                # Extract stop tokens from SeqDecodingParams
-                stop_tok = req.decode_params.stop_tokens
-                if isinstance(stop_tok, hax.NamedArray):
-                    stop_tokens_per_seq.append(stop_tok.array.tolist())
-                else:
-                    stop_tokens_per_seq.append(stop_tok)
-            else:
-                stop_tokens_per_seq.append([])
-
         # Outer generation loop: run until all sequences finish or we hit max length
-        max_outer_rounds = 1  # (self.config.max_seq_len + self.config.max_rounds - 1) // self.config.max_rounds
+        max_outer_rounds = (self.config.max_seq_len + self.config.max_rounds - 1) // self.config.max_rounds
         all_tokens = []
         all_logprobs = []
-        finished_mask = np.zeros(num_seqs, dtype=bool)
+        final_position = np.full(num_seqs, -1, dtype=np.int32)
 
         for outer_round in range(max_outer_rounds):
             logger.info(f"[OUTER_LOOP] Starting outer_round={outer_round}")
@@ -469,13 +447,13 @@ class InferenceEngine:
             all_logprobs.append(outputs.logprobs)
 
             logger.info(f"[OUTER_LOOP] Generated tokens: {outputs.tokens}")
-            # Check for stop sequences
+
             # Concatenate all tokens generated so far for each sequence
-            tokens_so_far = np.concatenate([t for t in all_tokens], axis=1)
-            finished_mask = _check_stop_sequences(tokens_so_far, stop_tokens_per_seq, self.config.max_stop_tokens)
+            tokens_so_far = np.concatenate(all_tokens, axis=1)
+            final_position = _check_stop_sequences(tokens_so_far, requests, final_position)
 
             # Check if all sequences are done
-            if np.all(finished_mask):
+            if np.all(final_position > -1):
                 logger.info(f"All sequences finished after {outer_round + 1} outer rounds")
                 break
 
@@ -491,20 +469,7 @@ class InferenceEngine:
         for i in range(num_seqs):
             seq_tokens = all_tokens_concat[i]
             seq_logprobs = all_logprobs_concat[i]
-
-            # Find where to stop: either at first zero (padding) or when finished
-            if finished_mask[i]:
-                # Find first occurrence of stop token
-                valid_len = len(seq_tokens)
-                for stop_tok in stop_tokens_per_seq[i]:
-                    first_stop = np.where(seq_tokens == stop_tok)[0]
-                    if len(first_stop) > 0:
-                        valid_len = min(valid_len, first_stop[0] + 1)  # Include stop token
-            else:
-                # Not finished, take all non-zero tokens
-                nonzero_indices = np.where(seq_tokens != 0)[0]
-                valid_len = len(nonzero_indices) if len(nonzero_indices) > 0 else 0
-
+            valid_len = final_position[i] if final_position[i] != -1 else seq_tokens.shape[0]
             tokens_list.append(seq_tokens[:valid_len].tolist())
             logprobs_list.append(seq_logprobs[:valid_len].tolist())
             total_generated += valid_len
