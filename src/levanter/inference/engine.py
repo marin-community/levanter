@@ -345,7 +345,7 @@ class InferenceEngine:
             page_spec=spec,
         )
 
-    def generate(self, requests: Sequence[Request], step_callback=None) -> GenerationResult:
+    def generate(self, requests: Sequence[Request]) -> GenerationResult:
         """Generate tokens for a batch of Requests.
 
         Each Request provides prompt_tokens, decode_params, and n_generations (clones).
@@ -353,7 +353,6 @@ class InferenceEngine:
 
         Args:
             requests: Sequence of generation requests
-            step_callback: Optional callback function called at each decode iteration with iteration number
         """
         # validate we don't have any sequences with n_generations exceeding max_seqs
         max_needed = max(int(r.n_generations) for r in requests)

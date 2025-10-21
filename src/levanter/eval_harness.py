@@ -767,18 +767,8 @@ class LevanterHarnessLM(TemplateLM):
                 )
             )
 
-        # Create step callback for profiling decode iterations
-        def decode_step_callback(iteration: int):
-            """Called at each decode iteration in the engine."""
-            # Use the iteration number as the step for profiling
-            saved_step = self._current_step
-            self._current_step = iteration
-            self._handle_profiler_step()
-            self._current_step = saved_step
-
         # Pass the callback to the engine if profiling is enabled
-        step_callback = decode_step_callback if self.profiler_config.enabled else None
-        result = engine.generate(gen_requests, step_callback=step_callback)
+        result = engine.generate(gen_requests)
 
         # Decode first generation per request (LM Harness expects one string per request)
         outputs: list[str] = []
