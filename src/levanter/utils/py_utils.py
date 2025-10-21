@@ -181,7 +181,7 @@ class FailSafeJSONEncoder(json.JSONEncoder):
 
     def __init__(self, *args, bytes_strategy="base64", **kwargs):
         # bytes_strategy: "base64" | "repr" | "hex"
-        super().__init__(*args, check_circular=True, **kwargs)
+        super().__init__(*args, **kwargs)
         self.bytes_strategy = bytes_strategy
 
     def default(self, obj):
