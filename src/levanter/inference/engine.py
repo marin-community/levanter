@@ -4,7 +4,6 @@
 import dataclasses
 import functools
 import logging
-import warnings
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
@@ -22,7 +21,6 @@ from levanter.inference.decode_state import (
     PageTableSpec,
     SeqDecodingParams,
 )
-from levanter.inference.utils import INVALID
 from levanter.layers.sampler import Sampler
 from levanter.models.llama import LlamaLMHeadModel
 from levanter.models.lm_model import LmHeadModel
@@ -161,113 +159,6 @@ class InferenceEngineConfig:
         return (self.max_seq_len + self.page_size - 1) // self.page_size
 
 
-def _infer_max_pages_from_hbm(model: LmHeadModel, config: InferenceEngineConfig) -> int:
-    """Infer a KV-page budget using HBM utilization targets."""
-
-    max_pages_per_seq = config.max_pages_per_seq
-
-    try:
-        budget = _available_hbm_budget_bytes(config.hbm_utilization)
-    except Exception as exc:  # pragma: no cover - depends on runtime environment
-        logger.warning(
-            "Falling back to max_seqs * max_pages_per_seq for KV cache sizing because HBM budget "
-            "could not be determined: %s",
-            exc,
-        )
-        return int(config.max_seqs * max_pages_per_seq)
-
-    @functools.lru_cache(maxsize=None)
-    def cache_bytes(num_pages: int) -> int:
-        if num_pages <= 0:
-            raise ValueError("num_pages must be positive when sizing the KV cache.")
-
-        def initial_cache(pages: int) -> int:
-            table = PageTable.init(pages, config.max_seqs, config.page_size, max_pages_per_seq)
-            cache_shape = model.initial_cache(table.spec(), dtype=config.compute_dtype)
-            return cache_shape
-
-        cache_shape = eqx.filter_eval_shape(initial_cache, num_pages)
-
-        return _tree_byte_size(cache_shape)
-
-    bytes_one = cache_bytes(1)
-    if bytes_one > budget:
-        raise ValueError(
-            "HBM budget insufficient to allocate even a single KV cache page. "
-            "Provide `max_pages` explicitly or increase `hbm_utilization`."
-        )
-
-    # Use the previous heuristic as the initial guess before expanding.
-    guess = max(int(config.max_seqs * max_pages_per_seq), 1)
-
-    low = 1
-    high = guess
-    high_bytes = cache_bytes(high)
-
-    if high_bytes <= budget:
-        low = high
-        while True:
-            high *= 2
-            if high > (1 << 20):
-                warnings.warn(
-                    "KV cache size exceeded 1M pages during budget inference; "
-                    "aborting search and using current estimate."
-                )
-                high = 1 << 20
-                break
-            high_bytes = cache_bytes(high)
-            if high_bytes > budget:
-                break
-            low = high
-
-    # Binary search between the known-good lower bound and the first oversized bound.
-    while low + 1 < high:
-        mid = (low + high) // 2
-        mid_bytes = cache_bytes(mid)
-        if mid_bytes <= budget:
-            low = mid
-        else:
-            high = mid
-
-    max_pages = low
-
-    bytes_at_max = cache_bytes(max_pages)
-    next_bytes = cache_bytes(high)
-    per_page = bytes_at_max if max_pages == 1 else bytes_at_max - cache_bytes(max_pages - 1)
-    base_bytes = max(bytes_at_max - per_page * max_pages, 0)
-
-    import humanfriendly as hly
-
-    logger.info(
-        "Auto-computed KV cache budget: base=%s, per_page=%s, budget=%s, used=%s, next=%s -> max_pages=%d",
-        hly.format_size(base_bytes),
-        hly.format_size(per_page),
-        hly.format_size(budget),
-        hly.format_size(bytes_at_max),
-        hly.format_size(next_bytes),
-        max_pages,
-    )
-
-    return max_pages
-
-
-def _compute_sample_indices(pos_ids, slot_ids, seq_lens, max_sample_indices):
-    """
-    Compute positions of last tokens per sequence inside a packed slice.
-
-    Boundary when absolute pos_id equals the post-allocation seq_len - 1 for that sequence.
-    """
-    seq_lens_per_seq = seq_lens["seq", slot_ids]
-    boundary_mask = pos_ids == (seq_lens_per_seq - 1)
-    # jax.debug.print("pos_ids={pos} seq_lens={lens} boundary={b}", pos=pos_ids.array, lens=seq_lens_per_seq.array, b=boundary_mask.array)
-    sample_indices = hax.where(
-        boundary_mask,
-        fill_value=INVALID,
-        new_axis=pos_ids.resolve_axis("position").resize(max_sample_indices),
-    )[0]
-    return sample_indices
-
-
 def _check_stop_sequences(
     generated_tokens: np.ndarray,  # [num_seqs, num_generated]
     stop_tokens: list[list[int]],  # per-sequence stop token lists
@@ -350,21 +241,9 @@ def _run_generation_loop(
     """Run autoregressive generation until all sequences finish or `max_rounds` reached."""
 
     def body(state: DecodeLoopState) -> DecodeLoopState:
-        jax.debug.print("[DECODE_LOOP] step={s} offset={o}", s=state.step, o=state.decode_state.offset)
+        jax.debug.print("[DECODE_LOOP] step={s}", s=state.step)
 
         binfo = state.decode_state.batch_info(kv_cache=state.cache)
-
-        jax.debug.print(
-            "[BATCH_INFO] tokens={t} pos_ids={p} seq_lens={sl}",
-            t=binfo.tokens.array,
-            p=binfo.pos_ids.array,
-            sl=binfo.seq_lens.array,
-        )
-        jax.debug.print(
-            "[BATCH_INFO] cu_q_lens={c} new_token_dests={d}", c=binfo.cu_q_lens.array, d=binfo.new_token_dests.array
-        )
-
-        # Decode logits and sample new tokens
         logits, cache = model.decode(binfo.tokens, state.cache, binfo, binfo.pos_ids)
 
         seed = jax.random.PRNGKey(state.step)
@@ -456,10 +335,7 @@ class InferenceEngine:
     ) -> "InferenceEngine":
         """Build an engine using a EngineConfig for sizing knobs."""
         if config.max_pages is None:
-            inferred_pages = _infer_max_pages_from_hbm(model, config)
-            config = dataclasses.replace(config, max_pages=int(inferred_pages))
-
-        assert config.max_pages is not None
+            config = dataclasses.replace(config, max_pages=config.max_seqs * config.max_seq_len // config.page_size)
 
         spec = PageTableSpec(config.max_pages, config.page_size, config.max_seqs)
         cache = hax.named_jit(model.initial_cache)(spec, dtype=config.compute_dtype)
@@ -498,7 +374,7 @@ class InferenceEngine:
         seq_lens = []
         tokens = []
         pos_ids = []
-        cu_q_lens = []
+        cu_q_lens = [0]
 
         q_len_offset = 0
         total_len = sum([len(req.prompt_tokens) for req in requests])
@@ -508,11 +384,8 @@ class InferenceEngine:
             seq_lens.append(len(req.prompt_tokens))
             tokens.extend(req.prompt_tokens)
             pos_ids.extend(np.arange(len(req.prompt_tokens)))
-            cu_q_lens.append(q_len_offset)
             q_len_offset += len(req.prompt_tokens)
-
-        # Add terminal element to cu_q_lens (required by ragged paged attention kernel)
-        cu_q_lens.append(q_len_offset)
+            cu_q_lens.append(q_len_offset)
 
         # now run prefill. this will fill the KV cache for all of the sequences. we'll then
         # build a new decode state with these pages as the baseline, and new page indices for
@@ -524,7 +397,6 @@ class InferenceEngine:
             pos_ids=hax.NamedArray(np.array(pos_ids), {"position": total_len}),
             cu_q_lens=hax.named(np.array(cu_q_lens, dtype=np.int32), "seq"),  # size is num_seqs + 1
             logprobs=hax.zeros({"position": total_len}),
-            offset=0,
             finished=hax.zeros({"seq": num_seqs}, dtype=jnp.bool_),
         )
 
@@ -535,11 +407,10 @@ class InferenceEngine:
         # `page_indices` of the clone for the first N tokens to refer to the
         # parent sequence.
         # TODO(prefill expansion)
-
         seq_lens = []
         tokens = []
         pos_ids = []
-        cu_q_lens = []
+        cu_q_lens = [0]
 
         q_len_offset = 0
         total_len = sum([len(req.prompt_tokens) for req in requests])
@@ -549,10 +420,7 @@ class InferenceEngine:
             seq_lens.append(len(req.prompt_tokens))
             tokens.append(req.prompt_tokens[-1])
             pos_ids.append(len(req.prompt_tokens) - 1)  # Position of last prompt token
-            cu_q_lens.append(i)  # Offset in current batch (0, 1, 2, ...)
-
-        # Add terminal element to cu_q_lens (required by ragged paged attention kernel)
-        cu_q_lens.append(num_seqs)
+            cu_q_lens.append(i + 1)
 
         decode_state = DecodeState(
             page_spec=self.page_spec,
@@ -561,7 +429,6 @@ class InferenceEngine:
             pos_ids=hax.NamedArray(np.array(pos_ids), {"position": num_seqs}),
             cu_q_lens=hax.named(np.array(cu_q_lens, dtype=np.int32), "seq"),  # size is num_seqs + 1
             logprobs=hax.zeros({"position": num_seqs}),
-            offset=0,
             finished=hax.zeros({"seq": num_seqs}, dtype=jnp.bool_),
         )
 
@@ -579,15 +446,13 @@ class InferenceEngine:
                 stop_tokens_per_seq.append([])
 
         # Outer generation loop: run until all sequences finish or we hit max length
-        max_outer_rounds = (self.config.max_seq_len + self.config.max_rounds - 1) // self.config.max_rounds
+        max_outer_rounds = 1  # (self.config.max_seq_len + self.config.max_rounds - 1) // self.config.max_rounds
         all_tokens = []
         all_logprobs = []
         finished_mask = np.zeros(num_seqs, dtype=bool)
 
         for outer_round in range(max_outer_rounds):
-            logger.info(f"[OUTER_LOOP] Starting outer_round={outer_round}, offset={decode_state.offset}")
-
-            # Run one batch of generation (inner loop)
+            logger.info(f"[OUTER_LOOP] Starting outer_round={outer_round}")
             self.cache, decoded_outputs, decode_state = _run_generation_loop(
                 page_cache=self.cache,
                 decode_state=decode_state,
@@ -596,13 +461,11 @@ class InferenceEngine:
                 num_rounds=self.config.max_rounds,
             )
 
-            # Transfer outputs to host
             outputs = jax.device_get(decoded_outputs)
             all_tokens.append(outputs.tokens)
             all_logprobs.append(outputs.logprobs)
 
             logger.info(f"[OUTER_LOOP] Generated tokens: {outputs.tokens}")
-
             # Check for stop sequences
             # Concatenate all tokens generated so far for each sequence
             tokens_so_far = np.concatenate([t for t in all_tokens], axis=1)
@@ -612,15 +475,6 @@ class InferenceEngine:
             if np.all(finished_mask):
                 logger.info(f"All sequences finished after {outer_round + 1} outer rounds")
                 break
-
-            # Update decode_state for next round
-            # Increment offset so next round knows where to write KV cache
-            decode_state = dataclasses.replace(
-                decode_state,
-                offset=decode_state.offset + self.config.max_rounds,
-            )
-
-            logger.info(f"[OUTER_LOOP] Updated offset to {decode_state.offset}")
 
         # Aggregate all tokens across rounds
         all_tokens_concat = np.concatenate(all_tokens, axis=1)  # [num_seqs, total_rounds]
