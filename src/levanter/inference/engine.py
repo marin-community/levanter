@@ -335,7 +335,10 @@ class InferenceEngine:
     ) -> "InferenceEngine":
         """Build an engine using a EngineConfig for sizing knobs."""
         if config.max_pages is None:
-            config = dataclasses.replace(config, max_pages=config.max_seqs * config.max_seq_len // config.page_size)
+            config = dataclasses.replace(
+                config, max_pages=(config.max_seqs * max(1, config.max_seq_len // config.page_size))
+            )
+            assert config.max_pages > 0, "Imputed max_pages must be > 0"
 
         spec = PageTableSpec(config.max_pages, config.page_size, config.max_seqs)
         cache = hax.named_jit(model.initial_cache)(spec, dtype=config.compute_dtype)

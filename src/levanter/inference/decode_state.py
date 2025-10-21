@@ -296,9 +296,8 @@ class DecodeState(eqx.Module):
                 start = self.cu_q_lens[{"seq": i}]
                 seq_len = self.seq_lens[{"seq": i}]
                 values = token_dests[i][:num_tokens]
-                filter = jnp.arange(num_tokens) > start
-                filter = filter & (jnp.arange(num_tokens) < (start + seq_len))
-                values = jnp.where(filter, values, 0)
+                values = jnp.where(jnp.arange(num_tokens) < (start + seq_len), values, 0)
+                values = jnp.where(jnp.arange(num_tokens) >= start, values, 0)
                 return dests + values
 
             new_token_dests_raw = lax.fori_loop(0, self.num_seqs, fill_seq, new_token_dests_raw)
