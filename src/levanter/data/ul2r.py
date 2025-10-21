@@ -837,10 +837,7 @@ class Ul2rDataset(MappedAsyncDataset[tuple[TokenizedDict, TokenizedDict], LmExam
         self.KPos = KPos
         self.pad_token_id = pad_token_id
 
-        sharding = jax.sharding.SingleDeviceSharding(jax.local_devices(backend="cpu")[0])
-
-        # TODO Equinox≤0.13’s stubs miss filter_jit(out_shardings)
-        @functools.partial(eqx.filter_jit, out_shardings=sharding)
+        @functools.partial(eqx.filter_jit)
         def _create_lm_example(e: tuple[TokenizedDict, TokenizedDict]) -> LmExample:
             example, seg_ids = e
             tokens = hax.named(example["input_ids"], self.QPos)
