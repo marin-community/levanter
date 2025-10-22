@@ -181,13 +181,15 @@ class TreeStore(Generic[T]):
         return await jax.tree.leaves(self.tree)[0].num_rows_async()
 
 
-def _normalize_cache_dir(path: str) -> str:
+def _normalize_cache_dir(path: os.PathLike[str] | str) -> str:
     """Resolve relative file paths to absolute paths while leaving URLs untouched."""
 
-    if _is_probably_url(path):
-        return path
+    path_str = os.fspath(path)
 
-    expanded = os.path.expanduser(path)
+    if _is_probably_url(path_str):
+        return path_str
+
+    expanded = os.path.expanduser(path_str)
     return os.path.abspath(expanded)
 
 
