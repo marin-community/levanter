@@ -223,6 +223,9 @@ class KvPageCache(PageCache):
 class DecodeState(eqx.Module):
     """Decoding state for a batch of sequences."""
 
+    token_dests: ht.i32[NamedArray, " seq position"]  # type: ignore[name-defined]
+    """The target locations for each token in the KV cache."""
+
     page_spec: PageTableSpec = eqx.field(static=True)
 
     seq_lens: ht.i32[NamedArray, " seq"]  # type: ignore[name-defined]
@@ -278,13 +281,15 @@ class DecodeState(eqx.Module):
         return self.seq_lens.shape["seq"]
 
     def batch_info(self, kv_cache: KvPageCache, prefill: bool = False) -> BatchInfo:
-        # define unique token positions for all sequences
-        token_dests = jnp.arange(self.page_spec.pages_per_seq * self.page_spec.page_size * self.num_seqs).reshape(
-            self.num_seqs, -1
+        page_indices = self.token_dests // self.page_spec.page_size
+        # page_indices are per-page, and pages are assumed to be fully filled
+        page_indices = page_indices.array[:, :: self.page_spec.page_size]
+        page_indices = hax.NamedArray(
+            page_indices,
+            {"seq": page_indices.shape[0], "page": page_indices.shape[1]},
         )
-        page_indices = token_dests // self.page_spec.page_size
 
-        # generate an array of shape [tokens] with the apprporiate target locations for each KV update
+        # generate an array of shape [tokens] with the appropriate target locations for each KV update
         # during decode, this is just a lookup, during prefill, we have to scatter from the token_dests
         # static array into the correct positions. we do this with a where and using 0 as a sentinel.
         if prefill:
@@ -295,16 +300,16 @@ class DecodeState(eqx.Module):
             def fill_seq(i, dests):
                 start = self.cu_q_lens[{"seq": i}]
                 seq_len = self.seq_lens[{"seq": i}]
-                values = token_dests[i][:num_tokens]
-                values = jnp.where(jnp.arange(num_tokens) < (start + seq_len), values, 0)
-                values = jnp.where(jnp.arange(num_tokens) >= start, values, 0)
+                values = self.token_dests[{"seq": i, "position": slice(0, num_tokens)}].array
+                values = jnp.where(jnp.arange(num_tokens) < (start + seq_len), values, 0)  # type: ignore
+                values = jnp.where(jnp.arange(num_tokens) >= start, values, 0)  # type: ignore
                 return dests + values
 
             new_token_dests_raw = lax.fori_loop(0, self.num_seqs, fill_seq, new_token_dests_raw)
             new_token_dests = hax.NamedArray(new_token_dests_raw, self.tokens.axes)
         else:
-            new_token_dests_raw = token_dests[jnp.arange(self.num_seqs), self.seq_lens.array]
-            new_token_dests = hax.NamedArray(new_token_dests_raw, {"seq": self.num_seqs})
+            new_token_dests_raw = self.token_dests.array[jnp.arange(self.num_seqs), self.seq_lens.array]
+            new_token_dests = hax.NamedArray(new_token_dests_raw, self.tokens.axes)
 
         jax.debug.print(
             "[BATCH_INFO_BUILD]  tokens={t} pos_ids={p} seq_lens={sl} new_token_dests={ntd}, cu_q_lens={cu}",
@@ -319,7 +324,7 @@ class DecodeState(eqx.Module):
             kv_cache=kv_cache,
             page_size=self.page_spec.page_size,
             cu_q_lens=self.cu_q_lens,
-            page_indices=hax.NamedArray(page_indices, {"seq": self.num_seqs, "page": page_indices.shape[1]}),
+            page_indices=page_indices,
             num_seqs=self.seq_lens.shape["seq"],
             seq_lens=self.seq_lens,
             tokens=self.tokens,

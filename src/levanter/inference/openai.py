@@ -137,7 +137,7 @@ class InferenceServerConfig:
     tokenizer: str | None = None
 
     # Inference service/memory layout configuration
-    service: InferenceEngineConfig = field(default_factory=lambda: InferenceEngineConfig(4096))
+    engine: InferenceEngineConfig = field(default_factory=lambda: InferenceEngineConfig(4096))
 
     # Default generation parameters for API
     temperature: float = 0.7
@@ -257,7 +257,7 @@ class InferenceContext:
             ):
                 self.model = weight_callback(self.model)
                 self.engine = InferenceEngine.from_model_with_config(
-                    model=self.model, tokenizer=self.tokenizer, config=self.config.service
+                    model=self.model, tokenizer=self.tokenizer, config=self.config.engine
                 )
                 elapsed = time.time() - start
             logger.info(f"Model reloaded in {elapsed:.2f}s")
@@ -719,7 +719,7 @@ class InferenceServer:
         This factory method loads the model, tokenizer, and creates all necessary
         components for the inference server.
         """
-        service = InferenceEngine.from_model_with_config(model=model, tokenizer=tokenizer, config=config.service)
+        service = InferenceEngine.from_model_with_config(model=model, tokenizer=tokenizer, config=config.engine)
 
         # Create and start inference thread
         inference_context = InferenceContext(model, tokenizer, service, config)

@@ -165,23 +165,27 @@ def _check_stop_sequences(
     final_position: np.ndarray,
 ) -> np.ndarray:
     """Return the stop index for each for sequence, or -1 if not found."""
-    num_seqs = generated_tokens.shape[0]
+    seq_idx = 0
 
-    for seq_idx in range(num_seqs):
-        if final_position[seq_idx] != -1:
-            continue
+    for req in requests:
+        for _ in range(req.n_generations):
+            if final_position[seq_idx] != -1:
+                seq_idx += 1
+                continue
+            stop_sequences = req.decode_params.stop_tokens
+            if not stop_sequences:
+                seq_idx += 1
+                continue
 
-        stop_sequences = requests[seq_idx].decode_params.stop_tokens
-        if not stop_sequences:
-            continue
-        stop_sequences = stop_sequences.array
-        tokens = generated_tokens[seq_idx]
-        for stop_idx in range(stop_sequences.shape[0]):
-            stop_tokens = stop_sequences[stop_idx].tolist()
-            for i in range(len(tokens) - len(stop_tokens) + 1):
-                if tokens[i : i + len(stop_tokens)].tolist() == stop_tokens:
-                    final_position[seq_idx] = i + len(stop_tokens)
-                    break
+            stop_sequences = stop_sequences.array
+            tokens = generated_tokens[seq_idx]
+            for stop_idx in range(stop_sequences.shape[0]):
+                stop_tokens = stop_sequences[stop_idx].tolist()
+                for i in range(len(tokens) - len(stop_tokens) + 1):
+                    if tokens[i : i + len(stop_tokens)].tolist() == stop_tokens:
+                        final_position[seq_idx] = i + len(stop_tokens)
+                        break
+            seq_idx += 1
 
     return final_position
 
@@ -332,7 +336,7 @@ class InferenceEngine:
             )
             assert config.max_pages > 0, "Imputed max_pages must be > 0"  # type: ignore
 
-        spec = PageTableSpec(config.max_pages, config.page_size, config.max_seqs)  # type: ignore
+        spec = PageTableSpec(max_seqs=config.max_seqs, page_size=config.page_size, num_pages=config.max_pages)  # type: ignore
         cache = hax.named_jit(model.initial_cache)(spec, dtype=config.compute_dtype)
         vocab_axis = model.Vocab
         sampler = Sampler(vocab_axis)
@@ -381,11 +385,18 @@ class InferenceEngine:
             q_len_offset += len(req.prompt_tokens)
             cu_q_lens.append(q_len_offset)
 
-        # now run prefill. this will fill the KV cache for all of the sequences. we'll then
+        # run prefill. this will fill the KV cache for all of the sequences. we'll then
         # build a new decode state with these pages as the baseline, and new page indices for
         # the newly decoded tokens.
+        token_dests = np.arange(
+            self.page_spec.pages_per_seq * self.page_spec.page_size * self.page_spec.max_seqs
+        ).reshape(self.page_spec.max_seqs, -1)
+
         decode_state = DecodeState(
             page_spec=self.page_spec,
+            token_dests=hax.NamedArray(
+                token_dests, {"seq": self.page_spec.max_seqs, "position": token_dests.shape[1]}
+            ),
             seq_lens=hax.NamedArray(np.array(seq_lens), {"seq": num_seqs}),
             tokens=hax.NamedArray(np.array(tokens), {"position": total_len}),
             pos_ids=hax.NamedArray(np.array(pos_ids), {"position": total_len}),
@@ -396,26 +407,32 @@ class InferenceEngine:
 
         self.cache = _run_prefill(self.cache, decode_state, self.model)
 
-        # The prefill kernel has now populated the KV cache for our initial set
-        # of prompts. For clones (n_generations > 1), we populate the
-        # `page_indices` of the clone for the first N tokens to refer to the
-        # parent sequence.
         seq_lens = []
         tokens = []
         pos_ids = []
         cu_q_lens = [0]
 
         q_len_offset = 0
-        total_len = sum([len(req.prompt_tokens) for req in requests])
-        num_seqs = len(requests)
+        total_len = sum([len(req.prompt_tokens) * max(1, req.n_generations) for req in requests])
+        num_seqs = sum(int(max(1, req.n_generations)) for req in requests)
+        seq_offset = 0
 
+        # The prefill kernel has now populated the KV cache for our initial set
+        # of prompts. For clones (n_generations > 1), we now need to adjust the
+        # token_dests for the new decode state so that the newly decoded tokens for each
+        # clone refer to the correct positions in the KV cache.
         for i, req in enumerate(requests):
-            seq_lens.append(len(req.prompt_tokens))
-            tokens.append(req.prompt_tokens[-1])
-            pos_ids.append(len(req.prompt_tokens) - 1)  # Position of last prompt token
-            cu_q_lens.append(i + 1)
+            # copy token dest entries for the original sequence to each clone
+            for j in range(int(req.n_generations)):
+                token_dests[seq_offset, : len(req.prompt_tokens)] = token_dests[i][: len(req.prompt_tokens)]
+                seq_lens.append(len(req.prompt_tokens))
+                tokens.append(req.prompt_tokens[-1])
+                pos_ids.append(len(req.prompt_tokens) - 1)  # Position of last prompt token
+                cu_q_lens.append(i + 1)
+                seq_offset += 1
 
         decode_state = DecodeState(
+            token_dests=hax.NamedArray(token_dests, {"seq": token_dests.shape[0], "position": token_dests.shape[1]}),
             page_spec=self.page_spec,
             seq_lens=hax.NamedArray(np.array(seq_lens), {"seq": num_seqs}),
             tokens=hax.NamedArray(np.array(tokens), {"position": num_seqs}),
@@ -460,18 +477,20 @@ class InferenceEngine:
         all_tokens_concat = np.concatenate(all_tokens, axis=1)  # [num_seqs, total_rounds]
         all_logprobs_concat = np.concatenate(all_logprobs, axis=1)
 
-        # Trim to actual lengths (remove padding zeros or tokens after stop)
-        tokens_list = []
-        logprobs_list = []
         total_generated = 0
 
-        for i in range(num_seqs):
-            seq_tokens = all_tokens_concat[i]
-            seq_logprobs = all_logprobs_concat[i]
-            valid_len = final_position[i] if final_position[i] != -1 else seq_tokens.shape[0]
-            tokens_list.append(seq_tokens[:valid_len].tolist())
-            logprobs_list.append(seq_logprobs[:valid_len].tolist())
-            total_generated += valid_len
+        seq_offset = 0
+        tokens_list = []
+        logprobs_list = []
+        for req in requests:
+            for _ in range(req.n_generations):
+                seq_tokens = all_tokens_concat[seq_offset]
+                seq_logprobs = all_logprobs_concat[seq_offset]
+                valid_len = final_position[seq_offset] if final_position[seq_offset] != -1 else seq_tokens.shape[0]
+                tokens_list.append(seq_tokens[:valid_len].tolist())
+                logprobs_list.append(seq_logprobs[:valid_len].tolist())
+                total_generated += valid_len
+                seq_offset += 1
 
         return GenerationResult(
             tokens=tokens_list,

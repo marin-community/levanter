@@ -166,10 +166,10 @@ class InferenceReplConfig:
     )
     server: InferenceServerConfig = field(
         default_factory=lambda: InferenceServerConfig(
-            service=InferenceEngineConfig(
+            engine=InferenceEngineConfig(
                 page_size=8,
                 max_seq_len=64,
-                max_seqs=2,
+                max_seqs=8,
                 max_queued_tokens=64,
                 max_seqs_in_prefill=1,
                 max_rounds=4,
