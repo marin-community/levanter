@@ -245,7 +245,7 @@ def _run_generation_loop(
         seed = jax.random.PRNGKey(state.step)
         seed = jnp.tile(seed, binfo.num_seqs)
         seed = seed.reshape(binfo.num_seqs, 2)
-        prng_keys = jax.vmap(jax.random.fold_in)(seed, binfo.pos_ids.array)
+        prng_keys = jax.vmap(jax.random.fold_in)(seed, binfo.new_token_dests.array)
         temps = 0.7  # state.decode_state.temperature["seq", new_slot_ids]
         new_tokens, logprobs = hax.vmap(sampler, "position")(logits, temps, key=prng_keys)
 
@@ -421,15 +421,21 @@ class InferenceEngine:
         # of prompts. For clones (n_generations > 1), we now need to adjust the
         # token_dests for the new decode state so that the newly decoded tokens for each
         # clone refer to the correct positions in the KV cache.
+        cloned_dests = token_dests.copy()
+
         for i, req in enumerate(requests):
-            # copy token dest entries for the original sequence to each clone
-            for j in range(int(req.n_generations)):
-                token_dests[seq_offset, : len(req.prompt_tokens)] = token_dests[i][: len(req.prompt_tokens)]
+            for _ in range(int(req.n_generations)):
+                cloned_dests[seq_offset, : len(req.prompt_tokens)] = token_dests[i][: len(req.prompt_tokens)]
+                logger.info(
+                    f"[CLONE_SETUP] After copy token_dests[{seq_offset}, :10] = {cloned_dests[seq_offset, :10]}"
+                )
                 seq_lens.append(len(req.prompt_tokens))
                 tokens.append(req.prompt_tokens[-1])
                 pos_ids.append(len(req.prompt_tokens) - 1)  # Position of last prompt token
-                cu_q_lens.append(i + 1)
+                cu_q_lens.append(seq_offset + 1)
                 seq_offset += 1
+
+        token_dests = cloned_dests
 
         decode_state = DecodeState(
             token_dests=hax.NamedArray(token_dests, {"seq": token_dests.shape[0], "position": token_dests.shape[1]}),
