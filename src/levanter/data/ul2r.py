@@ -189,16 +189,22 @@ def random_segmentation_2(num_items: int, num_segments: int, key: PRNGKeyArray, 
     sorted_perm = jnp.sort(perm_masked)
     threshold = sorted_perm[num_segments - 1]
 
-    # 1 where perm < threshold; so first num_items-1 elements are a random 01
-    # tensor, everything else is 0
-    first_in_segment = jnp.where(perm < threshold, 1, 0)
+    # 1 where perm < threshold; so num_segments-1 random 1s out of the first
+    # num_items-1 elements, everything else is 0
+    first_in_segment = jnp.where(perm_masked < threshold, 1, 0)
 
     # Roll right by 1; guarantees first element is 0
+    # Now there are num_segments-1 random 1s out of the first num_items elements
+    # (perm_masked[padded_length-1] = padded_length because
+    # padded_length-1 >= num_items-1 and
+    # padded_length >= max perm_masked >= threshold)
     first_in_segment = jnp.roll(first_in_segment, 1)
 
     # Set position num_items to 1 (marks end of all segments)
     first_in_segment = first_in_segment.at[num_items].set(1)
 
+    # The 1s mark the ends of the num_segments random segments, so segment_sum
+    # on the cumsum gives us the segment lengths
     segment_id = jnp.cumsum(first_in_segment)
     segment_length = jax.ops.segment_sum(jnp.ones_like(segment_id), segment_id, padded_length)
 
@@ -624,7 +630,7 @@ def compute_denoising_length(
             length, noise_density, mean_noise_span_length
         )
         # [task_token] one <sentinel_0> three <sentinel_0> two
-        return 1 + num_noise_spans + length
+        return 1 + 2 * num_noise_spans + length
 
     def s_length() -> jnp.ndarray:
         # [task_token] one <sentinel_0> two three
