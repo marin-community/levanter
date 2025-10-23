@@ -117,6 +117,7 @@ class InferenceEngineConfig:
     # Stop-token capacity (used for validation and buffer sizing at init)
     max_stop_seqs: int = 4
     """Maximum number of stop sequences per active sequence. 0 disables stop tokens."""
+
     max_stop_tokens: int = 16
     """Maximum tokens per stop sequence (position axis length)."""
 
@@ -137,34 +138,8 @@ class InferenceEngineConfig:
     compute_dtype: jnp.dtype = jnp.bfloat16
     """KV cache dtype. Default bfloat16 for performance/accuracy balance."""
 
-    max_queued_tokens: int = 512
-    """Capacity of the token queue used between sampling and decode packing."""
-
-    max_seqs_in_prefill: int = 16
-    """Maximum number of sequences to batch in prefill before flushing."""
-
     prefill_token_buckets: tuple[int, ...] = (128, 256, 512, 1024, 2048, 4096, 8192, 16384)
     """Power-of-2 buckets for prefill token padding. Prefill will pad to next largest bucket."""
-
-    # Decode loop knobs
-    max_tokens_per_round: int | None = None
-    """Pack size for each decode loop iteration. If None, set to max_seqs """
-
-    def __post_init__(self):
-        # this one is only required because of clones. If we really care, we could relax this
-        if self.max_queued_tokens < self.max_seqs:
-            raise ValueError("max_queued_tokens must be >= max_seqs")
-
-        if self.max_queued_tokens < self.imputed_max_tokens_per_round:
-            raise ValueError("max_queued_tokens must be >= max_tokens_per_round")
-
-        if self.max_queued_tokens < self.max_seqs_in_prefill:
-            raise ValueError("max_queued_tokens must be >= max_seqs_in_prefill")
-
-    @property
-    def imputed_max_tokens_per_round(self) -> int:
-        """Return explicit `max_tokens_per_round` or default to `max_seqs` when unset."""
-        return self.max_tokens_per_round if self.max_tokens_per_round is not None else self.max_seqs
 
     @property
     def max_pages_per_seq(self) -> int:
@@ -205,9 +180,7 @@ def _check_stop_sequences(
 def build_prefill_state(
     requests: Sequence[Request],
     page_spec: PageTableSpec,
-    max_seqs_in_prefill: int,
     token_buckets: tuple[int, ...],
-    pad_token_id: int = 0,
 ) -> DecodeState:
     """Build decode state for prefill phase with static shapes.
 
@@ -224,69 +197,58 @@ def build_prefill_state(
     Returns:
         DecodeState configured for prefill phase with static shapes
     """
-    # Compute actual sizes
-    actual_num_seqs = len(requests)
-    seq_lens_list = [len(req.prompt_tokens) for req in requests]
-    actual_total_len = sum(seq_lens_list)
+    max_seq_len = _bucket_size(
+        max(len(req.prompt_tokens) for req in requests),
+        token_buckets,
+    )
 
-    # Determine padded sizes
-    padded_num_seqs = max_seqs_in_prefill  # Always use max for static shapes
-    padded_total_len = _bucket_size(actual_total_len, token_buckets)
+    seq_lens = np.zeros(page_spec.max_seqs, dtype=np.int32)
+    cu_q_lens = np.zeros(page_spec.max_seqs + 1, dtype=np.int32)
 
-    # Build packed token arrays (actual data)
-    tokens_list = []
-    pos_ids_list = []
-    cu_q_lens_list = [0]
+    tokens = np.zeros(max_seq_len, dtype=np.int32)
+    pos_ids = np.zeros(max_seq_len, dtype=np.int32)
+    seq_offset = 0
 
-    q_len_offset = 0
     for req in requests:
-        tokens_list.extend(req.prompt_tokens)
-        pos_ids_list.extend(range(len(req.prompt_tokens)))
-        q_len_offset += len(req.prompt_tokens)
-        cu_q_lens_list.append(q_len_offset)
+        tokens[seq_offset:seq_offset + len(req.prompt_tokens)] = req.prompt_tokens
+        pos_ids[seq_offset:seq_offset + len(req.prompt_tokens)] = np.arange(len(req.prompt_tokens))
+        seq_lens[seq_offset] = len(req.prompt_tokens)
+        cu_q_lens[seq_offset + 1] = seq_offset + len(req.prompt_tokens)
+        seq_offset += len(req.prompt_tokens)
 
-    # Pad tokens and pos_ids to bucketed size
-    # Use the last real token as padding to avoid zeros in attention output
-    last_token = tokens_list[-1] if tokens_list else pad_token_id
-    last_pos = pos_ids_list[-1] if pos_ids_list else 0
-
-    tokens_array = np.full(padded_total_len, last_token, dtype=np.int32)
-    tokens_array[:actual_total_len] = tokens_list
-
-    pos_ids_array = np.full(padded_total_len, last_pos, dtype=np.int32)
-    pos_ids_array[:actual_total_len] = pos_ids_list
-
-    seq_lens_array = np.zeros(padded_num_seqs, dtype=np.int32)
-    seq_lens_array[:actual_num_seqs] = seq_lens_list
-
-    cu_q_lens_array = np.full(padded_num_seqs + 1, actual_total_len, dtype=np.int32)
-    cu_q_lens_array[: actual_num_seqs + 1] = cu_q_lens_list
+    for i in range(len(requests), page_spec.max_seqs):
+        cu_q_lens[i + 1] = cu_q_lens[i]
 
     token_dests = np.arange(
         page_spec.pages_per_seq * page_spec.page_size * page_spec.max_seqs
     ).reshape(page_spec.max_seqs, -1)
 
     # Mark finished sequences (padding sequences are already finished)
-    finished_array = np.ones(padded_num_seqs, dtype=bool)
-    finished_array[:actual_num_seqs] = False
+    finished_array = np.ones(tokens.shape, dtype=bool)
+    finished_array[:len(requests)] = False
 
-    cu_seq_lens = [0] + np.cumsum(seq_lens_array, dtype=np.int32).tolist()
-
-    logger.info(
-        f"[PREFILL_STATE] actual_seqs={actual_num_seqs}, padded_seqs={padded_num_seqs}, "
-        f"actual_tokens={actual_total_len}, padded_tokens={padded_total_len}"
-    )
+    # logger.info(
+    #     "[PREFILL_STATE] actual_seqs=%s"
+    #     "actual_tokens=%s "
+    #     "pos_ids=%s "
+    #     "seq_lens=%s "
+    #     "cu_q_lens=%s ",
+    #     len(requests),
+    #     tokens,
+    #     pos_ids,
+    #     seq_lens,
+    #     cu_q_lens,
+    # )
 
     return DecodeState(
-        num_seqs=actual_num_seqs,
+        num_seqs=len(requests),
         page_spec=page_spec,
         token_dests=hax.named(token_dests, ("seq", "position")),
-        seq_lens=hax.named(seq_lens_array, "seq"),
-        tokens=hax.named(tokens_array, "position"),
-        pos_ids=hax.named(pos_ids_array, "position"),
-        cu_q_lens=hax.named(cu_q_lens_array, "seq"),
-        cu_seq_lens=hax.named(np.array(cu_seq_lens), "seq"),
-        logprobs=hax.zeros({"position": padded_total_len}),
+        seq_lens=hax.named(seq_lens, "seq"),
+        tokens=hax.named(tokens, "position"),
+        pos_ids=hax.named(pos_ids, "position"),
+        cu_q_lens=hax.named(cu_q_lens, "seq"),
+        logprobs=hax.zeros({"position": tokens.shape[0]}),
         finished=hax.named(finished_array, "seq"),
     )
 
@@ -313,7 +275,6 @@ def build_decode_state(
     tokens = np.zeros(page_spec.max_seqs, dtype=np.int32)
     pos_ids = np.zeros(page_spec.max_seqs, dtype=np.int32)
     cu_q_lens = np.zeros(page_spec.max_seqs + 1, dtype=np.int32)
-    cu_seq_lens = np.zeros(page_spec.max_seqs + 1, dtype=np.int32)
     num_seqs = sum(int(max(1, req.n_generations)) for req in requests)
     seq_offset = 0
 
@@ -328,8 +289,10 @@ def build_decode_state(
             tokens[seq_offset] = req.prompt_tokens[-1]  # Last prompt token
             pos_ids[seq_offset] = len(req.prompt_tokens) - 1
             cu_q_lens[seq_offset + 1] = seq_offset + 1
-            cu_seq_lens[seq_offset + 1] = cu_seq_lens[seq_offset] + len(req.prompt_tokens)
             seq_offset += 1
+    
+    for i in range(num_seqs, page_spec.max_seqs):
+        cu_q_lens[i + 1] = cu_q_lens[i]
     
     return DecodeState(
         num_seqs=num_seqs,
@@ -339,7 +302,6 @@ def build_decode_state(
         tokens=hax.named(tokens, "position"),
         pos_ids=hax.named(pos_ids, "position"),
         cu_q_lens=hax.named(cu_q_lens, "seq"),
-        cu_seq_lens=hax.named(cu_seq_lens, "seq"),
         logprobs=hax.zeros({"position": page_spec.max_seqs}),
         finished=hax.zeros({"seq": page_spec.max_seqs}, dtype=jnp.bool_),
     )
@@ -392,8 +354,6 @@ def _run_generation_loop(
     """Run autoregressive generation until all sequences finish or `max_rounds` reached."""
 
     def body(state: DecodeLoopState) -> DecodeLoopState:
-        jax.debug.print("[DECODE_LOOP] step={s}", s=state.step)
-
         binfo = state.decode_state.batch_info(kv_cache=state.cache)
         logits, cache = model.decode(binfo.tokens, state.cache, binfo, binfo.pos_ids)
 
@@ -403,9 +363,7 @@ def _run_generation_loop(
         prng_keys = jax.vmap(jax.random.fold_in)(seed, binfo.new_token_dests.array)
         temps = 0.7  # state.decode_state.temperature["seq", new_slot_ids]
         new_tokens, logprobs = hax.vmap(sampler, "position")(logits, temps, key=prng_keys)
-
-        jax.debug.print("[SAMPLED] new_tokens={t} logprobs={lp}", t=new_tokens.array, lp=logprobs.array)
-
+        
         # Update decode state with the sampled tokens
         decode_state = state.decode_state.update_tokens(new_tokens=new_tokens, new_logprobs=logprobs, step=state.step)
         outputs = state.outputs.update(new_tokens=new_tokens, new_logprobs=logprobs, step=state.step)
@@ -507,10 +465,10 @@ class InferenceEngine:
             requests: Sequence of generation requests
         """
         # Validate batch size doesn't exceed prefill capacity
-        if len(requests) > self.config.max_seqs_in_prefill:
+        if len(requests) > self.config.max_seqs:
             raise ValueError(
-                f"Batch size ({len(requests)}) exceeds max_seqs_in_prefill ({self.config.max_seqs_in_prefill}). "
-                "Decompose your request into smaller batches or increase max_seqs_in_prefill."
+                f"Batch size ({len(requests)}) exceeds max_seqs ({self.config.max_seqs}). "
+                "Decompose your request into smaller batches or increase max_seqs."
             )
 
         # validate we don't have any sequences with n_generations exceeding max_seqs
@@ -521,16 +479,11 @@ class InferenceEngine:
                 "Decompose your request into smaller batches or increase max_seqs when building the service."
             )
 
-        # Get pad token ID from tokenizer
-        pad_token_id = getattr(self.tokenizer, "pad_token_id", None) or 0
-
         # Build prefill state with static shapes and run prefill to populate KV cache
         decode_state = build_prefill_state(
             requests,
             self.page_spec,
-            max_seqs_in_prefill=self.config.max_seqs_in_prefill,
             token_buckets=self.config.prefill_token_buckets,
-            pad_token_id=pad_token_id,
         )
         self.cache = _run_prefill(self.cache, decode_state, self.model)
 
@@ -559,8 +512,6 @@ class InferenceEngine:
             outputs = jax.device_get(decoded_outputs)
             all_tokens.append(outputs.tokens)
             all_logprobs.append(outputs.logprobs)
-
-            # logger.info(f"[OUTER_LOOP] Generated tokens: {outputs.tokens}")
 
             # Concatenate all tokens generated so far for each sequence
             tokens_so_far = np.concatenate(all_tokens, axis=1)

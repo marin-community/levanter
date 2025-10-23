@@ -231,9 +231,6 @@ class DecodeState(eqx.Module):
     seq_lens: ht.i32[NamedArray, " seq"]  # type: ignore[name-defined]
     """The length of each sequence."""
 
-    cu_seq_lens: ht.i32[NamedArray, " seq"]  # type: ignore[name-defined]
-    """The cumulative lengths for the sequences."""
-
     # N.B. The _query_ vector is recomputed each step. So cu_q_lens does _not_ refer
     # to the sequence length across the entire decode, but only the current step.
     cu_q_lens: ht.i32[NamedArray, " seq"]  # type: ignore[name-defined]
@@ -265,21 +262,17 @@ class DecodeState(eqx.Module):
         seq_lens = jnp.where(jnp.arange(self.max_seqs) < self.num_seqs, self.seq_lens.array + 1, self.seq_lens.array) # type: ignore
         pos_ids = jnp.where(jnp.arange(self.max_seqs) < self.num_seqs, self.pos_ids.array + 1, self.pos_ids.array) # type: ignore
 
-        jax.debug.print(
-            "[UPDATE_TOKENS] tokens_after={ta} pos_ids_after={pa} seq_lens_after={sla}",
-            ta=new_tokens.array,
-            pa=pos_ids,
-            sla=seq_lens,
-        )
+        # jax.debug.print(
+        #     "[UPDATE_TOKENS] tokens_after={ta} pos_ids_after={pa} seq_lens_after={sla}",
+        #     ta=new_tokens.array,
+        #     pa=pos_ids,
+        #     sla=seq_lens,
+        # )
 
         return dataclasses.replace(
             self,
             tokens=new_tokens,
             logprobs=new_logprobs,
-            cu_seq_lens=hax.named(
-                jnp.pad(jnp.cumsum(seq_lens, axis=0, dtype=jnp.int32), (1, 0), constant_values=0), 
-                self.cu_seq_lens.axes,
-            ),
             pos_ids=hax.named(pos_ids, self.pos_ids.axes),
             seq_lens=hax.named(seq_lens, self.seq_lens.axes),
             finished=self.finished,

@@ -168,11 +168,9 @@ class InferenceReplConfig:
         default_factory=lambda: InferenceServerConfig(
             engine=InferenceEngineConfig(
                 page_size=8,
-                tokens_per_round=4,
+                tokens_per_round=32,
                 max_seq_len=64,
                 max_seqs=8,
-                max_queued_tokens=64,
-                max_seqs_in_prefill=1,
             ),
         )
     )
