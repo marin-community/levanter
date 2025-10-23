@@ -60,6 +60,15 @@ def _available_hbm_budget_bytes(hbm_utilization: float) -> int:
     return min(budgets)
 
 
+def _bucket_size(actual_size: int, buckets: tuple[int, ...]) -> int:
+    """Return the smallest bucket >= actual_size."""
+    for bucket in buckets:
+        if actual_size <= bucket:
+            return bucket
+    # If exceeds all buckets, round up to next power of 2
+    return 1 << (actual_size - 1).bit_length()
+
+
 @dataclass(frozen=True)
 class Request:
     """A request for generation of a single sequence."""
@@ -102,8 +111,8 @@ class InferenceEngineConfig:
     page_size: int = 128
     """Tokens per KV page."""
 
-    max_rounds: int = 32
-    """Maximum number of while-loop iterations per decode call. Higher values increase throughput but also latency."""
+    tokens_per_round: int = 4
+    """Number of while-loop iterations per decode call. Higher values increase throughput but also latency."""
 
     # Stop-token capacity (used for validation and buffer sizing at init)
     max_stop_seqs: int = 4
@@ -133,6 +142,9 @@ class InferenceEngineConfig:
 
     max_seqs_in_prefill: int = 16
     """Maximum number of sequences to batch in prefill before flushing."""
+
+    prefill_token_buckets: tuple[int, ...] = (128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+    """Power-of-2 buckets for prefill token padding. Prefill will pad to next largest bucket."""
 
     # Decode loop knobs
     max_tokens_per_round: int | None = None
@@ -193,51 +205,89 @@ def _check_stop_sequences(
 def build_prefill_state(
     requests: Sequence[Request],
     page_spec: PageTableSpec,
+    max_seqs_in_prefill: int,
+    token_buckets: tuple[int, ...],
+    pad_token_id: int = 0,
 ) -> DecodeState:
-    """Build decode state for prefill phase from requests.
+    """Build decode state for prefill phase with static shapes.
 
-    Constructs packed sequence arrays (tokens, pos_ids, seq_lens, cu_q_lens)
-    and token_dests mapping for the initial prompt processing.
+    Pads to static sizes based on power-of-2 bucketing for XLA compilation.
+    Padding sequences have seq_lens=0 and are naturally skipped by attention.
 
     Args:
         requests: Sequence of generation requests
         page_spec: Page table specification
+        max_seqs_in_prefill: Maximum number of sequences (for padding)
+        token_buckets: Power-of-2 buckets for token padding
+        pad_token_id: Token ID to use for padding (default 0)
 
     Returns:
-        DecodeState configured for prefill phase
+        DecodeState configured for prefill phase with static shapes
     """
-    seq_lens = []
-    tokens = []
-    pos_ids = []
-    cu_q_lens = [0]
+    # Compute actual sizes
+    actual_num_seqs = len(requests)
+    seq_lens_list = [len(req.prompt_tokens) for req in requests]
+    actual_total_len = sum(seq_lens_list)
+
+    # Determine padded sizes
+    padded_num_seqs = max_seqs_in_prefill  # Always use max for static shapes
+    padded_total_len = _bucket_size(actual_total_len, token_buckets)
+
+    # Build packed token arrays (actual data)
+    tokens_list = []
+    pos_ids_list = []
+    cu_q_lens_list = [0]
 
     q_len_offset = 0
     for req in requests:
-        seq_lens.append(len(req.prompt_tokens))
-        tokens.extend(req.prompt_tokens)
-        pos_ids.extend(np.arange(len(req.prompt_tokens)))
+        tokens_list.extend(req.prompt_tokens)
+        pos_ids_list.extend(range(len(req.prompt_tokens)))
         q_len_offset += len(req.prompt_tokens)
-        cu_q_lens.append(q_len_offset)
+        cu_q_lens_list.append(q_len_offset)
 
-    total_len = sum(seq_lens)
-    num_seqs = len(requests)
+    # Pad tokens and pos_ids to bucketed size
+    # Use the last real token as padding to avoid zeros in attention output
+    last_token = tokens_list[-1] if tokens_list else pad_token_id
+    last_pos = pos_ids_list[-1] if pos_ids_list else 0
 
-    # Build token_dests mapping
+    tokens_array = np.full(padded_total_len, last_token, dtype=np.int32)
+    tokens_array[:actual_total_len] = tokens_list
+
+    pos_ids_array = np.full(padded_total_len, last_pos, dtype=np.int32)
+    pos_ids_array[:actual_total_len] = pos_ids_list
+
+    seq_lens_array = np.zeros(padded_num_seqs, dtype=np.int32)
+    seq_lens_array[:actual_num_seqs] = seq_lens_list
+
+    cu_q_lens_array = np.full(padded_num_seqs + 1, actual_total_len, dtype=np.int32)
+    cu_q_lens_array[: actual_num_seqs + 1] = cu_q_lens_list
+
     token_dests = np.arange(
         page_spec.pages_per_seq * page_spec.page_size * page_spec.max_seqs
     ).reshape(page_spec.max_seqs, -1)
 
+    # Mark finished sequences (padding sequences are already finished)
+    finished_array = np.ones(padded_num_seqs, dtype=bool)
+    finished_array[:actual_num_seqs] = False
+
+    cu_seq_lens = [0] + np.cumsum(seq_lens_array, dtype=np.int32).tolist()
+
+    logger.info(
+        f"[PREFILL_STATE] actual_seqs={actual_num_seqs}, padded_seqs={padded_num_seqs}, "
+        f"actual_tokens={actual_total_len}, padded_tokens={padded_total_len}"
+    )
+
     return DecodeState(
+        num_seqs=actual_num_seqs,
         page_spec=page_spec,
-        token_dests=hax.NamedArray(
-            token_dests, {"seq": page_spec.max_seqs, "position": token_dests.shape[1]}
-        ),
-        seq_lens=hax.NamedArray(np.array(seq_lens), {"seq": num_seqs}),
-        tokens=hax.NamedArray(np.array(tokens), {"position": total_len}),
-        pos_ids=hax.NamedArray(np.array(pos_ids), {"position": total_len}),
-        cu_q_lens=hax.named(np.array(cu_q_lens, dtype=np.int32), "seq"),
-        logprobs=hax.zeros({"position": total_len}),
-        finished=hax.zeros({"seq": num_seqs}, dtype=jnp.bool_),
+        token_dests=hax.named(token_dests, ("seq", "position")),
+        seq_lens=hax.named(seq_lens_array, "seq"),
+        tokens=hax.named(tokens_array, "position"),
+        pos_ids=hax.named(pos_ids_array, "position"),
+        cu_q_lens=hax.named(cu_q_lens_array, "seq"),
+        cu_seq_lens=hax.named(np.array(cu_seq_lens), "seq"),
+        logprobs=hax.zeros({"position": padded_total_len}),
+        finished=hax.named(finished_array, "seq"),
     )
 
 
@@ -259,11 +309,11 @@ def build_decode_state(
     Returns:
         DecodeState configured for autoregressive decode phase
     """
-    seq_lens = []
-    tokens = []
-    pos_ids = []
-    cu_q_lens = [0]
-
+    seq_lens = np.zeros(page_spec.max_seqs, dtype=np.int32)
+    tokens = np.zeros(page_spec.max_seqs, dtype=np.int32)
+    pos_ids = np.zeros(page_spec.max_seqs, dtype=np.int32)
+    cu_q_lens = np.zeros(page_spec.max_seqs + 1, dtype=np.int32)
+    cu_seq_lens = np.zeros(page_spec.max_seqs + 1, dtype=np.int32)
     num_seqs = sum(int(max(1, req.n_generations)) for req in requests)
     seq_offset = 0
 
@@ -277,21 +327,24 @@ def build_decode_state(
             logger.info(
                 f"[CLONE_SETUP] After copy token_dests[{seq_offset}, :10] = {cloned_dests[seq_offset, :10]}"
             )
-            seq_lens.append(len(req.prompt_tokens))
-            tokens.append(req.prompt_tokens[-1])  # Last prompt token
-            pos_ids.append(len(req.prompt_tokens) - 1)
-            cu_q_lens.append(seq_offset + 1)
+            seq_lens[seq_offset] = len(req.prompt_tokens)
+            tokens[seq_offset] = req.prompt_tokens[-1]  # Last prompt token
+            pos_ids[seq_offset] = len(req.prompt_tokens) - 1
+            cu_q_lens[seq_offset + 1] = seq_offset + 1
+            cu_seq_lens[seq_offset + 1] = cu_seq_lens[seq_offset] + len(req.prompt_tokens)
             seq_offset += 1
-
+    
     return DecodeState(
-        token_dests=hax.NamedArray(cloned_dests, {"seq": cloned_dests.shape[0], "position": cloned_dests.shape[1]}),
+        num_seqs=num_seqs,
+        token_dests=hax.named(cloned_dests, ("seq", "position")),
         page_spec=page_spec,
-        seq_lens=hax.NamedArray(np.array(seq_lens), {"seq": num_seqs}),
-        tokens=hax.NamedArray(np.array(tokens), {"position": num_seqs}),
-        pos_ids=hax.NamedArray(np.array(pos_ids), {"position": num_seqs}),
-        cu_q_lens=hax.named(np.array(cu_q_lens, dtype=np.int32), "seq"),
-        logprobs=hax.zeros({"position": num_seqs}),
-        finished=hax.zeros({"seq": num_seqs}, dtype=jnp.bool_),
+        seq_lens=hax.named(seq_lens, "seq"),
+        tokens=hax.named(tokens, "position"),
+        pos_ids=hax.named(pos_ids, "position"),
+        cu_q_lens=hax.named(cu_q_lens, "seq"),
+        cu_seq_lens=hax.named(cu_seq_lens, "seq"),
+        logprobs=hax.zeros({"position": page_spec.max_seqs}),
+        finished=hax.zeros({"seq": page_spec.max_seqs}, dtype=jnp.bool_),
     )
 
 
@@ -348,8 +401,8 @@ def _run_generation_loop(
         logits, cache = model.decode(binfo.tokens, state.cache, binfo, binfo.pos_ids)
 
         seed = jax.random.PRNGKey(state.step)
-        seed = jnp.tile(seed, binfo.num_seqs)
-        seed = seed.reshape(binfo.num_seqs, 2)
+        seed = jnp.tile(seed, binfo.max_seqs)
+        seed = seed.reshape(binfo.max_seqs, 2)
         prng_keys = jax.vmap(jax.random.fold_in)(seed, binfo.new_token_dests.array)
         temps = 0.7  # state.decode_state.temperature["seq", new_slot_ids]
         new_tokens, logprobs = hax.vmap(sampler, "position")(logits, temps, key=prng_keys)
@@ -359,13 +412,6 @@ def _run_generation_loop(
         # Update decode state with the sampled tokens
         decode_state = state.decode_state.update_tokens(new_tokens=new_tokens, new_logprobs=logprobs, step=state.step)
         outputs = state.outputs.update(new_tokens=new_tokens, new_logprobs=logprobs, step=state.step)
-
-        jax.debug.print(
-            "[AFTER_UPDATE] tokens={t} pos_ids={p} seq_lens={sl}",
-            t=decode_state.tokens.array,
-            p=decode_state.pos_ids.array,
-            sl=decode_state.seq_lens.array,
-        )
 
         return DecodeLoopState(
             step=state.step + 1,
@@ -379,8 +425,8 @@ def _run_generation_loop(
 
     # Allocate an outputs buffer sized for this run
     outputs_buf = DecodeOutputs(
-        logprobs=jnp.zeros((decode_state.num_seqs, num_rounds), dtype=jnp.float32),
-        tokens=jnp.zeros((decode_state.num_seqs, num_rounds), dtype=jnp.int32),
+        logprobs=jnp.zeros((decode_state.max_seqs, num_rounds), dtype=jnp.float32),
+        tokens=jnp.zeros((decode_state.max_seqs, num_rounds), dtype=jnp.int32),
     )
     init_state = DecodeLoopState(step=0, cache=page_cache, outputs=outputs_buf, decode_state=decode_state)
     final_state = jax.lax.while_loop(cond, body, init_state)
@@ -463,6 +509,13 @@ class InferenceEngine:
         Args:
             requests: Sequence of generation requests
         """
+        # Validate batch size doesn't exceed prefill capacity
+        if len(requests) > self.config.max_seqs_in_prefill:
+            raise ValueError(
+                f"Batch size ({len(requests)}) exceeds max_seqs_in_prefill ({self.config.max_seqs_in_prefill}). "
+                "Decompose your request into smaller batches or increase max_seqs_in_prefill."
+            )
+
         # validate we don't have any sequences with n_generations exceeding max_seqs
         max_needed = max(int(r.n_generations) for r in requests)
         if max_needed > int(self.page_spec.max_seqs):
@@ -471,17 +524,26 @@ class InferenceEngine:
                 "Decompose your request into smaller batches or increase max_seqs when building the service."
             )
 
-        # Build prefill state and run prefill to populate KV cache
-        decode_state = build_prefill_state(requests, self.page_spec)
+        # Get pad token ID from tokenizer
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None) or 0
+
+        # Build prefill state with static shapes and run prefill to populate KV cache
+        decode_state = build_prefill_state(
+            requests,
+            self.page_spec,
+            max_seqs_in_prefill=self.config.max_seqs_in_prefill,
+            token_buckets=self.config.prefill_token_buckets,
+            pad_token_id=pad_token_id,
+        )
         self.cache = _run_prefill(self.cache, decode_state, self.model)
 
         # Build decode state for autoregressive generation, handling clones
-        prefill_token_dests = decode_state.token_dests.array
+        prefill_token_dests = jax.device_get(decode_state.token_dests).array
         decode_state = build_decode_state(requests, self.page_spec, prefill_token_dests)
         num_seqs = decode_state.num_seqs
 
         # Outer generation loop: run until all sequences finish or we hit max length
-        max_outer_rounds = (self.config.max_seq_len + self.config.max_rounds - 1) // self.config.max_rounds
+        max_outer_rounds = (self.config.max_seq_len + self.config.tokens_per_round - 1) // self.config.tokens_per_round
         all_tokens = []
         all_logprobs = []
         final_position = np.full(num_seqs, -1, dtype=np.int32)
@@ -493,7 +555,7 @@ class InferenceEngine:
                 decode_state=decode_state,
                 sampler=self.sampler,
                 model=self.model,
-                num_rounds=self.config.max_rounds,
+                num_rounds=self.config.tokens_per_round,
             )
 
             outputs = jax.device_get(decoded_outputs)

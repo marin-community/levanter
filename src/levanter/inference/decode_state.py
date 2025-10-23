@@ -130,16 +130,21 @@ class BatchInfo(eqx.Module):
     kv_cache: PageCache
     page_size: int = eqx.field(static=True)
 
+    # the true number of (non-padded) sequences in the batch
     num_seqs: jnp.ndarray
 
+    @property
+    def max_seqs(self) -> int:
+        return self.seq_lens.shape["seq"]
+
     seq_lens: ht.i32[NamedArray, " seq"]  # type: ignore[name-defined]
-    """The length of each sequence."""
+    """The length of each sequence, padded with zeros."""
 
     tokens: ht.i32[NamedArray, " seq position"]  # type: ignore[name-defined]
-    """The token IDs for each sequence in the batch."""
+    """The token IDs for each sequence in the batch, padded with INVALID."""
 
     pos_ids: ht.i32[NamedArray, " seq position"]  # type: ignore[name-defined]
-    """The position IDs for each sequence in the batch."""
+    """The position IDs for each sequence in the batch, padded with zeros."""
 
     cu_q_lens: ht.i32[NamedArray, " seq"]  # type: ignore[name-defined]
     """..."""
@@ -196,18 +201,10 @@ class KvPageCache(PageCache):
         batch_info: BatchInfo,
     ) -> "KvPageCache":
         """Append keys and values to the cache based on *batch_info*."""
-        # K should be the number of tokens, not the number of sequences
-        K = jnp.asarray(new_k.array.shape[0], jnp.int32)
+        # K should be the number of VALID tokens (excluding padding)
+        # Count non-INVALID entries in new_token_dests
+        K = jnp.sum(is_valid(batch_info.new_token_dests).astype(jnp.int32).array)
         t_pages, t_slots = batch_info.pages_and_slots()  # [T] int32 (first K valid)
-
-        # jax.debug.print(
-        #     "[KV_UPDATE] K={k} new_token_dests={d} t_pages={p} t_slots={s}",
-        #     k=K,
-        #     d=batch_info.new_token_dests.array,
-        #     p=t_pages.array,
-        #     s=t_slots.array,
-        # )
-
         updated = kv_update_unified_prefix(
             self.kv_pages.array,
             t_pages.astype(jnp.int32).array,
@@ -223,13 +220,19 @@ class KvPageCache(PageCache):
 class DecodeState(eqx.Module):
     """Decoding state for a batch of sequences."""
 
-    token_dests: ht.i32[NamedArray, " seq position"]  # type: ignore[name-defined]
-    """The target locations for each token in the KV cache."""
+    num_seqs: jnp.ndarray
+    """The number of sequences in the batch."""
 
     page_spec: PageTableSpec = eqx.field(static=True)
 
+    token_dests: ht.i32[NamedArray, " seq position"]  # type: ignore[name-defined]
+    """The target locations for each token in the KV cache."""
+
     seq_lens: ht.i32[NamedArray, " seq"]  # type: ignore[name-defined]
     """The length of each sequence."""
+
+    cu_seq_lens: ht.i32[NamedArray, " seq"]  # type: ignore[name-defined]
+    """The cumulative lengths for the sequences."""
 
     # N.B. The _query_ vector is recomputed each step. So cu_q_lens does _not_ refer
     # to the sequence length across the entire decode, but only the current step.
@@ -248,37 +251,39 @@ class DecodeState(eqx.Module):
     finished: ht.bool_[NamedArray, " seq"]  # type: ignore[name-defined]
     """Whether each sequence has completed generation."""
 
-    def update_tokens(self, step: jnp.ndarray, new_tokens: NamedArray, new_logprobs: NamedArray):
-        jax.debug.print(
-            "[UPDATE_TOKENS] step={s} new_tokens={t} self.tokens_before={tb} self.pos_ids_before={pb}",
-            s=step,
-            t=new_tokens.array,
-            tb=self.tokens.array,
-            pb=self.pos_ids.array,
-        )
+    @property
+    def max_seqs(self) -> int:
+        return self.page_spec.max_seqs
 
-        seq_lens = self.seq_lens + 1
-        pos_ids = self.pos_ids + 1
+    def __post_init__(self):
+        assert self.token_dests.shape["seq"] == self.page_spec.max_seqs, (self.token_dests, self.page_spec)
+        assert self.tokens.shape["position"] <= self.page_spec.tokens_per_seq * self.page_spec.max_seqs, (self.tokens.shape, self.page_spec)
+        assert self.tokens.shape["position"] >= self.max_seqs, (self.tokens.shape, self.page_spec)
+
+
+    def update_tokens(self, step: jnp.ndarray, new_tokens: NamedArray, new_logprobs: NamedArray):
+        seq_lens = jnp.where(jnp.arange(self.max_seqs) < self.num_seqs, self.seq_lens.array + 1, self.seq_lens.array) # type: ignore
+        pos_ids = jnp.where(jnp.arange(self.max_seqs) < self.num_seqs, self.pos_ids.array + 1, self.pos_ids.array) # type: ignore
 
         jax.debug.print(
             "[UPDATE_TOKENS] tokens_after={ta} pos_ids_after={pa} seq_lens_after={sla}",
             ta=new_tokens.array,
-            pa=pos_ids.array,
-            sla=seq_lens.array,
+            pa=pos_ids,
+            sla=seq_lens,
         )
 
         return dataclasses.replace(
             self,
             tokens=new_tokens,
             logprobs=new_logprobs,
-            pos_ids=pos_ids,
-            seq_lens=seq_lens,
+            cu_seq_lens=hax.named(
+                jnp.pad(jnp.cumsum(seq_lens, axis=0, dtype=jnp.int32), (1, 0), constant_values=0), 
+                self.cu_seq_lens.axes,
+            ),
+            pos_ids=hax.named(pos_ids, self.pos_ids.axes),
+            seq_lens=hax.named(seq_lens, self.seq_lens.axes),
             finished=self.finished,
         )
-
-    @property
-    def num_seqs(self):
-        return self.seq_lens.shape["seq"]
 
     def batch_info(self, kv_cache: KvPageCache, prefill: bool = False) -> BatchInfo:
         page_indices = self.token_dests // self.page_spec.page_size
@@ -288,44 +293,66 @@ class DecodeState(eqx.Module):
             page_indices,
             {"seq": page_indices.shape[0], "page": page_indices.shape[1]},
         )
+        jax.debug.print("Token dests: {td}", td=self.token_dests.array)
 
         # generate an array of shape [tokens] with the appropriate target locations for each KV update
         # during decode, this is just a lookup, during prefill, we have to scatter from the token_dests
         # static array into the correct positions. we do this with a where and using 0 as a sentinel.
-        if prefill:
-            total_len = self.tokens.array.shape[0]
-            new_token_dests_raw = jnp.full(total_len, 0, dtype=jnp.int32)
-            num_tokens = self.tokens.shape["position"]
+        num_tokens = self.tokens.shape["position"]
+        tokens_per_seq = self.page_spec.tokens_per_seq
+        pad_len = max(num_tokens - tokens_per_seq, 0)
 
-            def fill_seq(i, dests):
-                start = self.cu_q_lens[{"seq": i}]
-                seq_len = self.seq_lens[{"seq": i}]
-                values = self.token_dests[{"seq": i, "position": slice(0, num_tokens)}].array
-                values = jnp.where(jnp.arange(num_tokens) < (start + seq_len), values, 0)  # type: ignore
-                values = jnp.where(jnp.arange(num_tokens) >= start, values, 0)  # type: ignore
-                return dests + values
+        def fill_seq(i, dests):
+            # where we are writing into `dests`
+            slice_start = self.cu_q_lens[{"seq": i}].array
+            slice_end = self.cu_q_lens[{"seq": i + 1}].array
+            seq_len = self.seq_lens[{"seq": i}].array
+            
+            # we start writing from the beginning of the sequence's slice in token_dests
+            # backing out by the number of tokens in our current sequence.
+            seq_start = 0 if prefill else seq_len
+            source_values = self.token_dests[{"seq": i}].array
+            # roll our source values to start from 0
+            source_values = jnp.roll(source_values, -seq_start)
 
-            new_token_dests_raw = lax.fori_loop(0, self.num_seqs, fill_seq, new_token_dests_raw)
-            new_token_dests = hax.NamedArray(new_token_dests_raw, self.tokens.axes)
-        else:
-            new_token_dests_raw = self.token_dests.array[jnp.arange(self.num_seqs), self.seq_lens.array]
-            new_token_dests = hax.NamedArray(new_token_dests_raw, self.tokens.axes)
+            # we need to pad or slice source_values to be the same size as `dests` (#tokens)
+            if pad_len > 0:
+                source_values = jnp.pad(source_values, (0, pad_len), constant_values=0)
+            else:
+                source_values = source_values[:num_tokens]
+
+            # now we need to roll our targets to align with the current sequence's slice
+            source_values = jnp.roll(source_values, slice_start)
+
+            jax.debug.print("Copying {seq_start}:{seq_len} tokens into dests[{slice_start}:{slice_end}]",
+                seq_start=seq_start,
+                seq_len=seq_start + seq_len,
+                slice_start=slice_start,
+                slice_end=slice_end,
+            )
+            dest_valid = jnp.arange(num_tokens) >= slice_start
+            dest_valid = dest_valid & (jnp.arange(num_tokens) < slice_end)
+            return jnp.where(dest_valid, source_values, dests)
+
+        new_token_dests_raw = jnp.full(num_tokens, INVALID, dtype=jnp.int32)
+        new_token_dests_raw = lax.fori_loop(0, self.page_spec.max_seqs, fill_seq, new_token_dests_raw)
+        new_token_dests = hax.NamedArray(new_token_dests_raw, self.tokens.axes)
 
         jax.debug.print(
             "[BATCH_INFO_BUILD]  tokens={t} pos_ids={p} seq_lens={sl} new_token_dests={ntd}, cu_q_lens={cu}",
             t=self.tokens.array,
             p=self.pos_ids.array,
             sl=self.seq_lens.array,
-            ntd=new_token_dests,
+            ntd=new_token_dests_raw,
             cu=self.cu_q_lens.array,
         )
 
         return BatchInfo(
+            num_seqs=self.num_seqs,
             kv_cache=kv_cache,
             page_size=self.page_spec.page_size,
             cu_q_lens=self.cu_q_lens,
             page_indices=page_indices,
-            num_seqs=self.seq_lens.shape["seq"],
             seq_lens=self.seq_lens,
             tokens=self.tokens,
             pos_ids=self.pos_ids,
