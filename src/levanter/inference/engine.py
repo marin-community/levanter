@@ -24,40 +24,9 @@ from levanter.inference.decode_state import (
 from levanter.layers.sampler import Sampler
 from levanter.models.llama import LlamaLMHeadModel
 from levanter.models.lm_model import LmHeadModel
-from levanter.utils.jax_utils import estimated_free_device_memory, sharded_tree_size
+from levanter.utils.jax_utils import estimated_free_device_memory
 
 logger = logging.getLogger(__name__)
-
-
-def _tree_byte_size(tree) -> int:
-    """Return the per-device number of bytes represented by ``tree``."""
-
-    return sharded_tree_size(tree)
-
-
-def _available_hbm_budget_bytes(hbm_utilization: float) -> int:
-    """Estimate the per-device HBM budget available to the KV cache."""
-
-    if not (0.0 < hbm_utilization <= 1.0):
-        raise ValueError("hbm_utilization must be in the interval (0, 1].")
-
-    devices = jax.devices()
-    if not devices:
-        raise RuntimeError("No JAX devices available for inference.")
-
-    budgets: list[int] = []
-    bytes_per_gib = 1024**3
-    for device in devices:
-        free_gib = estimated_free_device_memory(device)
-        if free_gib is None:
-            raise RuntimeError(f"Device {device} does not expose memory statistics.")
-        free_bytes = max(int(free_gib * bytes_per_gib), 0)
-        budgets.append(int(free_bytes * hbm_utilization))
-
-    if not budgets:
-        raise RuntimeError("Unable to determine device HBM budget.")
-
-    return min(budgets)
 
 
 def _bucket_size(actual_size: int, buckets: tuple[int, ...]) -> int:
@@ -205,16 +174,18 @@ def build_prefill_state(
     seq_lens = np.zeros(page_spec.max_seqs, dtype=np.int32)
     cu_q_lens = np.zeros(page_spec.max_seqs + 1, dtype=np.int32)
 
+    temperature = np.zeros(max_seq_len, dtype=np.float32)
     tokens = np.zeros(max_seq_len, dtype=np.int32)
     pos_ids = np.zeros(max_seq_len, dtype=np.int32)
-    seq_offset = 0
+    tok_offset = 0
 
-    for req in requests:
-        tokens[seq_offset:seq_offset + len(req.prompt_tokens)] = req.prompt_tokens
-        pos_ids[seq_offset:seq_offset + len(req.prompt_tokens)] = np.arange(len(req.prompt_tokens))
-        seq_lens[seq_offset] = len(req.prompt_tokens)
-        cu_q_lens[seq_offset + 1] = seq_offset + len(req.prompt_tokens)
-        seq_offset += len(req.prompt_tokens)
+    for i, req in enumerate(requests):
+        tokens[tok_offset:tok_offset + len(req.prompt_tokens)] = req.prompt_tokens
+        pos_ids[tok_offset:tok_offset + len(req.prompt_tokens)] = np.arange(len(req.prompt_tokens))
+        temperature[tok_offset:tok_offset + len(req.prompt_tokens)] = req.decode_params.temperature
+        seq_lens[i] = len(req.prompt_tokens)
+        cu_q_lens[i + 1] = tok_offset + len(req.prompt_tokens)
+        tok_offset += len(req.prompt_tokens)
 
     for i in range(len(requests), page_spec.max_seqs):
         cu_q_lens[i + 1] = cu_q_lens[i]
@@ -245,6 +216,7 @@ def build_prefill_state(
         page_spec=page_spec,
         token_dests=hax.named(token_dests, ("seq", "position")),
         seq_lens=hax.named(seq_lens, "seq"),
+        temperature=hax.named(temperature, "position"),
         tokens=hax.named(tokens, "position"),
         pos_ids=hax.named(pos_ids, "position"),
         cu_q_lens=hax.named(cu_q_lens, "seq"),
@@ -275,6 +247,7 @@ def build_decode_state(
     tokens = np.zeros(page_spec.max_seqs, dtype=np.int32)
     pos_ids = np.zeros(page_spec.max_seqs, dtype=np.int32)
     cu_q_lens = np.zeros(page_spec.max_seqs + 1, dtype=np.int32)
+    temperature = np.zeros(page_spec.max_seqs, dtype=np.float32)
     num_seqs = sum(int(max(1, req.n_generations)) for req in requests)
     seq_offset = 0
 
@@ -289,6 +262,7 @@ def build_decode_state(
             tokens[seq_offset] = req.prompt_tokens[-1]  # Last prompt token
             pos_ids[seq_offset] = len(req.prompt_tokens) - 1
             cu_q_lens[seq_offset + 1] = seq_offset + 1
+            temperature[seq_offset] = req.decode_params.temperature
             seq_offset += 1
     
     for i in range(num_seqs, page_spec.max_seqs):
@@ -299,6 +273,7 @@ def build_decode_state(
         token_dests=hax.named(cloned_dests, ("seq", "position")),
         page_spec=page_spec,
         seq_lens=hax.named(seq_lens, "seq"),
+        temperature=hax.named(temperature, "position"),
         tokens=hax.named(tokens, "position"),
         pos_ids=hax.named(pos_ids, "position"),
         cu_q_lens=hax.named(cu_q_lens, "seq"),
@@ -361,7 +336,7 @@ def _run_generation_loop(
         seed = jnp.tile(seed, binfo.max_seqs)
         seed = seed.reshape(binfo.max_seqs, 2)
         prng_keys = jax.vmap(jax.random.fold_in)(seed, binfo.new_token_dests.array)
-        temps = 0.7  # state.decode_state.temperature["seq", new_slot_ids]
+        temps = state.decode_state.temperature
         new_tokens, logprobs = hax.vmap(sampler, "position")(logits, temps, key=prng_keys)
         
         # Update decode state with the sampled tokens

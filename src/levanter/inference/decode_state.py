@@ -231,6 +231,8 @@ class DecodeState(eqx.Module):
     seq_lens: ht.i32[NamedArray, " seq"]  # type: ignore[name-defined]
     """The length of each sequence."""
 
+    temperature: ht.f32[NamedArray, " seq"]  # type: ignore[name-defined]
+
     # N.B. The _query_ vector is recomputed each step. So cu_q_lens does _not_ refer
     # to the sequence length across the entire decode, but only the current step.
     cu_q_lens: ht.i32[NamedArray, " seq"]  # type: ignore[name-defined]
