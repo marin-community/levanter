@@ -190,6 +190,111 @@ def _check_stop_sequences(
     return final_position
 
 
+def build_prefill_state(
+    requests: Sequence[Request],
+    page_spec: PageTableSpec,
+) -> DecodeState:
+    """Build decode state for prefill phase from requests.
+
+    Constructs packed sequence arrays (tokens, pos_ids, seq_lens, cu_q_lens)
+    and token_dests mapping for the initial prompt processing.
+
+    Args:
+        requests: Sequence of generation requests
+        page_spec: Page table specification
+
+    Returns:
+        DecodeState configured for prefill phase
+    """
+    seq_lens = []
+    tokens = []
+    pos_ids = []
+    cu_q_lens = [0]
+
+    q_len_offset = 0
+    for req in requests:
+        seq_lens.append(len(req.prompt_tokens))
+        tokens.extend(req.prompt_tokens)
+        pos_ids.extend(np.arange(len(req.prompt_tokens)))
+        q_len_offset += len(req.prompt_tokens)
+        cu_q_lens.append(q_len_offset)
+
+    total_len = sum(seq_lens)
+    num_seqs = len(requests)
+
+    # Build token_dests mapping
+    token_dests = np.arange(
+        page_spec.pages_per_seq * page_spec.page_size * page_spec.max_seqs
+    ).reshape(page_spec.max_seqs, -1)
+
+    return DecodeState(
+        page_spec=page_spec,
+        token_dests=hax.NamedArray(
+            token_dests, {"seq": page_spec.max_seqs, "position": token_dests.shape[1]}
+        ),
+        seq_lens=hax.NamedArray(np.array(seq_lens), {"seq": num_seqs}),
+        tokens=hax.NamedArray(np.array(tokens), {"position": total_len}),
+        pos_ids=hax.NamedArray(np.array(pos_ids), {"position": total_len}),
+        cu_q_lens=hax.named(np.array(cu_q_lens, dtype=np.int32), "seq"),
+        logprobs=hax.zeros({"position": total_len}),
+        finished=hax.zeros({"seq": num_seqs}, dtype=jnp.bool_),
+    )
+
+
+def build_decode_state(
+    requests: Sequence[Request],
+    page_spec: PageTableSpec,
+    prefill_token_dests: np.ndarray,
+) -> DecodeState:
+    """Build decode state for autoregressive generation with clone support.
+
+    Constructs decode state where each request can have multiple clones (n_generations).
+    Clones share prefill KV cache pages but have independent generation state.
+
+    Args:
+        requests: Sequence of generation requests
+        page_spec: Page table specification
+        prefill_token_dests: Token destinations from prefill state
+
+    Returns:
+        DecodeState configured for autoregressive decode phase
+    """
+    seq_lens = []
+    tokens = []
+    pos_ids = []
+    cu_q_lens = [0]
+
+    num_seqs = sum(int(max(1, req.n_generations)) for req in requests)
+    seq_offset = 0
+
+    # Clone token_dests so each clone points to correct prefill pages
+    cloned_dests = prefill_token_dests.copy()
+
+    for i, req in enumerate(requests):
+        for _ in range(int(req.n_generations)):
+            # Share prefill pages across clones
+            cloned_dests[seq_offset, : len(req.prompt_tokens)] = prefill_token_dests[i][: len(req.prompt_tokens)]
+            logger.info(
+                f"[CLONE_SETUP] After copy token_dests[{seq_offset}, :10] = {cloned_dests[seq_offset, :10]}"
+            )
+            seq_lens.append(len(req.prompt_tokens))
+            tokens.append(req.prompt_tokens[-1])  # Last prompt token
+            pos_ids.append(len(req.prompt_tokens) - 1)
+            cu_q_lens.append(seq_offset + 1)
+            seq_offset += 1
+
+    return DecodeState(
+        token_dests=hax.NamedArray(cloned_dests, {"seq": cloned_dests.shape[0], "position": cloned_dests.shape[1]}),
+        page_spec=page_spec,
+        seq_lens=hax.NamedArray(np.array(seq_lens), {"seq": num_seqs}),
+        tokens=hax.NamedArray(np.array(tokens), {"position": num_seqs}),
+        pos_ids=hax.NamedArray(np.array(pos_ids), {"position": num_seqs}),
+        cu_q_lens=hax.named(np.array(cu_q_lens, dtype=np.int32), "seq"),
+        logprobs=hax.zeros({"position": num_seqs}),
+        finished=hax.zeros({"seq": num_seqs}, dtype=jnp.bool_),
+    )
+
+
 @functools.partial(jax.jit, donate_argnums=0)
 def _run_prefill(
     cache: PageCache,
@@ -366,87 +471,14 @@ class InferenceEngine:
                 "Decompose your request into smaller batches or increase max_seqs when building the service."
             )
 
-        # construct the DecodeState inputs for the batch of requests, run prefill, then prepare the clones
-        # N.B. Llama decode doesn't support the "batch" axis. We're therefore forced
-        # to pack all sequences into linear arrays.
-        seq_lens = []
-        tokens = []
-        pos_ids = []
-        cu_q_lens = [0]
-
-        q_len_offset = 0
-        total_len = sum([len(req.prompt_tokens) for req in requests])
-        num_seqs = len(requests)
-
-        for i, req in enumerate(requests):
-            seq_lens.append(len(req.prompt_tokens))
-            tokens.extend(req.prompt_tokens)
-            pos_ids.extend(np.arange(len(req.prompt_tokens)))
-            q_len_offset += len(req.prompt_tokens)
-            cu_q_lens.append(q_len_offset)
-
-        # run prefill. this will fill the KV cache for all of the sequences. we'll then
-        # build a new decode state with these pages as the baseline, and new page indices for
-        # the newly decoded tokens.
-        token_dests = np.arange(
-            self.page_spec.pages_per_seq * self.page_spec.page_size * self.page_spec.max_seqs
-        ).reshape(self.page_spec.max_seqs, -1)
-
-        decode_state = DecodeState(
-            page_spec=self.page_spec,
-            token_dests=hax.NamedArray(
-                token_dests, {"seq": self.page_spec.max_seqs, "position": token_dests.shape[1]}
-            ),
-            seq_lens=hax.NamedArray(np.array(seq_lens), {"seq": num_seqs}),
-            tokens=hax.NamedArray(np.array(tokens), {"position": total_len}),
-            pos_ids=hax.NamedArray(np.array(pos_ids), {"position": total_len}),
-            cu_q_lens=hax.named(np.array(cu_q_lens, dtype=np.int32), "seq"),  # size is num_seqs + 1
-            logprobs=hax.zeros({"position": total_len}),
-            finished=hax.zeros({"seq": num_seqs}, dtype=jnp.bool_),
-        )
-
+        # Build prefill state and run prefill to populate KV cache
+        decode_state = build_prefill_state(requests, self.page_spec)
         self.cache = _run_prefill(self.cache, decode_state, self.model)
 
-        seq_lens = []
-        tokens = []
-        pos_ids = []
-        cu_q_lens = [0]
-
-        q_len_offset = 0
-        total_len = sum([len(req.prompt_tokens) * max(1, req.n_generations) for req in requests])
-        num_seqs = sum(int(max(1, req.n_generations)) for req in requests)
-        seq_offset = 0
-
-        # The prefill kernel has now populated the KV cache for our initial set
-        # of prompts. For clones (n_generations > 1), we now need to adjust the
-        # token_dests for the new decode state so that the newly decoded tokens for each
-        # clone refer to the correct positions in the KV cache.
-        cloned_dests = token_dests.copy()
-
-        for i, req in enumerate(requests):
-            for _ in range(int(req.n_generations)):
-                cloned_dests[seq_offset, : len(req.prompt_tokens)] = token_dests[i][: len(req.prompt_tokens)]
-                logger.info(
-                    f"[CLONE_SETUP] After copy token_dests[{seq_offset}, :10] = {cloned_dests[seq_offset, :10]}"
-                )
-                seq_lens.append(len(req.prompt_tokens))
-                tokens.append(req.prompt_tokens[-1])
-                pos_ids.append(len(req.prompt_tokens) - 1)  # Position of last prompt token
-                cu_q_lens.append(seq_offset + 1)
-                seq_offset += 1
-
-        token_dests = cloned_dests
-
-        decode_state = DecodeState(
-            token_dests=hax.NamedArray(token_dests, {"seq": token_dests.shape[0], "position": token_dests.shape[1]}),
-            page_spec=self.page_spec,
-            seq_lens=hax.NamedArray(np.array(seq_lens), {"seq": num_seqs}),
-            tokens=hax.NamedArray(np.array(tokens), {"position": num_seqs}),
-            pos_ids=hax.NamedArray(np.array(pos_ids), {"position": num_seqs}),
-            cu_q_lens=hax.named(np.array(cu_q_lens, dtype=np.int32), "seq"),  # size is num_seqs + 1
-            logprobs=hax.zeros({"position": num_seqs}),
-            finished=hax.zeros({"seq": num_seqs}, dtype=jnp.bool_),
-        )
+        # Build decode state for autoregressive generation, handling clones
+        prefill_token_dests = decode_state.token_dests.array
+        decode_state = build_decode_state(requests, self.page_spec, prefill_token_dests)
+        num_seqs = decode_state.num_seqs
 
         # Outer generation loop: run until all sequences finish or we hit max length
         max_outer_rounds = (self.config.max_seq_len + self.config.max_rounds - 1) // self.config.max_rounds
