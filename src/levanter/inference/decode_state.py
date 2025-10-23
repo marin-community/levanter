@@ -293,7 +293,6 @@ class DecodeState(eqx.Module):
             page_indices,
             {"seq": page_indices.shape[0], "page": page_indices.shape[1]},
         )
-        jax.debug.print("Token dests: {td}", td=self.token_dests.array)
 
         # generate an array of shape [tokens] with the appropriate target locations for each KV update
         # during decode, this is just a lookup, during prefill, we have to scatter from the token_dests
@@ -324,12 +323,12 @@ class DecodeState(eqx.Module):
             # now we need to roll our targets to align with the current sequence's slice
             source_values = jnp.roll(source_values, slice_start)
 
-            jax.debug.print("Copying {seq_start}:{seq_len} tokens into dests[{slice_start}:{slice_end}]",
-                seq_start=seq_start,
-                seq_len=seq_start + seq_len,
-                slice_start=slice_start,
-                slice_end=slice_end,
-            )
+            # jax.debug.print("Copying {seq_start}:{seq_len} tokens into dests[{slice_start}:{slice_end}]",
+            #     seq_start=seq_start,
+            #     seq_len=seq_start + seq_len,
+            #     slice_start=slice_start,
+            #     slice_end=slice_end,
+            # )
             dest_valid = jnp.arange(num_tokens) >= slice_start
             dest_valid = dest_valid & (jnp.arange(num_tokens) < slice_end)
             return jnp.where(dest_valid, source_values, dests)
@@ -338,14 +337,14 @@ class DecodeState(eqx.Module):
         new_token_dests_raw = lax.fori_loop(0, self.page_spec.max_seqs, fill_seq, new_token_dests_raw)
         new_token_dests = hax.NamedArray(new_token_dests_raw, self.tokens.axes)
 
-        jax.debug.print(
-            "[BATCH_INFO_BUILD]  tokens={t} pos_ids={p} seq_lens={sl} new_token_dests={ntd}, cu_q_lens={cu}",
-            t=self.tokens.array,
-            p=self.pos_ids.array,
-            sl=self.seq_lens.array,
-            ntd=new_token_dests_raw,
-            cu=self.cu_q_lens.array,
-        )
+        # jax.debug.print(
+        #     "[BATCH_INFO_BUILD]  tokens={t} pos_ids={p} seq_lens={sl} new_token_dests={ntd}, cu_q_lens={cu}",
+        #     t=self.tokens.array,
+        #     p=self.pos_ids.array,
+        #     sl=self.seq_lens.array,
+        #     ntd=new_token_dests_raw,
+        #     cu=self.cu_q_lens.array,
+        # )
 
         return BatchInfo(
             num_seqs=self.num_seqs,

@@ -324,9 +324,6 @@ def build_decode_state(
         for _ in range(int(req.n_generations)):
             # Share prefill pages across clones
             cloned_dests[seq_offset, : len(req.prompt_tokens)] = prefill_token_dests[i][: len(req.prompt_tokens)]
-            logger.info(
-                f"[CLONE_SETUP] After copy token_dests[{seq_offset}, :10] = {cloned_dests[seq_offset, :10]}"
-            )
             seq_lens[seq_offset] = len(req.prompt_tokens)
             tokens[seq_offset] = req.prompt_tokens[-1]  # Last prompt token
             pos_ids[seq_offset] = len(req.prompt_tokens) - 1
@@ -543,13 +540,14 @@ class InferenceEngine:
         num_seqs = decode_state.num_seqs
 
         # Outer generation loop: run until all sequences finish or we hit max length
-        max_outer_rounds = (self.config.max_seq_len + self.config.tokens_per_round - 1) // self.config.tokens_per_round
+        min_seq_len = min(len(req.prompt_tokens) for req in requests)
+        max_outer_rounds = max(1, (self.config.max_seq_len - min_seq_len) // self.config.tokens_per_round)
         all_tokens = []
         all_logprobs = []
         final_position = np.full(num_seqs, -1, dtype=np.int32)
 
         for outer_round in range(max_outer_rounds):
-            logger.info(f"[OUTER_LOOP] Starting outer_round={outer_round}")
+            logger.info(f"[OUTER_LOOP] Starting outer_round={outer_round} of {max_outer_rounds}")
             self.cache, decoded_outputs, decode_state = _run_generation_loop(
                 page_cache=self.cache,
                 decode_state=decode_state,
@@ -562,7 +560,7 @@ class InferenceEngine:
             all_tokens.append(outputs.tokens)
             all_logprobs.append(outputs.logprobs)
 
-            logger.info(f"[OUTER_LOOP] Generated tokens: {outputs.tokens}")
+            # logger.info(f"[OUTER_LOOP] Generated tokens: {outputs.tokens}")
 
             # Concatenate all tokens generated so far for each sequence
             tokens_so_far = np.concatenate(all_tokens, axis=1)
@@ -586,7 +584,14 @@ class InferenceEngine:
             for _ in range(req.n_generations):
                 seq_tokens = all_tokens_concat[seq_offset]
                 seq_logprobs = all_logprobs_concat[seq_offset]
-                valid_len = final_position[seq_offset] if final_position[seq_offset] != -1 else seq_tokens.shape[0]
+                # slice out anything beyond the stop position. our kv-cache writes
+                # roll over our input tokens if we proceed past max_seq_len, so always
+                # cap there.
+                if final_position[seq_offset] == -1:
+                    valid_len = self.config.max_seq_len - len(req.prompt_tokens)
+                else:
+                    valid_len = final_position[seq_offset]
+
                 tokens_list.append(seq_tokens[:valid_len].tolist())
                 logprobs_list.append(seq_logprobs[:valid_len].tolist())
                 total_generated += valid_len
