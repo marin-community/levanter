@@ -205,6 +205,16 @@ class TrainLmConfig:
 
     load_debug_weights: bool = False
 
+    # If True, save per-step input_ids (tokens), dataset_id, and index for reproducibility
+    save_input_ids: bool = False
+
+    # Record-only mode: iterate data loaders and save batch metadata without training
+    record_only: bool = False
+    # If True, gather shards and save a single file per step (rank 0 writes)
+    record_gather_single: bool = True
+    # Optional cap on number of train steps to record; defaults to full schedule
+    record_max_steps: Optional[int] = None
+
 
 def main(config: TrainLmConfig):
     # Print JAX/JAXLIB versions early for cluster log introspection
@@ -309,6 +319,82 @@ def main(config: TrainLmConfig):
 
         # Get the tagged evaluation datasets
         tagged_eval_datasets = config.data.tagged_eval_sets(Pos)
+
+        # If requested, run in record-only mode: dump train batch metadata and reward-val tokens, then exit
+        if getattr(config, "record_only", False):
+            logger.info("[RecordOnly] Recording train inputs and reward validation tokens; skipping training.")
+
+            # Train inputs: save per-step tokens/dataset_id/index using existing TPU-safe saver
+            train_loader_for_record = trainer.data_loader(train_dataset)
+            train_iter = train_loader_for_record.iter_from_step(0)
+            max_steps_to_record = int(config.record_max_steps or config.trainer.num_train_steps)
+
+            inputs_dir = os.path.join(config.out_dir, "inputs")
+            fsspec_utils.mkdirs(inputs_dir)
+
+            # Accumulate tokens to save a concatenated tensor (steps x batch x seq_len)
+            _all_step_tokens = []
+
+            for step_idx, ex in zip(range(max_steps_to_record), train_iter):
+                step_int = int(step_idx)
+                tokens_current = getattr(ex.tokens, "array", ex.tokens)
+                _save_array_tpu_safe(
+                    inputs_dir,
+                    f"step-{step_int:06d}.tokens.npy",
+                    tokens_current,
+                    gather_to_single_file=bool(config.record_gather_single),
+                )
+                # Append for concatenated save later
+                _all_step_tokens.append(tokens_current)
+                if hasattr(ex, "dataset_id"):
+                    _save_array_tpu_safe(
+                        inputs_dir,
+                        f"step-{step_int:06d}.dataset_id.npy",
+                        getattr(ex.dataset_id, "array", ex.dataset_id),
+                        gather_to_single_file=bool(config.record_gather_single),
+                    )
+                if hasattr(ex, "index"):
+                    _save_array_tpu_safe(
+                        inputs_dir,
+                        f"step-{step_int:06d}.index.npy",
+                        getattr(ex.index, "array", ex.index),
+                        gather_to_single_file=bool(config.record_gather_single),
+                    )
+                _ = multihost_broadcast_sync(1)
+
+            # Save concatenated train tokens (steps x batch x seq)
+            try:
+                if len(_all_step_tokens) > 0:
+                    train_tokens_all = jnp.stack(_all_step_tokens, axis=0)
+                    _save_array_tpu_safe(
+                        config.out_dir,
+                        "train_tokens_all.npy",
+                        train_tokens_all,
+                        gather_to_single_file=bool(config.record_gather_single),
+                    )
+                    _ = multihost_broadcast_sync(1)
+            except Exception:
+                logger.exception("Failed to save concatenated train tokens during record-only mode")
+
+            # Reward validation tokens: mimic existing selection (last validation dataset)
+            try:
+                val_sets = config.data.validation_sets(Pos)
+                if len(val_sets) > 0:
+                    last_name, last_dataset = list(val_sets.items())[-1]
+                    val_loader2 = trainer.data_loader(last_dataset, trainer.EvalBatch)
+                    val_iter = val_loader2.iter_from_step(0)
+                    val_tokens_list = []
+                    for ex in val_iter:
+                        tokens_arr = getattr(ex.tokens, "array", ex.tokens)
+                        val_tokens_list.append(tokens_arr)
+                    if len(val_tokens_list) > 0:
+                        val_tokens = jnp.concatenate(val_tokens_list, axis=0)
+                        _save_array_tpu_safe(config.out_dir, "val_tokens.npy", val_tokens, gather_to_single_file=True)
+                        _ = multihost_broadcast_sync(1)
+            except Exception:
+                logger.exception("Failed to save validation tokens during record-only mode")
+
+            return
 
         state = trainer.initial_state(training_key, model_init=lambda: config.model.build(Vocab, key=model_key))
 
@@ -571,6 +657,35 @@ def main(config: TrainLmConfig):
 
         logger.info("[RewardLoader] Final selection: %s", "LM-Eval" if used_lm_eval_reward else "Validation loader")
 
+        # If requested, register a simple hook to save input_ids and indices each step.
+        if config.save_input_ids:
+            def _save_inputs_hook(info):
+                try:
+                    ex = getattr(trainer, "_last_batch_example", None)
+                    if ex is None:
+                        return
+                    out_dir = os.path.join(config.out_dir, "inputs")
+                    fsspec_utils.mkdirs(out_dir)
+                    step_int = int(jax.device_get(info.step)) if hasattr(info.step, "dtype") else int(info.step)
+
+                    # Save tokens as a single file gathered across hosts (rank 0 writes)
+                    _save_array_tpu_safe(
+                        out_dir,
+                        f"step-{step_int:06d}.tokens.npy",
+                        getattr(ex.tokens, "array", ex.tokens),
+                        gather_to_single_file=True,
+                    )
+                    if hasattr(ex, "dataset_id"):
+                        _save_array_tpu_safe(out_dir, f"step-{step_int:06d}.dataset_id.npy", getattr(ex.dataset_id, "array", ex.dataset_id))
+                    if hasattr(ex, "index"):
+                        _save_array_tpu_safe(out_dir, f"step-{step_int:06d}.index.npy", getattr(ex.index, "array", ex.index))
+                    # Ensure all hosts wait for IO completion to improve consistency on remote filesystems
+                    _ = multihost_broadcast_sync(1)
+                except Exception:
+                    logger.exception("Failed to save input batch for step %s", info.step)
+
+            trainer.add_hook(_save_inputs_hook, every=1)
+
         ret = trainer.train_and_replay(
             state,
             train_loader,
@@ -600,6 +715,26 @@ def main(config: TrainLmConfig):
                 _save_array_tpu_safe(out_dir, 'loss_masks_global.npy', loss_masks_global, gather_to_single_file=True)
             else:
                 logger.warning(f"[LossMask] No loss_masks_global to save")
+
+            # Additionally, extract and save tokens seen during metagrad reward calculations as a single file
+            try:
+                val_tokens_list = []
+                # Rebuild the validation loader to replay the same evaluation dataset
+                val_sets = config.data.validation_sets(Pos)
+                if len(val_sets) > 0:
+                    # Use the last dataset (matching how reward_loader was selected)
+                    last_name, last_dataset = list(val_sets.items())[-1]
+                    val_loader2 = trainer.data_loader(last_dataset, trainer.EvalBatch)
+                    val_iter = val_loader2.iter_from_step(0)
+                    for ex in val_iter:
+                        tokens_arr = getattr(ex.tokens, 'array', ex.tokens)
+                        val_tokens_list.append(tokens_arr)
+                if len(val_tokens_list) > 0:
+                    # Concatenate along the batch axis and gather to a single host before saving
+                    val_tokens = jnp.concatenate(val_tokens_list, axis=0)
+                    _save_array_tpu_safe(out_dir, 'val_tokens.npy', val_tokens, gather_to_single_file=True)
+            except Exception:
+                logger.exception("Failed to save validation tokens")
 
             save_success = True
         except Exception:

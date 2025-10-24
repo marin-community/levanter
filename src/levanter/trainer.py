@@ -1277,6 +1277,13 @@ class Trainer:
 
             # print('[Timing Info] > data loading time:', loading_time(), flush=True)
 
+            # Optionally persist batch inputs for exact reproducibility. We avoid fetching global arrays
+            # here; store the batch object for a later save hook executed outside JIT in train_lm.main.
+            try:
+                self._last_batch_example = example  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
             info = self.train_step(state, example)
             state = info.state
 
