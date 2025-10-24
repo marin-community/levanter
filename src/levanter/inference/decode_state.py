@@ -332,14 +332,14 @@ class DecodeState(eqx.Module):
         new_token_dests_raw = lax.fori_loop(0, self.page_spec.max_seqs, fill_seq, new_token_dests_raw)
         new_token_dests = hax.NamedArray(new_token_dests_raw, self.tokens.axes)
 
-        # jax.debug.print(
-        #     "[BATCH_INFO_BUILD]  tokens={t} pos_ids={p} seq_lens={sl} new_token_dests={ntd}, cu_q_lens={cu}",
-        #     t=self.tokens.array,
-        #     p=self.pos_ids.array,
-        #     sl=self.seq_lens.array,
-        #     ntd=new_token_dests_raw,
-        #     cu=self.cu_q_lens.array,
-        # )
+        jax.debug.print(
+            "[BATCH_INFO_BUILD]  tokens={t} pos_ids={p} seq_lens={sl} new_token_dests={ntd}, cu_q_lens={cu}",
+            t=self.tokens.array,
+            p=self.pos_ids.array,
+            sl=self.seq_lens.array,
+            ntd=new_token_dests_raw,
+            cu=self.cu_q_lens.array,
+        )
 
         return BatchInfo(
             num_seqs=self.num_seqs,
