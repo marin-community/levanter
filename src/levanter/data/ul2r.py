@@ -291,14 +291,12 @@ def random_spans_noise_mask(
     def apply_roll(m):
         offset = jax.random.randint(key3, (), 0, length, dtype=jnp.int32)
         # Roll the mask
-        rolled = jnp.roll(m, offset, axis=0)
-        # Mask out values that wrapped around from beyond length
-        # After rolling by offset, positions [0, offset) contain what was at
-        # [length, length+offset)
-        # We need to zero these out since they're from beyond the valid range
+        rolled = jnp.roll(m, offset)
+        # We want to roll within [0, length) so we need to overwrite values that
+        # came from the end
         rolled = jnp.where(
             indices < offset,
-            m[jnp.minimum(length + indices, padded_length - 1)],
+            jnp.roll(m, offset - length),
             rolled,
         )
         rolled = typing.cast(jnp.ndarray, rolled)
