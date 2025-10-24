@@ -161,16 +161,16 @@ class InferenceReplConfig:
         default_factory=lambda: TrainerConfig(
             model_axis_size=1,
             tensor_parallel_axes=["mlp", "kv_head"],
-            mp=jmp.get_policy("p=f32,c=bfloat16"),
+            mp=jmp.get_policy("p=f32,c=f32"),
         )
     )
     server: InferenceServerConfig = field(
         default_factory=lambda: InferenceServerConfig(
             engine=InferenceEngineConfig(
                 page_size=8,
-                tokens_per_round=32,
-                max_seq_len=64,
-                max_seqs=8,
+                tokens_per_round=16,
+                max_seq_len=128,
+                max_seqs=1,
             ),
         )
     )
@@ -178,6 +178,7 @@ class InferenceReplConfig:
     # Generation parameters
     temperature: float = 1.0
     seed: int = 42
+    max_tokens: int = 64
 
     # CLI mode parameters
     command: Optional[str] = None
@@ -253,6 +254,7 @@ class ReplContext:
         if self.server is not None:
 
             def _reload(current_model: LmHeadModel) -> LmHeadModel:
+                logger.info("Reloading.")
                 with use_cpu_device():
                     key = jrandom.PRNGKey(server_config.seed)
                     vocab_size = len(server.inference_context.tokenizer)
@@ -376,7 +378,6 @@ class ReplContext:
         async def submit_batch():
             tasks = []
             for i, req_data in enumerate(batch_data):
-                # Convert to ChatCompletionRequest
                 messages = []
                 for msg in req_data.get("messages", []):
                     messages.append(ChatMessage(role=msg["role"], content=msg.get("content", "")))
@@ -384,6 +385,7 @@ class ReplContext:
                 request = ChatCompletionRequest(
                     model=req_data.get("model", "<default model>"),
                     messages=messages,
+                    max_tokens=req_data.get("max_tokens", self.config.max_tokens),
                     temperature=req_data.get("temperature", self.config.server.temperature),
                     n=req_data.get("n", 1),
                     logprobs=req_data.get("logprobs", False),
@@ -424,6 +426,7 @@ class ReplContext:
         request = CompletionRequest(
             model=self.model_name or "model",
             prompt=prompt_text,
+            max_tokens=req_data.get("max_tokens", self.config.max_tokens),
             temperature=self.config.server.temperature,
         )
 
@@ -440,6 +443,7 @@ class ReplContext:
             model=self.model_name or "<default model>",
             messages=messages,
             stop=[self.server.inference_context.tokenizer.eos_token],
+            max_tokens=self.config.max_tokens,
             temperature=self.config.server.temperature,
             n=self.config.n_generations,
         )
@@ -576,7 +580,8 @@ def cli_mode(config: InferenceReplConfig, commands: ReplContext):
 def main(config: InferenceReplConfig):
     """Main entry point."""
     commands = ReplContext(config)
-    # Determine mode
+
+    os.environ["EQX_ON_ERROR"] = "nan"
     if config.command:
         cli_mode(config, commands)
     else:
