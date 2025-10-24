@@ -24,7 +24,6 @@ from levanter.inference.decode_state import (
 from levanter.layers.sampler import Sampler
 from levanter.models.llama import LlamaLMHeadModel
 from levanter.models.lm_model import LmHeadModel
-from levanter.utils.jax_utils import estimated_free_device_memory
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +106,7 @@ class InferenceEngineConfig:
     compute_dtype: jnp.dtype = jnp.bfloat16
     """KV cache dtype. Default bfloat16 for performance/accuracy balance."""
 
-    prefill_token_buckets: tuple[int, ...] = (128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+    prefill_token_buckets: tuple[int, ...] = (18, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
     """Power-of-2 buckets for prefill token padding. Prefill will pad to next largest bucket."""
 
     @property

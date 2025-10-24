@@ -201,8 +201,7 @@ class KvPageCache(PageCache):
         batch_info: BatchInfo,
     ) -> "KvPageCache":
         """Append keys and values to the cache based on *batch_info*."""
-        # K should be the number of VALID tokens (excluding padding)
-        # Count non-INVALID entries in new_token_dests
+        # K should be the number of valid tokens (excluding padding)
         K = jnp.sum(is_valid(batch_info.new_token_dests).astype(jnp.int32).array)
         t_pages, t_slots = batch_info.pages_and_slots()  # [T] int32 (first K valid)
         updated = kv_update_unified_prefix(
@@ -261,8 +260,9 @@ class DecodeState(eqx.Module):
 
 
     def update_tokens(self, step: jnp.ndarray, new_tokens: NamedArray, new_logprobs: NamedArray):
-        seq_lens = jnp.where(jnp.arange(self.max_seqs) < self.num_seqs, self.seq_lens.array + 1, self.seq_lens.array) # type: ignore
-        pos_ids = jnp.where(jnp.arange(self.max_seqs) < self.num_seqs, self.pos_ids.array + 1, self.pos_ids.array) # type: ignore
+        filter = jnp.arange(self.max_seqs) < self.num_seqs
+        seq_lens = jnp.where(filter, self.seq_lens.array + 1, self.seq_lens.array) # type: ignore
+        pos_ids = jnp.where(filter, self.pos_ids.array + 1, self.pos_ids.array) # type: ignore
 
         # jax.debug.print(
         #     "[UPDATE_TOKENS] tokens_after={ta} pos_ids_after={pa} seq_lens_after={sla}",
@@ -290,8 +290,6 @@ class DecodeState(eqx.Module):
         )
 
         # generate an array of shape [tokens] with the appropriate target locations for each KV update
-        # during decode, this is just a lookup, during prefill, we have to scatter from the token_dests
-        # static array into the correct positions. we do this with a where and using 0 as a sentinel.
         num_tokens = self.tokens.shape["position"]
         tokens_per_seq = self.page_spec.tokens_per_seq
         pad_len = max(num_tokens - tokens_per_seq, 0)
@@ -318,12 +316,6 @@ class DecodeState(eqx.Module):
             # now we need to roll our targets to align with the current sequence's slice
             source_values = jnp.roll(source_values, slice_start)
 
-            # jax.debug.print("Copying {seq_start}:{seq_len} tokens into dests[{slice_start}:{slice_end}]",
-            #     seq_start=seq_start,
-            #     seq_len=seq_start + seq_len,
-            #     slice_start=slice_start,
-            #     slice_end=slice_end,
-            # )
             dest_valid = jnp.arange(num_tokens) >= slice_start
             dest_valid = dest_valid & (jnp.arange(num_tokens) < slice_end)
             return jnp.where(dest_valid, source_values, dests)
