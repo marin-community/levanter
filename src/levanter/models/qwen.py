@@ -6,10 +6,9 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Type
 
 import equinox as eqx
-import jax.random as jrandom
-
 import haliax as hax
 import haliax.nn as hnn
+import jax.random as jrandom
 from haliax import Axis, NamedArray
 from haliax.jax_utils import maybe_rng_split, named_call, shaped_rng_split
 from haliax.nn.scan import Stacked
@@ -24,7 +23,6 @@ from levanter.utils.activation import ActivationFunctionEnum
 from levanter.utils.flop_utils import lm_flops_per_token
 from levanter.utils.logging import silence_transformer_nag
 from levanter.utils.types import BlockFoldable
-
 
 silence_transformer_nag()
 from transformers import PretrainedConfig as HfConfig  # noqa: E402
