@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import pytest
 from haliax import Axis
 
-from levanter.inference.engine import InferenceEngine, Request, InferenceEngineConfig
+from levanter.inference.engine import InferenceEngine, InferenceEngineConfig, Request
 from levanter.inference.jit_scheduler import SeqDecodingParams
 from levanter.inference.page_table import PageTableSpec
 from levanter.inference.utils import INVALID
