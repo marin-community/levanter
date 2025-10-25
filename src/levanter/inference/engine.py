@@ -24,7 +24,6 @@ import levanter.tracker
 from levanter.inference.jit_scheduler import (
     DecodeState,
     SeqDecodingParams,
-    SequenceTable,
     TokenQueue,
     _DecodeOutputs,
 )
@@ -860,14 +859,13 @@ class InferenceEngine:
         for slot_id in range(page_table.max_seqs):
             sequences, page_table = sequences.free_pages(page_table, slot_id)
 
-        clean_sequences = SequenceTable.init(page_table.max_seqs, page_table.pages_per_seq, page_table.page_size)
-        new_decode_state = dataclasses.replace(
-            self._initial_decode_state,
-            page_table=page_table,
-            sequences=clean_sequences,
+        new_decode_state = DecodeState.init(
+            page_table,
+            max_stop_seqs=self.config.max_stop_seqs,
+            max_stop_tokens=self.config.max_stop_tokens,
+            max_queued_tokens=self.config.max_queued_tokens,
         )
         self.gen_state = dataclasses.replace(self.gen_state, decode_state=new_decode_state)
-        # All local slots are free after reset (ascending order to keep parents before clones)
         self.free_slots = list(range(int(page_table.max_seqs)))
         self.local_map.clear()
         self.sequences.clear()
