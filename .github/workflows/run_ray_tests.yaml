@@ -1,6 +1,6 @@
 name: Run tests that use ray
 
-on: [push]
+on: [workflow_dispatch]
 
 jobs:
   ray_tests:

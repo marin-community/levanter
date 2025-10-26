@@ -1,0 +1,56 @@
+name: TPU Device Ordering Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-device-ordering:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        jax_version: ["0.6.2", "0.7.2"]
+    env:
+      TPU_ZONE: "us-central2-b"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Configure Google Cloud
+        run: |
+          gcloud config set project ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Create VM and install JAX ${{ matrix.jax_version }}
+        run: |
+          export TPU_NAME=jax-${{ matrix.jax_version }}-${{ github.run_id }}
+          export JAX_VERSION=${{ matrix.jax_version }}
+          eval "$(ssh-agent -s)"
+          TRUE_SHA=${{ github.sha }}
+          bash infra/spin-up-vm.sh $TPU_NAME -z ${TPU_ZONE} -t v4-8 --preemptible -s infra/helpers/setup-tpu-vm-tests.sh -b ${TRUE_SHA} --retries 1
+
+      - name: Run device ordering test
+        run: |
+          export TPU_NAME=jax-${{ matrix.jax_version }}-${{ github.run_id }}
+          gcloud compute tpus tpu-vm ssh $TPU_NAME --zone ${TPU_ZONE} --command "cd levanter && source .venv/bin/activate && python infra/test_device_ordering.py"
+
+      - name: Run all 19 originally failing tests
+        run: |
+          export TPU_NAME=jax-${{ matrix.jax_version }}-${{ github.run_id }}
+          gcloud compute tpus tpu-vm ssh $TPU_NAME --zone ${TPU_ZONE} --command "cd levanter && source .venv/bin/activate && pytest -vs tests/inference/test_paged_attention.py::test_attention_paged_decode_prefill_in_chunks[seq_ids0-1-1] tests/test_attention.py::test_segment_ids_are_respected[default] tests/test_attention.py::test_segment_ids_are_respected[jax_flash] tests/test_attention.py::test_segment_ids_are_respected[vanilla] tests/test_attention.py::test_tpu_splash_attention tests/test_attention.py::test_tpu_splash_attention_sliding_window tests/test_checkpoint.py::test_load_from_checkpoint_allows_partial_checkpoints tests/test_checkpoint.py::test_load_from_checkpoint_or_initialize tests/test_checkpoint.py::test_load_from_checkpoint_or_initialize_works_if_file_not_found tests/test_hf_checkpoints.py::test_save_pretrained_default_dtype tests/test_hf_checkpoints.py::test_save_pretrained_to_memory_fs tests/test_hf_checkpoints.py::test_save_pretrained_with_custom_dtype tests/test_hf_checkpoints.py::test_save_sharded_checkpoints tests/test_hf_gpt2_serialize.py::test_hf_save_to_fs_spec tests/test_hf_gpt2_serialize.py::test_hf_save_to_gcs_roundtrip tests/test_histogram.py::test_sharded_histogram_simple tests/test_histogram.py::test_sharded_histogram_tp tests/test_histogram.py::test_sharded_histogram_with_vmap tests/test_packing.py::test_per_segment_loss"
+
+      - name: Cleanup
+        if: ${{ always() }}
+        run: |
+          export TPU_NAME=jax-${{ matrix.jax_version }}-${{ github.run_id }}
+          gcloud compute tpus tpu-vm delete $TPU_NAME --zone ${TPU_ZONE} --quiet

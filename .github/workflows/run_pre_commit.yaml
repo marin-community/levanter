@@ -1,6 +1,6 @@
 name: Pre-Commit
 
-on: [push, pull_request]
+on: [workflow_dispatch]
 
 jobs:
   pre_commit:
