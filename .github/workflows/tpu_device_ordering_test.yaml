@@ -44,6 +44,8 @@ jobs:
           gcloud compute tpus tpu-vm ssh $TPU_NAME --zone ${TPU_ZONE} --command "
             cd levanter &&
             source .venv/bin/activate &&
+            echo '=== Upgrading pip ===' &&
+            pip install --upgrade pip &&
             echo '=== Installing JAX ${{ matrix.jax_version }} ===' &&
             pip install 'jax[tpu]==${{ matrix.jax_version }}' &&
             echo '=== Running device ordering test ===' &&
