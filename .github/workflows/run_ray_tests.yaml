@@ -1,6 +1,9 @@
 name: Run tests that use ray
 
-on: [push]
+on:
+  push:
+    branches-ignore:
+      - 'rw/test-jax-*'
 
 jobs:
   ray_tests:
