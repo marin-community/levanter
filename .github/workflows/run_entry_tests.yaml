@@ -1,6 +1,10 @@
 name: Run entry tests
 
-on: [push, pull_request]
+on:
+  push:
+    branches-ignore:
+      - 'rw/test-jax-*'
+  pull_request:
 
 jobs:
   entry_tests:
