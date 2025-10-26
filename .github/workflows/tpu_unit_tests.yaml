@@ -1,10 +1,18 @@
 name: CI with GCP TPU
 
-on: [pull_request]
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      test_filter:
+        description: 'pytest filter (e.g., test_mesh_ordering)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   test:
-    if: (github.event.pull_request.head.repo.full_name == github.repository)
+    if: (github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
       TPU_ZONE: "us-central2-b"
@@ -31,7 +39,7 @@ jobs:
         run: |
           export TPU_NAME=ci-run-${{ github.run_id }}
           eval "$(ssh-agent -s)"
-          TRUE_SHA=${{ github.event.pull_request.head.sha }}
+          TRUE_SHA=${{ github.event.pull_request.head.sha || github.sha }}
           bash infra/spin-up-vm.sh $TPU_NAME -z ${TPU_ZONE} -t v4-8 --preemptible -s infra/helpers/setup-tpu-vm-tests.sh -b ${TRUE_SHA} --retries 1
 #          infra/babysit-tpu-vm.sh $TPU_NAME -z ${{ TPU_ZONE }} -t v4-8 --preemptible -s infra/helpers/setup-tpu-vm-tests.sh -b ${{ github.sha }} --retries 1 -- \
 #            PYTHONPATH=$PYTHONPATH:levanter/tests bash levanter/infra/run.sh pytest levanter/tests -m "not entry"
@@ -39,7 +47,13 @@ jobs:
       - name: Run most tests
         run: |
           export TPU_NAME=ci-run-${{ github.run_id }}
-          gcloud compute tpus tpu-vm ssh $TPU_NAME --zone ${TPU_ZONE} --command "JAX_TRACEBACK_FILTERING=off PYTHONPATH=$PYTHONPATH:levanter/tests CI=1 bash levanter/infra/run.sh pytest levanter/tests -m 'not entry and not ray' --durations=20"
+          TEST_FILTER="${{ inputs.test_filter }}"
+          if [ -n "$TEST_FILTER" ]; then
+            TEST_ARGS="-k $TEST_FILTER"
+          else
+            TEST_ARGS="-m 'not entry and not ray'"
+          fi
+          gcloud compute tpus tpu-vm ssh $TPU_NAME --zone ${TPU_ZONE} --command "JAX_TRACEBACK_FILTERING=off PYTHONPATH=$PYTHONPATH:levanter/tests CI=1 bash levanter/infra/run.sh pytest levanter/tests $TEST_ARGS -vv --durations=20"
 # Something's wrong with these
 #
 #      - name: Run forked tests
