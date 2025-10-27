@@ -24,8 +24,9 @@ from levanter import callbacks
 from levanter.checkpoint import load_checkpoint
 from levanter.compat.hf_checkpoints import HFCompatConfig, save_hf_checkpoint_callback
 from levanter.data.text import LMMixtureDatasetConfig, SingleDatasetLMConfig, UrlSingleDatasetLMConfig
+from levanter.data.splice_dataset import SpliceSingleDocumentLMConfig
+from levanter.eval_pz_single_doc import PzSingleDocConfig, pz_single_doc_callback
 from levanter.eval_harness import LmEvalHarnessConfig
-from levanter.eval_pz_innerloop import PzInnerLoopConfig, pz_eval_callback
 from levanter.models.llama import LlamaConfig
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, compute_next_token_loss
 from levanter.optim import AdamConfig, OptimizerConfig
@@ -38,7 +39,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TrainLmConfig:
-    data: Union[SingleDatasetLMConfig, LMMixtureDatasetConfig] = field(default_factory=UrlSingleDatasetLMConfig)
+    data: Union[SingleDatasetLMConfig, LMMixtureDatasetConfig, SpliceSingleDocumentLMConfig] = field(
+        default_factory=UrlSingleDatasetLMConfig
+    )
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
     model: LmConfig = field(default_factory=LlamaConfig)
     optimizer: OptimizerConfig = field(default_factory=AdamConfig)
@@ -67,11 +70,13 @@ class TrainLmConfig:
     epoch: int = 0
     eval_harness: Optional[LmEvalHarnessConfig] = None
     eval_harness_steps: int = 10000
-    pz_eval: Optional[PzInnerLoopConfig] = None
-    pz_eval_steps: int = 10000
 
     # TODO: really need to add callback framework
     log_entropy: bool = False
+
+    # Optional single-document P(z) evaluation over the training doc (for splice dataset configs)
+    pz_single_doc: Optional[PzSingleDocConfig] = None
+    pz_single_doc_steps: int = 10000
 
 
 def main(config: TrainLmConfig):
@@ -197,6 +202,18 @@ def main(config: TrainLmConfig):
             )
             trainer.add_hook(cb, every=config.trainer.steps_per_eval)
 
+        # Optional: P(z) evaluation for a single training document
+        if config.pz_single_doc is not None:
+            pz_cb = pz_single_doc_callback(
+                cfg=config.pz_single_doc,
+                tokenizer=tokenizer,
+                axis_resources=compute_axis_mapping,
+                mp=trainer.mp,
+                data_config=config.data,
+                device_mesh=trainer.device_mesh,
+            )
+            trainer.add_hook(pz_cb, every=config.pz_single_doc_steps)
+
         flops_per_token = config.model.flops_per_token(vocab_size)
         flops_per_example = 3 * flops_per_token * Pos.size if flops_per_token is not None else None
         trainer.add_hook(
@@ -229,27 +246,9 @@ def main(config: TrainLmConfig):
             eval_harness = config.eval_harness
             trainer.add_hook(
                 levanter.eval_harness.lm_eval_harness(
-                    eval_harness,
-                    tokenizer,
-                    EvalBatch,
-                    compute_axis_mapping,
-                    trainer.mp,
-                    data_config=config.data,
+                    eval_harness, tokenizer, EvalBatch, compute_axis_mapping, trainer.mp
                 ),
                 every=config.eval_harness_steps,
-            )
-
-        if config.pz_eval is not None:
-            trainer.add_hook(
-                pz_eval_callback(
-                    config.pz_eval,
-                    tokenizer,
-                    compute_axis_mapping,
-                    trainer.mp,
-                    config.data,
-                    device_mesh=trainer.device_mesh,
-                ),
-                every=config.pz_eval_steps,
             )
 
         @named_jit(
