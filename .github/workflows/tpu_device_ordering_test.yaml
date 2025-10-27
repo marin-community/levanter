@@ -31,26 +31,18 @@ jobs:
         run: |
           gcloud config set project ${{ secrets.GCP_PROJECT_ID }}
 
-      - name: Create VM
+      - name: Create VM and install JAX ${{ matrix.jax_version }}
         run: |
           export TPU_NAME=jax-${{ matrix.jax_version }}-${{ github.run_id }}
+          export JAX_VERSION=${{ matrix.jax_version }}
           eval "$(ssh-agent -s)"
           TRUE_SHA=${{ github.sha }}
           bash infra/spin-up-vm.sh $TPU_NAME -z ${TPU_ZONE} -t v4-8 --preemptible -s infra/helpers/setup-tpu-vm-tests.sh -b ${TRUE_SHA} --retries 1
 
-      - name: Install JAX ${{ matrix.jax_version }} and run device test
+      - name: Run device ordering test
         run: |
           export TPU_NAME=jax-${{ matrix.jax_version }}-${{ github.run_id }}
-          gcloud compute tpus tpu-vm ssh $TPU_NAME --zone ${TPU_ZONE} --command "
-            cd levanter &&
-            source .venv/bin/activate &&
-            echo '=== Upgrading pip ===' &&
-            pip install --upgrade pip &&
-            echo '=== Installing JAX ${{ matrix.jax_version }} ===' &&
-            pip install 'jax[tpu]==${{ matrix.jax_version }}' &&
-            echo '=== Running device ordering test ===' &&
-            python infra/test_device_ordering.py
-          "
+          gcloud compute tpus tpu-vm ssh $TPU_NAME --zone ${TPU_ZONE} --command "cd levanter && source .venv/bin/activate && python infra/test_device_ordering.py"
 
       - name: Cleanup
         if: ${{ always() }}

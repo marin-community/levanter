@@ -119,4 +119,15 @@ echo "Checking out branch $BRANCH"
 
 # install levanter
 uv venv
-uv sync --extra tpu
+
+if [ -n "$JAX_VERSION" ]; then
+  echo "Installing with JAX version override: $JAX_VERSION"
+  # Patch pyproject.toml to use the specified JAX version
+  # Use sed to replace the jax dependency line
+  sed -i.bak "s/\"jax[^\"]*\"/\"jax[tpu]==$JAX_VERSION\"/" pyproject.toml
+  uv sync --extra tpu
+  # Restore original pyproject.toml
+  mv pyproject.toml.bak pyproject.toml
+else
+  uv sync --extra tpu
+fi
