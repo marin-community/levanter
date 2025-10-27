@@ -327,15 +327,15 @@ def test_load_from_checkpoint_or_initialize():
     k0 = jax.random.PRNGKey(0)
     k1 = jax.random.PRNGKey(1)
 
+    model0 = eqx.filter_jit(init_fn)(k0)
+    model1 = eqx.filter_jit(init_fn)(k1)
+
+    is_checkpointed = hax.tree_util.tree_map(lambda _: False, model0)
+    is_checkpointed = eqx.tree_at(lambda t: t.layers[-1], is_checkpointed, replace=True)
+    is_checkpointed1 = hax.tree_util.tree_map(lambda _: False, model1)
+    is_checkpointed1 = eqx.tree_at(lambda t: t.layers[-1], is_checkpointed1, replace=True)
+
     with use_test_mesh(), tempfile.TemporaryDirectory() as tmpdir:
-        model0 = eqx.filter_jit(init_fn)(k0)
-        model1 = eqx.filter_jit(init_fn)(k1)
-
-        is_checkpointed = hax.tree_util.tree_map(lambda _: False, model0)
-        is_checkpointed = eqx.tree_at(lambda t: t.layers[-1], is_checkpointed, replace=True)
-        is_checkpointed1 = hax.tree_util.tree_map(lambda _: False, model1)
-        is_checkpointed1 = eqx.tree_at(lambda t: t.layers[-1], is_checkpointed1, replace=True)
-
         filtered = eqx.filter(model0, is_checkpointed)
         save_checkpoint(filtered, step=0, checkpoint_path=tmpdir)
 
@@ -381,13 +381,13 @@ def test_load_from_checkpoint_or_initialize_works_if_file_not_found():
     k0 = jax.random.PRNGKey(0)
     k1 = jax.random.PRNGKey(1)
 
+    model0 = init_fn(k0)
+    model1 = init_fn(k1)
+
+    is_checkpointed = jtu.tree_map(lambda _: False, model0)
+    is_checkpointed = eqx.tree_at(lambda t: t.layers[-1], is_checkpointed, replace=True)
+
     with use_test_mesh():
-        model0 = init_fn(k0)
-        model1 = init_fn(k1)
-
-        is_checkpointed = jtu.tree_map(lambda _: False, model0)
-        is_checkpointed = eqx.tree_at(lambda t: t.layers[-1], is_checkpointed, replace=True)
-
         loaded = load_checkpoint_or_initialize(init_fn, "kanmfklafnmjlkanfjklanfjkh", is_checkpointed=is_checkpointed)(
             k1
         )
@@ -416,12 +416,12 @@ def test_load_from_checkpoint_allows_partial_checkpoints():
     k0 = jax.random.PRNGKey(0)
     k1 = jax.random.PRNGKey(1)
 
+    model0 = init_fn(k0, False)
+    model1 = init_fn(k1, True)
+
     is_checkpointed = True
 
     with use_test_mesh(), tempfile.TemporaryDirectory() as tmpdir:
-        model0 = init_fn(k0, False)
-        model1 = init_fn(k1, True)
-
 
         save_checkpoint(eqx.filter(model0, is_checkpointed), step=0, checkpoint_path=tmpdir)
 
