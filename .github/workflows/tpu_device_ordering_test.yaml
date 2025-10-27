@@ -44,6 +44,11 @@ jobs:
           export TPU_NAME=jax-${{ matrix.jax_version }}-${{ github.run_id }}
           gcloud compute tpus tpu-vm ssh $TPU_NAME --zone ${TPU_ZONE} --command "cd levanter && source .venv/bin/activate && python infra/test_device_ordering.py"
 
+      - name: Run sample failing tests for comparison
+        run: |
+          export TPU_NAME=jax-${{ matrix.jax_version }}-${{ github.run_id }}
+          gcloud compute tpus tpu-vm ssh $TPU_NAME --zone ${TPU_ZONE} --command "cd levanter && source .venv/bin/activate && pytest -vs tests/test_attention.py::test_segment_ids_are_respected tests/test_checkpoint.py::test_load_from_checkpoint_or_initialize tests/test_checkpoint.py::test_load_from_checkpoint_or_initialize_works_if_file_not_found tests/test_checkpoint.py::test_load_from_checkpoint_allows_partial_checkpoints tests/test_hf_checkpoints.py::test_save_pretrained_to_memory_fs tests/test_histogram.py::test_sharded_histogram_simple tests/test_histogram.py::test_sharded_histogram_tp tests/test_histogram.py::test_sharded_histogram_with_vmap"
+
       - name: Cleanup
         if: ${{ always() }}
         run: |
