@@ -562,12 +562,13 @@ def to_ul2r_tokens(
             sentinel_token_ids=SENTINEL_TOKEN_IDS,
             max_length=max_length - 1,
         )
-        return inputs_len, jnp.concatenate([jnp.array([task_token_id], dtype=jnp.int32), out])
+        # Add 1 to inputs_len for the task token.
+        return inputs_len + 1, jnp.concatenate([jnp.array([task_token_id], dtype=jnp.int32), out])
 
     def s_tokens():
         # TODO Do we ensure that the prefix/continuation isn't just <{begin,end}_of_text>?
         inputs_len, out = to_ul2r_s_tokens(key, tokens[:-1], length)
-        return inputs_len, jnp.concatenate([jnp.array([task_token_id], dtype=jnp.int32), out])
+        return inputs_len + 1, jnp.concatenate([jnp.array([task_token_id], dtype=jnp.int32), out])
 
     def too_short():
         return length, tokens
