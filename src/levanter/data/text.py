@@ -644,6 +644,8 @@ def dataset_for_format(
             pad_token_id = 0
             max_segments_per_example = 64
             slice_strategy = "left"
+            # TODO Figure out whether to pass this in. Needs a lot of piping thru train_set etc.
+            # Seems weird that only UL2R needs it.
             KPos = Pos.alias("key_position")
             return Ul2rDataset(cache, Pos, KPos, task_configs, task_probs, key, pad_token_id, max_segments_per_example, slice_strategy)
         case TextLmDatasetFormat():

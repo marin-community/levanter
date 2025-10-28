@@ -182,9 +182,12 @@ def main(config: TrainLmConfig):
                 # TODO Why do we only have is_causal=True and segment_ids but not prefix_mask?
                 print(batch.attn_mask)
                 for i in range(batch_size):
-                    print(batch.tokens['batch', i].array)
-                    print(tokenizer.decode(batch.tokens['batch', i].array))
-                    print(batch.loss_mask['batch', i].array)
+                    n = 512
+                    print(batch.tokens["batch", i].array[:n])
+                    print(tokenizer.decode(batch.tokens["batch", i].array[:n]))
+                    print(batch.loss_mask["batch", i].array[:n])
+                    print(batch.attn_mask.segment_ids[0]["batch", i, "position", :n].array)
+                    print(batch.attn_mask.materialize(Pos, Pos)["batch", i].array[:n, :n])
                     # TODO print more from batch
                     break
             logger.info("Exiting early because data_only is True")

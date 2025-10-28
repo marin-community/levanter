@@ -246,9 +246,15 @@ def random_spans_noise_mask(
     """
     Generates a random 1D Boolean mask tensor where `noise_density` gives the
     fraction of tokens that are 1s, occurring in runs of length
-    `mean_noise_span_length`. You must use `random_roll` to make each mask
-    equally likely; otherwise the distribution is not uniform and the mask will
-    have a prefix of 0s.
+    `mean_noise_span_length`.
+
+
+    TODO Implement random_roll! This implementation has a bug because it turns
+    input noise masks like 010 into target noise masks like 101, which will
+    create one masked span in the input but two in the target.
+
+    You must use `random_roll` to make each mask equally likely; otherwise the
+    distribution is not uniform and the mask will have a prefix of 0s.
 
     Only the first `length` tokens describe the mask; the contents of the
     remaining `padded_length - length` tokens are 0s.
@@ -288,22 +294,22 @@ def random_spans_noise_mask(
     is_noise = jnp.where(indices < length, is_noise, False)
     is_noise = typing.cast(jnp.ndarray, is_noise)
 
-    def apply_roll(m):
-        offset = jax.random.randint(key3, (), 0, length, dtype=jnp.int32)
-        # Roll the mask
-        rolled = jnp.roll(m, offset)
-        # We want to roll within [0, length) so we need to overwrite values that
-        # came from the end
-        rolled = jnp.where(
-            indices < offset,
-            jnp.roll(m, offset - length),
-            rolled,
-        )
-        rolled = typing.cast(jnp.ndarray, rolled)
-        rolled = jnp.where(indices < length, rolled, False)
-        return rolled
-
-    mask = jax.lax.cond(random_roll, apply_roll, lambda m: m, is_noise)
+    # def apply_roll(m):
+    #     offset = jax.random.randint(key3, (), 0, length, dtype=jnp.int32)
+    #     # Roll the mask
+    #     rolled = jnp.roll(m, offset)
+    #     # We want to roll within [0, length) so we need to overwrite values that
+    #     # came from the end
+    #     rolled = jnp.where(
+    #         indices < offset,
+    #         jnp.roll(m, offset - length),
+    #         rolled,
+    #     )
+    #     rolled = typing.cast(jnp.ndarray, rolled)
+    #     rolled = jnp.where(indices < length, rolled, False)
+    #     return rolled
+    # mask = jax.lax.cond(random_roll, apply_roll, lambda m: m, is_noise)
+    mask = is_noise
 
     return mask
 
@@ -559,6 +565,7 @@ def to_ul2r_tokens(
         return inputs_len, jnp.concatenate([jnp.array([task_token_id], dtype=jnp.int32), out])
 
     def s_tokens():
+        # TODO Do we ensure that the prefix/continuation isn't just <{begin,end}_of_text>?
         inputs_len, out = to_ul2r_s_tokens(key, tokens[:-1], length)
         return inputs_len, jnp.concatenate([jnp.array([task_token_id], dtype=jnp.int32), out])
 
@@ -756,15 +763,16 @@ def create_ul2r_example(
     loss_mask = ul2r_loss_mask(input_mask, out_seg_ids, denoising_tokens, pad_token_id)
     loss_mask = hax.named(loss_mask, QPos)
 
+    # TODO Do we not need KPos? LmExample.causal() just reuses the QPos seg_ids...
+    out_seg_ids = hax.named(out_seg_ids, [QPos])
     attn_mask = AttentionMask(
         is_causal=True,
         is_prefix=True,
         input_mask=hax.named(input_mask, [QPos]),
-        segment_ids=(hax.named(out_seg_ids, [QPos]), hax.named(out_seg_ids, [KPos])),
+        segment_ids=(out_seg_ids, out_seg_ids),
     )
 
     denoising_tokens = hax.named(denoising_tokens, QPos)
-    out_seg_ids = hax.named(out_seg_ids, QPos)
     return LmExample(tokens=denoising_tokens, loss_mask=loss_mask, attn_mask=attn_mask)
 
 
