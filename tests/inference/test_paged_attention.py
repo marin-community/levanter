@@ -303,6 +303,8 @@ def test_attention_paged_decode_matches_full_prefill():
 @pytest.mark.parametrize("chunk_size", [1, 2, 3, 8])
 @pytest.mark.parametrize("seq_ids", [[0, 1], [1, 0], [2, 0], [0, 2], [2, 1]])
 def test_attention_paged_decode_prefill_in_chunks(prefix_size, chunk_size, seq_ids):
+    from test_utils import use_test_mesh
+
     Pos = Axis("position", prefix_size + 4 * chunk_size)
     Embed = Axis("embed", 16)
 
@@ -323,26 +325,26 @@ def test_attention_paged_decode_prefill_in_chunks(prefix_size, chunk_size, seq_i
     assert int(assigned2) == seq2
     kv_cache = attn.empty_page_cache(pt.spec(), dtype=jnp.float32)
 
-    x = hax.random.normal(x_key, (Pos, Embed)) * 0.2
-    x0 = x["position", hax.dslice(0, Pos.size)]
-    x1 = x0
-    full_out = attn(hax.stack("batch", [x0, x1]), AttentionMask.causal(), key=jrandom.PRNGKey(1))
+    with use_test_mesh():
+        x = hax.random.normal(x_key, (Pos, Embed)) * 0.2
+        x0 = x["position", hax.dslice(0, Pos.size)]
+        x1 = x0
+        full_out = attn(hax.stack("batch", [x0, x1]), AttentionMask.causal(), key=jrandom.PRNGKey(1))
 
-    # prefill prefix
-    outputs0 = []
-    outputs1 = []
-    x_prefill = hax.concatenate("position", [x0[Pos, hax.dslice(0, prefix_size)], x1[Pos, hax.dslice(0, prefix_size)]])
-    tokens = hax.named([seq1] * prefix_size + [seq2] * prefix_size, Axis("position", 2 * prefix_size))
-    pos_ids = hax.concatenate(
-        "position",
-        [
-            hax.arange({"position": prefix_size}, dtype=jnp.int32),
-            hax.arange({"position": prefix_size}, dtype=jnp.int32),
-        ],
-    )
-    sequences, pt, binfo = sequences.allocate_for_seq(pt, tokens, pos_ids)
+        # prefill prefix
+        outputs0 = []
+        outputs1 = []
+        x_prefill = hax.concatenate("position", [x0[Pos, hax.dslice(0, prefix_size)], x1[Pos, hax.dslice(0, prefix_size)]])
+        tokens = hax.named([seq1] * prefix_size + [seq2] * prefix_size, Axis("position", 2 * prefix_size))
+        pos_ids = hax.concatenate(
+            "position",
+            [
+                hax.arange({"position": prefix_size}, dtype=jnp.int32),
+                hax.arange({"position": prefix_size}, dtype=jnp.int32),
+            ],
+        )
+        sequences, pt, binfo = sequences.allocate_for_seq(pt, tokens, pos_ids)
 
-    with jax.sharding.set_mesh(jax.make_mesh((len(jax.devices()),), ("model",))):
         out, kv_cache = _jit_paged_decode(attn, x_prefill, pos_ids, kv_cache, binfo)
         outputs0.append(out["position", hax.dslice(0, prefix_size)])
         outputs1.append(out["position", hax.dslice(prefix_size, prefix_size)])
