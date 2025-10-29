@@ -248,7 +248,6 @@ def random_spans_noise_mask(
     fraction of tokens that are 1s, occurring in runs of length
     `mean_noise_span_length`.
 
-
     TODO Implement random_roll! This implementation has a bug because it turns
     input noise masks like 010 into target noise masks like 101, which will
     create one masked span in the input but two in the target.

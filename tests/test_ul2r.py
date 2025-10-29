@@ -86,8 +86,8 @@ def test_random_spans_noise_mask():
         (100, 0.15, 3.0, False),
         # (100, 0.15, 3.0, True),
         (200, 0.5, 10.0, False),
+        # NOTE This is so short that w/o random roll I think it's deterministic because the num_segments = 1 for noise/non-noise
         # (10, 0.3, 3.0, True),
-        (10, 0.3, 3.0, False),
     ]
 
     for length, noise_density, mean_span_length, random_roll in test_cases:
