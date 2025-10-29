@@ -701,7 +701,7 @@ def create_ul2r_example(
     out_starts = jnp.where(unique_seg_ids == -1, -1, out_starts)
     out_starts = typing.cast(jnp.ndarray, out_starts)
 
-    def process_segment(key: PRNGKeyArray, id: int) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def process_segment(key: PRNGKeyArray, id: int) -> tuple[jnp.ndarray, jnp.ndarray, int, int]:
         """
         Applies UL2R denoising to a single segment.
         Returns `(input_mask, denoising_tokens, out_seg_ids)`.
@@ -716,10 +716,10 @@ def create_ul2r_example(
         task_idx = task_indices[id]
 
         idx = jnp.nonzero(unique_seg_ids == id, size=1)[0]
-        in_start = jnp.squeeze(in_starts[idx])
-        in_length = jnp.squeeze(in_lengths[idx])
-        out_length = jnp.squeeze(out_lengths[idx])
-        out_start = jnp.squeeze(out_starts[idx])
+        in_start = typing.cast(int, jnp.squeeze(in_starts[idx]))
+        in_length = typing.cast(int, jnp.squeeze(in_lengths[idx]))
+        out_length = typing.cast(int, jnp.squeeze(out_lengths[idx]))
+        out_start = typing.cast(int, jnp.squeeze(out_starts[idx]))
 
         segment = jnp.roll(tokens.array, -in_start)
         inputs_len, denoising_tokens = to_ul2r_tokens(key, task_params[task_idx], segment, in_length, QPos.size)
@@ -728,9 +728,7 @@ def create_ul2r_example(
         input_mask = jnp.arange(n_tokens) < inputs_len
         input_mask = jnp.roll(input_mask, out_start)
         denoising_tokens = jnp.roll(denoising_tokens, out_start)
-        out_seg_ids = jnp.where(jnp.arange(n_tokens) < out_length, id, 0)
-        out_seg_ids = jnp.roll(out_seg_ids, out_start)
-        return (input_mask, denoising_tokens, out_seg_ids)
+        return (input_mask, denoising_tokens, out_start, out_length)
 
     def should_loop(
         acc: tuple[PRNGKeyArray, int, jnp.ndarray, jnp.ndarray, jnp.ndarray],
@@ -743,15 +741,20 @@ def create_ul2r_example(
     ) -> tuple[PRNGKeyArray, int, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         (key, i, input_mask, denoising_tokens, out_seg_ids) = acc
         process_key, key = jax.random.split(key)
-        (seg_input_mask, seg_denoising_tokens, seg_out_seg_ids) = process_segment(process_key, unique_seg_ids[i])
+        (seg_input_mask, seg_denoising_tokens, out_start, out_length) = process_segment(process_key, unique_seg_ids[i])
         input_mask = input_mask | seg_input_mask
         denoising_tokens = denoising_tokens | seg_denoising_tokens
-        out_seg_ids = out_seg_ids | seg_out_seg_ids
+
+        indices = jnp.arange(out_seg_ids.shape[0])
+        seg_mask = (indices >= out_start) & (indices < out_start + out_length)
+        out_seg_ids = jnp.where(seg_mask, unique_seg_ids[i], out_seg_ids)
+        out_seg_ids = typing.cast(jnp.ndarray, out_seg_ids)
+
         return (key, i + 1, input_mask, denoising_tokens, out_seg_ids)
 
     input_mask = jnp.zeros_like(tokens.array, dtype=jnp.bool_)
     denoising_tokens = jnp.zeros_like(tokens.array)
-    out_seg_ids = jnp.zeros_like(tokens.array)
+    out_seg_ids = jnp.full(tokens.array.shape, -1)
     acc = (key, 0, input_mask, denoising_tokens, out_seg_ids)
 
     jax.debug.print("create_ul2r_example loop")

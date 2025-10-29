@@ -796,7 +796,6 @@ def _materialize_segment_mask(
         q_segment_ids = segment_ids[QPos.name, q_slice]
 
     # TODO Does this need to worry about padding segments?
-
     return q_segment_ids.broadcast_axis(kv_segment_ids.axes) == kv_segment_ids
 
 
@@ -876,6 +875,8 @@ class AttentionMask(eqx.Module):
             shifted_k_start = k_slice.start - offset
             if isinstance(shifted_k_start, NamedArray):
                 # need to vmap
+                # TODO I think the mask is nonzero even for padding positions.
+                # Is that OK? Could check using segment_ids.
                 causal = hax.vmap(causal_mask, shifted_k_start.axes)(
                     QPos.resize(q_slice.size),
                     KPos.resize(k_slice.size),
