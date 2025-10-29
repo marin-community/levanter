@@ -234,17 +234,17 @@ def test_save_pretrained_to_memory_fs():
             save_feature_extractor=False,
         )
 
-    stored_files = {fs._strip_protocol(file) for file in fs.find(path)}
-    base_path = fs._strip_protocol(path)
-    safetensor_files = {file for file in stored_files if file.endswith(".safetensors")}
+        stored_files = {fs._strip_protocol(file) for file in fs.find(path)}
+        base_path = fs._strip_protocol(path)
+        safetensor_files = {file for file in stored_files if file.endswith(".safetensors")}
 
-    assert len(safetensor_files) > 1
-    assert f"{base_path}/config.json" in stored_files
-    assert f"{base_path}/{SAFE_TENSORS_INDEX_NAME}" in stored_files
+        assert len(safetensor_files) > 1
+        assert f"{base_path}/config.json" in stored_files
+        assert f"{base_path}/{SAFE_TENSORS_INDEX_NAME}" in stored_files
 
-    for file in safetensor_files:
-        with fs.open(file, "rb") as fh:
-            assert fh.read(1) != b""
+        for file in safetensor_files:
+            with fs.open(file, "rb") as fh:
+                assert fh.read(1) != b""
 
     with tempfile.TemporaryDirectory() as tmpdir:
         local_path = os.path.join(tmpdir, "model")

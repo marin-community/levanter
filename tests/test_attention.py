@@ -415,10 +415,10 @@ def test_segment_ids_are_respected(impl):
             flash_block_size=128,
         )
 
-    # the first 3 positions should all have a value of 300.0
-    assert_trees_all_close(result.array[0:3, 1], 300.0, atol=1e-3, rtol=1e-3)
-    # the rest should be 0
-    assert_trees_all_close(result.array[3:, 1], 0.0, atol=1e-3, rtol=1e-3)
+        # the first 3 positions should all have a value of 300.0
+        assert_trees_all_close(result.array[0:3, 1], 300.0, atol=1e-3, rtol=1e-3)
+        # the rest should be 0
+        assert_trees_all_close(result.array[3:, 1], 0.0, atol=1e-3, rtol=1e-3)
 
 
 # TODO: fix flash attention for offsets

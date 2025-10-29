@@ -24,8 +24,8 @@ def test_sharded_histogram_simple():
         hist, bins = levanter.tracker.histogram.sharded_histogram(a, bins=32)
         hist_normal, bins_normal = jax.numpy.histogram(a.array, bins=32)
 
-    assert jax.numpy.allclose(hist, hist_normal)
-    assert jax.numpy.allclose(bins, bins_normal)
+        assert jax.numpy.allclose(hist, hist_normal)
+        assert jax.numpy.allclose(bins, bins_normal)
 
 
 @skip_if_not_enough_devices(2)
@@ -42,8 +42,8 @@ def test_sharded_histogram_tp():
         hist, bins = levanter.tracker.histogram.sharded_histogram(a, bins=64)
         jnp_hist, jnp_bins = jax.numpy.histogram(a.array, bins=64)
 
-    assert jax.numpy.allclose(hist, jnp_hist)
-    assert jax.numpy.allclose(bins, jnp_bins)
+        assert jax.numpy.allclose(hist, jnp_hist)
+        assert jax.numpy.allclose(bins, jnp_bins)
 
 
 def test_sharded_histogram_with_vmap():
@@ -66,5 +66,5 @@ def test_sharded_histogram_with_vmap():
         hist, bins = jit_vmap_hist(a)
         hist_normal, bins_normal = jax.vmap(functools.partial(jax.numpy.histogram, bins=32), in_axes=0)(a.array)
 
-    assert jax.numpy.allclose(hist, hist_normal)
-    assert jax.numpy.allclose(bins, bins_normal)
+        assert jax.numpy.allclose(hist, hist_normal)
+        assert jax.numpy.allclose(bins, bins_normal)

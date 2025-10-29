@@ -25,6 +25,8 @@ from levanter.store.jagged_array import JaggedArrayStore
 
 
 def test_per_segment_loss():
+    from test_utils import use_test_mesh
+
     Pos = hax.Axis("pos", size=10)
     packer = SequencePacker(Pos=Pos, max_pack_size=10, pad_token=0)
 
@@ -35,14 +37,15 @@ def test_per_segment_loss():
     # Pack into LmExample
     packed = packer.pack()
 
-    losses = hax.named(jnp.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]), Pos)
+    with use_test_mesh():
+        losses = hax.named(jnp.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]), Pos)
 
-    Segments = hax.Axis("segments", size=3)
+        Segments = hax.Axis("segments", size=3)
 
-    unique_ids, segment_losses = per_segment_loss(packed, losses, max_Segments=Segments)
+        unique_ids, segment_losses = per_segment_loss(packed, losses, max_Segments=Segments)
 
-    assert list(unique_ids.array) == [-1, 0, 1]
-    assert list(segment_losses.array) == [0.0, 0.6, 0.9]
+        assert list(unique_ids.array) == [-1, 0, 1]
+        assert list(segment_losses.array) == [0.0, 0.6, 0.9]
 
 
 def test_can_pack_simple_case():

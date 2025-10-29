@@ -324,10 +324,9 @@ def test_load_from_checkpoint_or_initialize():
     def init_fn(key):
         return hax.nn.MLP.init(In, Out, 2, 1, key=key, use_bias=False, use_final_bias=False)
 
-    k0 = jax.random.PRNGKey(0)
-    k1 = jax.random.PRNGKey(1)
-
     with use_test_mesh(), tempfile.TemporaryDirectory() as tmpdir:
+        k0 = jax.random.PRNGKey(0)
+        k1 = jax.random.PRNGKey(1)
         model0 = eqx.filter_jit(init_fn)(k0)
         model1 = eqx.filter_jit(init_fn)(k1)
 
@@ -378,10 +377,9 @@ def test_load_from_checkpoint_or_initialize_works_if_file_not_found():
     def init_fn(key):
         return hax.nn.MLP.init(In, Out, 2, 3, key=key)
 
-    k0 = jax.random.PRNGKey(0)
-    k1 = jax.random.PRNGKey(1)
-
     with use_test_mesh():
+        k0 = jax.random.PRNGKey(0)
+        k1 = jax.random.PRNGKey(1)
         model0 = init_fn(k0)
         model1 = init_fn(k1)
 
@@ -413,12 +411,11 @@ def test_load_from_checkpoint_allows_partial_checkpoints():
         k_a, k_b = jax.random.split(key)
         return MyModule(a=hax.random.normal(k_a, (In, Out)), b=hax.random.normal(k_b, (In, Out)) if use_b else None)
 
-    k0 = jax.random.PRNGKey(0)
-    k1 = jax.random.PRNGKey(1)
-
     is_checkpointed = True
 
     with use_test_mesh(), tempfile.TemporaryDirectory() as tmpdir:
+        k0 = jax.random.PRNGKey(0)
+        k1 = jax.random.PRNGKey(1)
         model0 = init_fn(k0, False)
         model1 = init_fn(k1, True)
 
