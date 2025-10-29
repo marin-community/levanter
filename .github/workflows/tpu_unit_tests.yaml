@@ -6,6 +6,10 @@ jobs:
   test:
     if: (github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        jax_version: ["0.6.2", "0.7.2"]
     env:
       TPU_ZONE: "us-central2-b"
 
@@ -29,7 +33,8 @@ jobs:
 
       - name: Create VM
         run: |
-          export TPU_NAME=ci-run-${{ github.run_id }}
+          export TPU_NAME=ci-run-jax-${{ matrix.jax_version }}-${{ github.run_id }}
+          export JAX_VERSION=${{ matrix.jax_version }}
           eval "$(ssh-agent -s)"
           TRUE_SHA=${{ github.event.pull_request.head.sha }}
           bash infra/spin-up-vm.sh $TPU_NAME -z ${TPU_ZONE} -t v4-8 --preemptible -s infra/helpers/setup-tpu-vm-tests.sh -b ${TRUE_SHA} --retries 1
@@ -38,8 +43,8 @@ jobs:
 
       - name: Run most tests
         run: |
-          export TPU_NAME=ci-run-${{ github.run_id }}
-          gcloud compute tpus tpu-vm ssh $TPU_NAME --zone ${TPU_ZONE} --command "JAX_TRACEBACK_FILTERING=off PYTHONPATH=$PYTHONPATH:levanter/tests CI=1 bash levanter/infra/run.sh pytest levanter/tests -m 'not entry and not ray' --durations=20"
+          export TPU_NAME=ci-run-jax-${{ matrix.jax_version }}-${{ github.run_id }}
+          gcloud compute tpus tpu-vm ssh $TPU_NAME --zone ${TPU_ZONE} --command "JAX_TRACEBACK_FILTERING=off PYTHONPATH=$PYTHONPATH:levanter/tests CI=1 bash levanter/infra/run.sh pytest levanter/tests -m 'not entry and not ray' -vv --durations=20"
 # Something's wrong with these
 #
 #      - name: Run forked tests
@@ -50,6 +55,5 @@ jobs:
       - name: Cleanup
         if: ${{ always() }}
         run: |
-          export TPU_NAME=ci-run-${{ github.run_id }}
-          echo gcloud compute tpus tpu-vm delete $TPU_NAME --zone ${TPU_ZONE} --quiet
+          export TPU_NAME=ci-run-jax-${{ matrix.jax_version }}-${{ github.run_id }}
           gcloud compute tpus tpu-vm delete $TPU_NAME --zone ${TPU_ZONE} --quiet
