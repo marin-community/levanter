@@ -81,17 +81,18 @@ def test_random_segmentation():
 
 def test_random_spans_noise_mask():
     padded_length = 256
+    # NOTE At short lengths, it can be deterministic because the num_segments =
+    # 1 for noise/non-noise.
     test_cases = [
         (20, 0.3, 3.0, False),
         (100, 0.15, 3.0, False),
         # (100, 0.15, 3.0, True),
         (200, 0.5, 10.0, False),
-        # NOTE This is so short that w/o random roll I think it's deterministic because the num_segments = 1 for noise/non-noise
-        # (10, 0.3, 3.0, True),
+        (10, 0.3, 3.0, True),
     ]
 
     for length, noise_density, mean_span_length, random_roll in test_cases:
-        key = jax.random.PRNGKey(42)
+        key = jax.random.PRNGKey(37)
 
         mask = random_spans_noise_mask(length, noise_density, key, mean_span_length, random_roll, padded_length)
         print(mask)
@@ -200,7 +201,6 @@ def test_noise_span_to_unique_sentinel():
 
 
 def test_to_ul2r_rx_tokens():
-    """Test the to_ul2r_rx_tokens function."""
     max_length = 256
     pad_token_id = 0
     sentinel_tokens = jnp.array([100, 101, 102, 103, 104])
@@ -268,6 +268,49 @@ def test_to_ul2r_rx_tokens():
     #     assert jnp.all(
     #         result_roll[last_non_pad_roll + 1 :] == pad_token_id
     #     ), "Should have continuous padding at the end with roll"
+
+
+def test_to_ul2r_rx_tokens_roll():
+    max_length = 256
+    pad_token_id = 0
+    min_sentinel_id = 100
+    num_sentinels = 5
+    sentinel_ids = jnp.arange(min_sentinel_id, min_sentinel_id + num_sentinels)
+
+    tokens = jnp.arange(10, 20)
+    tokens = jnp.pad(tokens, (0, max_length - tokens.shape[0]), constant_values=pad_token_id)
+    length = 10
+
+    for i in range(5):
+        key = jax.random.PRNGKey(i)
+
+        input_length, result = to_ul2r_rx_tokens(
+            key,
+            tokens,
+            length,
+            mask_prob=0.3,
+            mean_noise_span_length=3.0,
+            random_roll=True,
+            sentinel_token_ids=sentinel_ids,
+            max_length=max_length,
+        )
+        assert result.shape == (max_length,)
+
+        assert input_length.shape == ()
+        assert input_length > 0
+        assert input_length <= length
+
+        inputs = result[:input_length]
+        targets = result[input_length:]
+
+        # The same sentinels should exist in inputs/targets.
+        # We previously had a bug where a noise mask of 010 (created from
+        # random_roll) would produce a target noise mask of 101, which would create
+        # 2 sentinels in the target vs. only 1 in the input.
+
+        np.testing.assert_array_equal(jnp.isin(sentinel_ids, inputs), jnp.isin(sentinel_ids, targets))
+        assert jnp.any(jnp.isin(sentinel_ids, inputs))
+        assert jnp.any(jnp.isin(sentinel_ids, targets))
 
 
 def test_ul2r_loss_mask():

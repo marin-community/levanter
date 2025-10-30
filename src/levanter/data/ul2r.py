@@ -293,50 +293,39 @@ def random_spans_noise_mask(
     is_noise = jnp.where(indices < length, is_noise, False)
     is_noise = typing.cast(jnp.ndarray, is_noise)
 
-    # def apply_roll(m):
-    #     offset = jax.random.randint(key3, (), 0, length, dtype=jnp.int32)
-    #     # Roll the mask
-    #     rolled = jnp.roll(m, offset)
-    #     # We want to roll within [0, length) so we need to overwrite values that
-    #     # came from the end
-    #     rolled = jnp.where(
-    #         indices < offset,
-    #         jnp.roll(m, offset - length),
-    #         rolled,
-    #     )
-    #     rolled = typing.cast(jnp.ndarray, rolled)
-    #     rolled = jnp.where(indices < length, rolled, False)
-    #     return rolled
-    # mask = jax.lax.cond(random_roll, apply_roll, lambda m: m, is_noise)
-    mask = is_noise
+    def apply_roll(m):
+        offset = jax.random.randint(key3, (), 0, length, dtype=jnp.int32)
+        # Roll the mask
+        rolled = jnp.roll(m, offset)
+        # We want to roll within [0, length) so we need to overwrite values that
+        # came from the end
+        rolled = jnp.where(
+            indices < offset,
+            jnp.roll(m, offset - length),
+            rolled,
+        )
+        rolled = typing.cast(jnp.ndarray, rolled)
+        rolled = jnp.where(indices < length, rolled, False)
+        return rolled
 
+    mask = jax.lax.cond(random_roll, apply_roll, lambda m: m, is_noise)
     return mask
 
 
 @jax.jit
-def noise_span_to_unique_sentinel(
-    tokens: jnp.ndarray,
-    noise_mask: jnp.ndarray,
-    sentinel_tokens: jnp.ndarray,
-    length: int,
+def noise_span_to_unique_sentinel_all_nonnoise(
+    tokens: jnp.ndarray, noise_mask: jnp.ndarray, sentinel_tokens: jnp.ndarray, length: int
 ) -> jnp.ndarray:
-    """
-    Replace each run of consecutive noise tokens with a different sentinel.
-    `length` must be the true length of `tokens`, excluding padding.
+    # If the input noise mask is e.g. 10, we end up with a target noise mask of
+    # 01. The input will be <mask1> bar and length will truncate the target
+    # noise mask to just 0. But we want to output <mask1> foo, not foo.
+    return jnp.concatenate([sentinel_tokens[0:1], tokens[:-1]])
 
-    For example:
 
-        tokens = "The longest river in the world is the Amazon"
-        noise_mask = [0, 1, 0, ...]
-        noise_span_to_unique_sentinel(...) =
-            "The <sentinel_0> river in the world is the Amazon <sentinel_0> Amazon"
-
-    Based on `noise_span_to_unique_sentinel` in T5:
-    https://github.com/google-research/text-to-text-transfer-transformer/blob/e081111ccd51df425aa7124e8e311ed6d403d767/t5/data/preprocessors.py#L3141
-
-    Returns:
-        A tensor with the same shape and dtype as `tokens`.
-    """
+@jax.jit
+def noise_span_to_unique_sentinel_some_noise(
+    tokens: jnp.ndarray, noise_mask: jnp.ndarray, sentinel_tokens: jnp.ndarray, length: int
+) -> jnp.ndarray:
     # Identify first noise tokens in each span
     prev_token_is_noise = jnp.roll(noise_mask, 1)
     prev_token_is_noise = prev_token_is_noise.at[0].set(False)
@@ -362,8 +351,8 @@ def noise_span_to_unique_sentinel(
     def loop_body(read_pos, state):
         out, write_pos = state
         # Advance the read position from left to right in `tokens`.
-        # When we see the first noise token for a span, write the sentinel for the
-        # span.
+        # When we see the first noise token for a span, write the sentinel for
+        # the span.
         # When we see a subsequent noise token, advance the read position
         # without writing anything.
         # Otherwise just copy from `tokens`.
@@ -381,6 +370,40 @@ def noise_span_to_unique_sentinel(
     result, _ = jax.lax.fori_loop(0, length, loop_body, (result, 0))
 
     return result
+
+
+@jax.jit
+def noise_span_to_unique_sentinel(
+    tokens: jnp.ndarray,
+    noise_mask: jnp.ndarray,
+    sentinel_tokens: jnp.ndarray,
+    length: int,
+) -> jnp.ndarray:
+    """
+    Replace each run of consecutive noise tokens with a different sentinel.
+    `length` must be the un-padded length of `tokens`.
+
+    For example:
+
+        tokens = "The longest river in the world is the Amazon"
+        noise_mask = [0, 1, 0, ...]
+        noise_span_to_unique_sentinel(...) =
+            "The <sentinel_0> river in the world is the Amazon <sentinel_0> Amazon"
+
+    Based on `noise_span_to_unique_sentinel` in T5:
+    https://github.com/google-research/text-to-text-transfer-transformer/blob/e081111ccd51df425aa7124e8e311ed6d403d767/t5/data/preprocessors.py#L3141
+
+    Returns:
+        A tensor with the same shape and dtype as `tokens`.
+    """
+
+    indices = jnp.arange(tokens.shape[0])
+    is_all_nonnoise = ~jnp.any(jnp.where(indices < length, noise_mask, False))
+    return jax.lax.cond(
+        is_all_nonnoise,
+        lambda: noise_span_to_unique_sentinel_all_nonnoise(tokens, noise_mask, sentinel_tokens, length),
+        lambda: noise_span_to_unique_sentinel_some_noise(tokens, noise_mask, sentinel_tokens, length),
+    )
 
 
 @jax.jit
@@ -420,6 +443,13 @@ def to_ul2r_rx_tokens(
         padded_length,
     )
 
+    # When random_roll is True we can get noise masks that end with non-noise.
+    # 010 as noise_mask for inputs -> 101 as noise_mask for targets
+    # foo <m1> buzz (inputs) -> <m1> bar <m2> (ouputs -- wrong)
+    # want: <m1> bar
+    # So for targets we must not read past the last noised part of inputs.
+    target_in_len = jnp.where(noise_mask, jnp.arange(noise_mask.shape[0]), 0).max() + 1
+
     inputs = noise_span_to_unique_sentinel(
         tokens,
         noise_mask,
@@ -430,7 +460,7 @@ def to_ul2r_rx_tokens(
         tokens,
         ~noise_mask,
         sentinel_token_ids,
-        length,
+        target_in_len,
     )
 
     indices = jnp.arange(padded_length)
