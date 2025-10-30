@@ -101,12 +101,12 @@ class LmExample(eqx.Module):
 
     @staticmethod
     def causal_loss_mask(Pos: Axis, prompt_length: Optional[int] = None) -> NamedArray:
-        loss_mask = 1 - hax.nn.one_hot(-1, Pos, dtype=jnp.float32)
+        loss_mask = hax.logical_not(hax.nn.one_hot(-1, Pos, dtype=jnp.bool_))
 
         if prompt_length is not None:
             # don't predict the prompt tokens
             prompt_mask = hax.arange(Pos) >= prompt_length - 1
-            loss_mask = loss_mask * prompt_mask
+            loss_mask = hax.logical_and(loss_mask, prompt_mask)
 
         return loss_mask
 
