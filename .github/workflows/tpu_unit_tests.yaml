@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        jax_version: ["0.6.2", "0.7.2"]
+        jax_version: ["0.6.2", "0.7.2", "0.8.0"]
     env:
       TPU_ZONE: ${{ inputs.tpu_zone || 'us-east5-a' }}
       TPU_TYPE: ${{ inputs.tpu_type || 'v5p-8' }}
