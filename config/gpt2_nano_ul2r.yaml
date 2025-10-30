@@ -1,6 +1,8 @@
 #data:
 #  id: dlwh/wikitext_103_detokenized
 
+disable_jit: true
+
 model:
   type: gpt2
   hidden_dim: 32
@@ -24,7 +26,7 @@ trainer:
 
 data:
   id: dlwh/wikitext_103_detokenized
-  cache_dir: /teamspace/studios/this_studio/marin_cache/
+  cache_dir: /workspace/marin_cache
   tokenizer: gpt2
   format:
     type: ul2r

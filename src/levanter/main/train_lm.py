@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass, field
 import itertools
 from typing import Optional, Union
+import jax
 from tqdm_loggable.auto import tqdm
 
 import jax.numpy as jnp
@@ -74,6 +75,7 @@ class TrainLmConfig:
     log_entropy: bool = False
 
     data_only: bool = False
+    disable_jit: bool = False
 
 
 def main(config: TrainLmConfig):
@@ -314,7 +316,10 @@ def main(config: TrainLmConfig):
             train_loader = train_loader.iter_from_step(0)
 
         ## OK, actually run training!
-        last_info = trainer.train(state, train_loader)
+        disable_jit = config.disable_jit
+        last_info = None
+        with jax.disable_jit(disable_jit):
+            last_info = trainer.train(state, train_loader)
 
         # If running EpochDataset save latest checkpoint by default
         if trainer.config.checkpointer is not None and config.epoch > 0:
