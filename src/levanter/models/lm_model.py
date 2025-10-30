@@ -55,7 +55,7 @@ class LmExample(eqx.Module):
             # we don't compute loss for any tokens matching the ignore index
             ignore_mask = hax.roll(tokens, -1, Pos) != ignore_id
             ignore_mask = ignore_mask.astype(loss_mask.dtype)
-            loss_mask = loss_mask & ignore_mask.astype(loss_mask.dtype)
+            loss_mask = loss_mask & ignore_mask
 
         loss_mask = loss_mask.astype(jnp.int32)
 
