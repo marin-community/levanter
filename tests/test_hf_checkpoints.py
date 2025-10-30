@@ -179,7 +179,7 @@ def test_save_pretrained_default_dtype():
     with tempfile.TemporaryDirectory() as tmpdir:
         with use_test_mesh():
             wrapped_model = BasicModelWrapper.init(converter.Vocab, gpt2_config, key=PRNGKey(0))
-            wrapped_model = jax.tree_util.tree_map(cast_floats, wrapped_model, is_leaf=lambda x: eqx.is_array(x))
+            wrapped_model = jax.tree_util.tree_map(cast_floats, wrapped_model, is_leaf=eqx.is_array)
 
             assert (
                 wrapped_model.model.transformer.blocks.stacked.attn.c_attn.weight.array.dtype == expected_float_dtype

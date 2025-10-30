@@ -21,6 +21,7 @@ from levanter.inference.utils import INVALID
 from levanter.layers import AttentionConfig, AttentionBackend, Attention
 from levanter.layers.attention import AttentionMask, ragged_paged_attention, simple_attention_with_dropout
 from levanter.layers.kv_cache import KvPageCache
+from test_utils import use_test_mesh
 
 SLOT = hax.Axis("slot", 4)  # page size
 NUM_SLOTS = SLOT.size
@@ -303,8 +304,6 @@ def test_attention_paged_decode_matches_full_prefill():
 @pytest.mark.parametrize("chunk_size", [1, 2, 3, 8])
 @pytest.mark.parametrize("seq_ids", [[0, 1], [1, 0], [2, 0], [0, 2], [2, 1]])
 def test_attention_paged_decode_prefill_in_chunks(prefix_size, chunk_size, seq_ids):
-    from test_utils import use_test_mesh
-
     Pos = Axis("position", prefix_size + 4 * chunk_size)
     Embed = Axis("embed", 16)
 
