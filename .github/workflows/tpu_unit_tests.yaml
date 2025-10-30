@@ -11,6 +11,7 @@ on:
         type: choice
         options:
           - v5p-8
+          - v5litepod-4
           - v5litepod-8
           - v4-8
           - v6e-8
