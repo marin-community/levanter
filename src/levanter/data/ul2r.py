@@ -43,7 +43,6 @@ MIN_S_LENGTH = 3
 
 @dataclass(frozen=True)
 class DenoisingConfig(draccus.ChoiceRegistry):
-    task_kind: int
     task_token_id: int
 
     def with_task_token_id(self, task_token_id: int) -> "DenoisingConfig":
@@ -57,13 +56,13 @@ class DenoisingConfig(draccus.ChoiceRegistry):
     ) -> typing.Dict[str, "DenoisingConfig"]:
         # Table 1 https://arxiv.org/pdf/2205.05131
         return {
-            "r1": RXDenoisingConfig(RX_TASK_KIND, r_task_token_id, 0.15, 3.0, False),
-            "r2": RXDenoisingConfig(RX_TASK_KIND, r_task_token_id, 0.15, 8.0, False),
-            "x1": RXDenoisingConfig(RX_TASK_KIND, x_task_token_id, 0.5, 3.0, False),
-            "x2": RXDenoisingConfig(RX_TASK_KIND, x_task_token_id, 0.5, 8.0, False),
-            "x3": RXDenoisingConfig(RX_TASK_KIND, x_task_token_id, 0.15, 64.0, False),
-            "x4": RXDenoisingConfig(RX_TASK_KIND, x_task_token_id, 0.5, 64.0, False),
-            "s": SDenoisingConfig(S_TASK_KIND, s_task_token_id),
+            "r1": RXDenoisingConfig(r_task_token_id, 0.15, 3.0, False),
+            "r2": RXDenoisingConfig(r_task_token_id, 0.15, 8.0, False),
+            "x1": RXDenoisingConfig(x_task_token_id, 0.5, 3.0, False),
+            "x2": RXDenoisingConfig(x_task_token_id, 0.5, 8.0, False),
+            "x3": RXDenoisingConfig(x_task_token_id, 0.15, 64.0, False),
+            "x4": RXDenoisingConfig(x_task_token_id, 0.5, 64.0, False),
+            "s": SDenoisingConfig(s_task_token_id),
         }
 
     @staticmethod
@@ -74,10 +73,10 @@ class DenoisingConfig(draccus.ChoiceRegistry):
     ) -> Dict[str, "DenoisingConfig"]:
         # Section 3.3 Loss Objectives https://arxiv.org/pdf/2210.11399v2
         return {
-            "r": RXDenoisingConfig(RX_TASK_KIND, r_task_token_id, 0.15, 3.0, False),
-            "x1": RXDenoisingConfig(RX_TASK_KIND, x_task_token_id, 0.15, 32.0, False),
-            "x2": RXDenoisingConfig(RX_TASK_KIND, x_task_token_id, 0.5, 3.0, False),
-            "s": SDenoisingConfig(S_TASK_KIND, s_task_token_id),
+            "r": RXDenoisingConfig(r_task_token_id, 0.15, 3.0, False),
+            "x1": RXDenoisingConfig(x_task_token_id, 0.15, 32.0, False),
+            "x2": RXDenoisingConfig(x_task_token_id, 0.5, 3.0, False),
+            "s": SDenoisingConfig(s_task_token_id),
         }
 
     def to_task_params(self) -> jnp.ndarray:
@@ -101,7 +100,7 @@ class RXDenoisingConfig(DenoisingConfig):
 
     def to_task_params(self) -> jnp.ndarray:
         args = [
-            self.task_kind,
+            RX_TASK_KIND,
             self.task_token_id,
             self.mask_prob,
             self.mean_span_length,
@@ -120,11 +119,9 @@ class RXDenoisingConfig(DenoisingConfig):
 @DenoisingConfig.register_subclass("s")
 @dataclass(frozen=True)
 class SDenoisingConfig(DenoisingConfig):
-    task_kind: int
-
     def to_task_params(self) -> jnp.ndarray:
         # should match size of RXDenoisingConfig
-        return jnp.array([self.task_kind, self.task_token_id, 0, 0])
+        return jnp.array([S_TASK_KIND, self.task_token_id, 0, 0])
 
 
 @functools.partial(jax.jit, static_argnames=["padded_length"])
