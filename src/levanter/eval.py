@@ -9,6 +9,7 @@ from collections import defaultdict
 from typing import Callable, Mapping, Optional, Sequence, TypeVar
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import jmp
 import numpy as np
@@ -16,6 +17,7 @@ from jax.sharding import Mesh
 from tqdm_loggable.auto import tqdm
 
 import haliax as hax
+from haliax import Axis
 from haliax.partitioning import ResourceMapping
 
 import levanter.tracker
@@ -46,6 +48,23 @@ class EvalResult:
     macro_bpb: Optional[float] = None
     tag_macro_bpb: Optional[dict[str, float]] = None
     tag_micro_bpb: Optional[dict[str, float]] = None
+    # New fields for per-token loss tracking
+    per_token_loss: Optional[hax.NamedArray] = None  # Full array of average loss per vocab ID
+    token_macro_loss: Optional[float] = None  # Macro average over *appeared* token losses
+
+
+@dataclasses.dataclass
+class _EvalRunningMeans:
+    """Helper class to track running means for evaluation losses."""
+
+    total_loss_running_mean: RunningMean
+    token_count_running_mean: RunningMean
+    bytes_per_token_running_mean: RunningMean
+    tag_total_loss_running_mean: RunningMean
+    tag_token_count_running_mean: RunningMean
+    tag_bytes_per_token_running_mean: RunningMean
+    # New field for per-token loss tracking
+    per_token_loss_running_mean: RunningMean
 
 
 # This class doesn't try to be async or work with incomplete datasets, because it's eval
@@ -156,14 +175,9 @@ class DomainTaggedDataset(AsyncDataset[tuple[T, hax.NamedArray]]):
         return await self.async_len()
 
 
-def _join_prefix(prefix: str, tag: str) -> str:
-    if prefix:
-        return f"{prefix}/{tag}"
-    return tag
-
-
 def cb_tagged_lm_evaluate(
     EvalBatch: hax.Axis,
+    model: LmHeadModel,
     tagged_eval_sets: Sequence[tuple[AsyncDataset[LmExample], Sequence[str]]],
     tokenizer: Optional[HfTokenizer] = None,
     device_mesh: Optional[Mesh] = None,
@@ -182,300 +196,313 @@ def cb_tagged_lm_evaluate(
     Tags can be hierarchical, with "/" as a separator. We log both a micro and macro average loss
     for each tag.
 
+    This function also tracks per-token loss (average loss for each individual token ID) and
+    a 'token macro loss' (the average of these per-token losses for tokens that appeared).
+
     !!! note
 
         loss_fn should return *per-token* loss (shape [EvalBatch, Token])
 
     Args:
         EvalBatch: The axis for the evaluation batch (mostly for the batch size)
-        tagged_eval_sets: A list of datasets, each with its own domain tag
-        tokenizer: The tokenizer to use for bits-per-byte evaluation (optional)
-        device_mesh: The mesh to use for evaluation
-        axis_mapping: The axis mapping to use for evaluation
-        max_examples_per_dataset: The maximum number of examples to use from each dataset
-        prefix: The prefix to use for logging the losses
-        eval_current: Whether to evaluate the model's current parameters
-        eval_ema: Whether to evaluate the EMA model (or other model averaged model)
+        model: The model to evaluate. A template model is passed to capture metadata like axes.
+        tagged_eval_sets: A sequence of tuples, where each tuple is an `AsyncDataset` and a sequence of tags.
+        tokenizer: The tokenizer to use for BPB calculation.
+        device_mesh: The device mesh to use for evaluation.
+        axis_mapping: The resource mapping to use for evaluation.
+        max_examples_per_dataset: The maximum number of examples to use from each dataset.
+        eval_current: Whether to evaluate the current model.
+        eval_ema: Whether to evaluate the EMA model.
+        prefix: The prefix to use for logging.
+        mp: The mixed precision policy to use for evaluation.
     """
 
-    evaluator = TaggedEvaluator(
-        EvalBatch, tagged_eval_sets, tokenizer, device_mesh, axis_mapping, max_examples_per_dataset, mp=mp
-    )
+    if device_mesh is None:
+        device_mesh = hax.partitioning.get_context().mesh
 
-    if not eval_current and not eval_ema:
-        raise ValueError("At least one of eval_current or eval_ema should be True")
+    if axis_mapping is None:
+        axis_mapping = hax.partitioning.get_context().axis_mapping
 
-    def eval_callback(step: StepInfo):
-        step_count = step.step
+    if mp is None:
+        mp = jmp.get_policy("primitives")
 
-        if eval_current:
-            log_dict = eval_model(evaluator, step.model, prefix=prefix)
-            levanter.tracker.log(log_dict, step=step_count)
+    dataset = DomainTaggedDataset(tagged_eval_sets, max_examples_per_dataset=max_examples_per_dataset)
+    Tag = dataset.Tag
+    Vocab = model.Vocab
 
-        if not eval_current and step.state.model_averaging is None:
-            raise ValueError("Cannot evaluate EMA model without model averaging, but you only want to evaluate EMA")
+    def callback(info: StepInfo):
+        if not eval_current and not eval_ema:
+            return
 
-        if eval_ema and step.state.model_averaging is not None:
-            log_dict = eval_model(evaluator, step.eval_model, prefix=_join_prefix(prefix, "ema"))
-            levanter.tracker.log(log_dict, step=step_count)
+        with jax.spmd_mode("allow_all"):
+            if eval_current:
+                logger.info(f"Evaluating current model at step {info.step}")
+                result = evaluate_model(info.model, prefix, use_ema=False)
+                log_eval_result(result)
 
-        return
+            if eval_ema and info.ema_model is not None:
+                logger.info(f"Evaluating EMA model at step {info.step}")
+                result = evaluate_model(info.ema_model, prefix, use_ema=True)
+                log_eval_result(result)
 
-    return eval_callback
+    @eqx.filter_jit
+    def compute_and_accumulate_loss_step(model, running_means: _EvalRunningMeans, batch: LmExample):
+        # compute loss and sharded device array
+        losses = compute_next_token_loss(model, batch, key=None)
 
+        # we don't need the tags on the device, but it's fine
+        # loss mask is a bool array, but it's fine to multiply by it
+        masked_loss = losses * batch.loss_mask
+        # total loss for the batch
+        total_loss = hax.sum(masked_loss)
+        # total tokens for the batch that are not padding
+        token_count = hax.sum(batch.loss_mask)
 
-def eval_model(evaluator: "TaggedEvaluator", model: LmHeadModel, prefix: str = "") -> dict[str, float]:
-    with levanter.tracker.capture_time() as time_fn:
-        result = evaluator.evaluate(model)
-    log_dict = _construct_log_dict(evaluator, result, time_fn(), prefix=prefix)
-    return log_dict
+        new_total_loss_mean = running_means.total_loss_running_mean.update(total_loss, token_count)
+        new_running_means = dataclasses.replace(running_means, total_loss_running_mean=new_total_loss_mean)
 
+        new_token_count_mean = running_means.token_count_running_mean.update(token_count)
+        new_running_means = dataclasses.replace(new_running_means, token_count_running_mean=new_token_count_mean)
 
-def _construct_log_dict(evaluator, eval_result, total_time, prefix):
-    tokenizer = evaluator.tokenizer
-    log_dict = {
-        # log micro average as just "loss"
-        _join_prefix(prefix, "loss"): eval_result.micro_avg_loss,
-        _join_prefix(prefix, "loading_time"): eval_result.total_eval_loading_time,
-        _join_prefix(prefix, "total_time"): total_time,
-    }
-    logger.info(f"{prefix} loss: {eval_result.micro_avg_loss:.3f}")
-    has_tags = len(evaluator.dataset.tag_to_index) > 1  # 1 tag means there's no difference between micro and macro
-    if has_tags:
-        log_dict[_join_prefix(prefix, "macro_loss")] = eval_result.macro_avg_loss
+        # total loss for each tag
+        tag_loss = hax.sum(masked_loss.broadcast_axis(Tag) * batch.tags, batch.tokens.axes)
+        tag_token_count = hax.sum(batch.loss_mask.broadcast_axis(Tag) * batch.tags, batch.tokens.axes)
 
-        for tag, loss in eval_result.tag_macro_losses.items():
-            # don't log leaf tag macro losses because it doesn't mean anything different than micro loss
-            if tag in evaluator.dataset.tag_to_index:
-                continue
-            if not tag:
-                continue
-            log_dict[_join_prefix(prefix, tag) + "/macro_loss"] = loss
-            logger.info(f"{tag} macro loss: {loss:.3f}")
-    for tag, loss in eval_result.tag_micro_losses.items():
-        if not tag:
-            continue
-        if tag in evaluator.dataset.tag_to_index:
-            log_dict[_join_prefix(prefix, tag) + "/loss"] = loss
-            logger.info(f"{tag} loss: {loss:.3f}")
-        else:
-            log_dict[_join_prefix(prefix, tag) + "/micro_loss"] = loss
-            logger.info(f"{tag} micro loss: {loss:.3f}")
-    if tokenizer is not None:
-        log_dict[_join_prefix(prefix, "bpb")] = eval_result.micro_bpb
-        if has_tags:
-            log_dict[_join_prefix(prefix, "macro_bpb")] = eval_result.macro_bpb
-        for tag, bpb in eval_result.tag_micro_bpb.items():
-            log_dict[_join_prefix(prefix, tag) + "/bpb"] = bpb
-
-        if has_tags:
-            for tag, bpb in eval_result.tag_macro_bpb.items():
-                log_dict[_join_prefix(prefix, tag) + "/macro_bpb"] = bpb
-    return log_dict
-
-
-class TaggedEvaluator:
-    """
-    Evaluates multiple tagged datasets using a given evaluation function.
-    Scores for each tag are aggregated and logged separately, as well as getting an overall score.
-
-    TaggedEvaluator computes both log-perplexity and bits-per-byte for each tag, if a tokenizer is provided.
-
-    Tags are arranged hierarchically with "/" as separator, and we log both a micro and macro average loss
-    for each tag.
-
-    """
-
-    def __init__(
-        self,
-        EvalBatch: hax.Axis,
-        tagged_eval_sets: Sequence[tuple[AsyncDataset, Sequence[str]]],
-        tokenizer: Optional[HfTokenizer] = None,
-        device_mesh=None,
-        axis_mapping=None,
-        max_examples_per_dataset=None,
-        mp: Optional[jmp.Policy] = None,
-    ):
-        self.EvalBatch = EvalBatch
-        self.dataset = DomainTaggedDataset(tagged_eval_sets, max_examples_per_dataset)
-        self.loader = DataLoader(
-            self.dataset.as_async_dataset(),
-            EvalBatch,
-            max_buffered_batches=100,
-            mesh=device_mesh,
-            axis_resources=axis_mapping,
+        new_tag_total_loss_mean = running_means.tag_total_loss_running_mean.update(tag_loss, tag_token_count)
+        new_running_means = dataclasses.replace(
+            new_running_means, tag_total_loss_running_mean=new_tag_total_loss_mean
         )
-        self.mp = mp
-        self.tokenizer = tokenizer
-        self.bytes_per_token = self._calculate_bytes_per_token_type(tokenizer)
 
-        # tags are arranged hierarchically with "/" as separator. We want to log the average loss for each tag.
-        hierarchy: dict[str, list[int]] = {}
-        for tag, index in self.dataset.tag_to_index.items():
-            parts = tag.split("/")
-            for i in range(1, len(parts)):
-                parent = "/".join(parts[:i])
-                assert parent != tag
-                if parent not in hierarchy:
-                    hierarchy[parent] = []
-                hierarchy[parent].append(index)
+        new_tag_token_count_mean = running_means.tag_token_count_running_mean.update(tag_token_count)
+        new_running_means = dataclasses.replace(
+            new_running_means, tag_token_count_running_mean=new_tag_token_count_mean
+        )
 
-        self.hierarchy = hierarchy
+        # bytes per token for the batch
+        if tokenizer:
+            Pos = batch.tokens.axes[-1]
+            next_tokens = hax.roll(batch.tokens, -1, Pos)
+            bytes_per_token = hax.vmap(byte_length_of_token, "tok_id")(next_tokens)
+            bytes_per_token = hax.named(bytes_per_token, next_tokens.axes)
+            masked_bytes_per_token = bytes_per_token * batch.loss_mask
+            total_bytes = hax.sum(masked_bytes_per_token)
 
-        @hax.named_jit
-        def accum_for_batch(m: LmHeadModel, state: _EvalRunningMeans, batch: LmExample, tags: hax.NamedArray):
-            m = inference_mode(m, True)
+            new_bpt_mean = running_means.bytes_per_token_running_mean.update(total_bytes, token_count)
+            new_running_means = dataclasses.replace(new_running_means, bytes_per_token_running_mean=new_bpt_mean)
 
-            if self.mp is not None:
-                m = self.mp.cast_to_compute(m)
+            tag_bytes = hax.sum(masked_bytes_per_token.broadcast_axis(Tag) * batch.tags, batch.tokens.axes)
+            new_tag_bpt_mean = running_means.tag_bytes_per_token_running_mean.update(tag_bytes, tag_token_count)
+            new_running_means = dataclasses.replace(
+                new_running_means, tag_bytes_per_token_running_mean=new_tag_bpt_mean
+            )
 
-            from contextlib import ExitStack
+        # per-token loss tracking
+        Pos = batch.tokens.axes[-1]
+        next_token_ids = hax.roll(batch.tokens, shift=-1, axis=Pos)
 
-            context = ExitStack()
+        one_hot_targets = hax.nn.one_hot(next_token_ids, Vocab, dtype=losses.dtype)
+        masked_one_hot = one_hot_targets * batch.loss_mask
+        # masked_losses is masked_loss reshaped to be compatible with masked_one_hot
 
-            with context:
-                if axis_mapping is not None:
-                    context.enter_context(hax.axis_mapping(axis_mapping))
-                losses = compute_next_token_loss(m, batch, reduction=None, reduction_axis=())
-                mask = batch.loss_mask  # [Batch, Pos]
-                this_tokens = hax.sum(mask)
-                this_loss = hax.einsum("->", losses, mask)  # to scalar
+        sum_axes = batch.tokens.axes
 
-                # all the *_per_tag variables are [Tag]
-                this_tokens_per_tag = hax.einsum("-> tag", mask, tags)
-                this_loss_per_tag = hax.einsum("-> tag", mask, losses, tags)  # [Tag]
+        masked_total_losses_per_vocab_id = hax.sum(
+            masked_one_hot * masked_loss.broadcast_axis(Vocab), sum_axes
+        )
+        masked_token_counts_per_vocab_id = hax.sum(masked_one_hot, sum_axes)
 
-                mean = state.token_avg_loss.add(this_loss / this_tokens, this_tokens)
-                state = dataclasses.replace(state, token_avg_loss=mean)
+        new_per_token_loss_mean = running_means.per_token_loss_running_mean.update(
+            masked_total_losses_per_vocab_id, masked_token_counts_per_vocab_id
+        )
+        new_running_means = dataclasses.replace(
+            new_running_means, per_token_loss_running_mean=new_per_token_loss_mean
+        )
 
-                if len(self.dataset.tag_to_index) > 0:
-                    # careful: this_tokens_per_tag can be 0 if there are no tokens for that tag
-                    safe_mean = hax.where(this_tokens_per_tag, this_loss_per_tag / this_tokens_per_tag, 0.0)
-                    mean_per_tag = state.loss_per_tag.add(safe_mean, this_tokens_per_tag)
-                    state = dataclasses.replace(state, loss_per_tag=mean_per_tag)
+        return losses, new_running_means
 
-                if self.bytes_per_token is not None:
-                    next_tokens = hax.roll(
-                        batch.tokens, -1, m.Pos.name
-                    )  # [Batch, Pos], rolled by 1 for next token task
-                    bytes_per_pos = self.bytes_per_token.take("vocab", next_tokens)  # [Batch, Pos]
-                    bytes_per_tag = hax.einsum("-> tag", mask, bytes_per_pos, tags)  # [Tag]
-                    this_bytes = hax.einsum("->", bytes_per_pos, mask)  # Scalar
+    def evaluate_model(model_to_eval, prefix: str, use_ema: bool) -> EvalResult:
+        model_to_eval = inference_mode(model_to_eval, True)
+        model_to_eval = eqx.tree_inference(model_to_eval, True)
 
-                    # log loss -> bits is log2(e) * loss
-                    bpb_per_tag = this_loss_per_tag / hax.maximum(bytes_per_tag, 1) * jnp.log2(jnp.e)
-                    bpb = this_loss / hax.maximum(this_bytes, 1) * jnp.log2(jnp.e)
+        # TODO: i think this is not ideal, should probably pass in the policy from the trainer
+        # but i'm not sure how to do that easily.
+        model_to_eval = mp.cast_to_compute(model_to_eval)
 
-                    bpb_mean = state.bpb.add(bpb, this_tokens)
-                    state = dataclasses.replace(state, bpb=bpb_mean)
-                    if len(self.dataset.tag_to_index) > 0:
-                        bpb_per_tag_mean = state.bpb_per_tag.add(bpb_per_tag, this_tokens_per_tag)
-                        state = dataclasses.replace(state, bpb_per_tag=bpb_per_tag_mean)
+        data_loader = DataLoader(dataset, EvalBatch.size)
 
-            return state
+        pbar = tqdm(total=len(dataset), desc="Evaluating", leave=False)
+        loading_time_tracker = LoadingTimeTrackerIterator(data_loader, pbar)
 
-        self.accum_for_batch = accum_for_batch
+        running_means = _EvalRunningMeans(
+            total_loss_running_mean=RunningMean(),
+            token_count_running_mean=RunningMean(),
+            bytes_per_token_running_mean=RunningMean(),
+            tag_total_loss_running_mean=RunningMean.zeros(Tag),
+            tag_token_count_running_mean=RunningMean.zeros(Tag),
+            tag_bytes_per_token_running_mean=RunningMean.zeros(Tag),
+            per_token_loss_running_mean=RunningMean.zeros(Vocab, dtype=jnp.float32),
+        )
 
-    def evaluate(self, m: LmHeadModel):
-        total_loss = jnp.zeros(())
-        mean_losses_per_tag = hax.zeros(self.dataset.Tag, dtype=np.float32)
+        for batch in loading_time_tracker:
+            my_batch, my_tags = batch
 
-        state = _EvalRunningMeans.zeros_like(total_loss, mean_losses_per_tag)
-        del total_loss, mean_losses_per_tag
-        state = hax.shard(state)
+            # my_tags is a list of arrays, one for each example.
+            # we want to stack them and add the batch axis
+            my_tags = hax.stack(EvalBatch, *my_tags)
+            batch = LmExample(my_batch, my_tags)
 
-        iterator = LoadingTimeTrackerIterator(self.loader)
-        n = 0
+            batch = hax.shard_with_axis_mapping(batch, axis_mapping)
 
-        for batch, tags in tqdm(iterator, "eval", total=len(self.loader)):
-            state = self.accum_for_batch(m, state, batch, tags)
-            n += 1
+            _, running_means = compute_and_accumulate_loss_step(model_to_eval, running_means, batch)
 
-        micro_avg_loss = state.token_avg_loss.mean.item()
-        tag_avg_loss = state.loss_per_tag.mean
+            pbar.update(EvalBatch.size)
 
-        # TODO: why do i have to jit this
-        macro_avg_loss = hax.named_jit(lambda x: hax.mean(x).array)(tag_avg_loss).item()
+        pbar.close()
 
-        if self.bytes_per_token is not None:
-            micro_bpb = state.bpb.mean.item()
-            tag_avg_bpb = state.bpb_per_tag.mean
-            macro_avg_bpb = hax.named_jit(lambda x: hax.mean(x).array)(tag_avg_bpb).item()
+        # ok now we have the running means, we can compute the final metrics
+        # we do this on the host
+        (micro_loss, total_tokens) = running_means.total_loss_running_mean.get()
+
+        (tag_losses, tag_tokens) = running_means.tag_total_loss_running_mean.get()
+
+        (micro_loss, total_tokens, tag_losses, tag_tokens) = jax.device_get(
+            (micro_loss, total_tokens, tag_losses, tag_tokens)
+        )
+
+        micro_loss = micro_loss.item() / total_tokens.item()
+
+        tag_losses = tag_losses / tag_tokens
+        tag_losses[np.isnan(tag_losses)] = 0.0
+
+        tag_loss_dict = {tag: tag_losses[i].item() for tag, i in dataset.tag_to_index.items()}
+
+        macro_loss = np.mean([loss for loss in tag_loss_dict.values() if loss > 0.0])
+
+        micro_bpb, macro_bpb, tag_macro_bpb, tag_micro_bpb = _compute_bpb(
+            running_means, dataset.tag_to_index, Tag, tokenizer is not None
+        )
+
+        tag_micro_losses, tag_macro_losses = _aggregate_tagged_losses(tag_loss_dict)
+
+        # Per-token loss calculations
+        per_token_loss_sum, per_token_loss_count = running_means.per_token_loss_running_mean.get()
+        per_token_loss_sum, per_token_loss_count = jax.device_get((per_token_loss_sum, per_token_loss_count))
+
+        per_token_loss_array = np.divide(
+            per_token_loss_sum.array,
+            per_token_loss_count.array,
+            where=(per_token_loss_count.array > 0),
+            out=np.zeros_like(per_token_loss_sum.array),
+        )
+
+        appeared_mask = per_token_loss_count.array > 0
+        if np.any(appeared_mask):
+            token_macro_loss = float(np.mean(per_token_loss_array[appeared_mask]))
         else:
-            micro_bpb = None
-            macro_avg_bpb = None
+            token_macro_loss = 0.0
 
-        tag_macro_loss: dict[str, float] = {}
-        tag_micro_loss: dict[str, float] = {}
-        tag_macro_bpb: dict[str, float] = {}
-        tag_micro_bpb: dict[str, float] = {}
-
-        mean_loss_per_tag_cpu = np.array(state.loss_per_tag.mean.array)
-        total_tokens_per_tag_cpu = np.array(state.loss_per_tag.mean.array)
-
-        mean_bits_per_tag_cpu = np.array(state.bpb_per_tag.mean.array)
-        total_bytes_per_tag_cpu = np.array(state.bpb_per_tag.mean.array)
-
-        # add in the hierarchy
-        for parent, children in self.hierarchy.items():
-            mask = np.zeros(self.dataset.Tag.size, dtype=bool)
-            mask[children] = 1
-            assert total_tokens_per_tag_cpu.shape == mask.shape
-
-            # don't consider tags with no tokens in macro average
-            mask = mask & (total_tokens_per_tag_cpu > 0)
-
-            # macro is the average of the averages
-            tag_macro_loss[parent] = np.mean(mean_loss_per_tag_cpu, where=mask)
-            # micro is the total loss for the parent tag
-            # (average doesn't support where directly so we just 0 out the weights)
-            tag_micro_loss[parent] = np.average(mean_loss_per_tag_cpu, weights=total_tokens_per_tag_cpu * mask)
-
-            if self.bytes_per_token is not None:
-                tag_macro_bpb[parent] = np.mean(mean_bits_per_tag_cpu, where=mask)
-                tag_micro_bpb[parent] = np.average(mean_bits_per_tag_cpu, weights=total_bytes_per_tag_cpu * mask)
-
-        for tag, index in self.dataset.tag_to_index.items():
-            tag_micro_loss[tag] = float(mean_loss_per_tag_cpu[index])
-            # no macro loss for the leaf tags
-
-            if self.bytes_per_token is not None:
-                tag_micro_bpb[tag] = float(mean_bits_per_tag_cpu[index])
+        per_token_loss_named = hax.named(per_token_loss_array, Vocab)
 
         return EvalResult(
-            micro_avg_loss,
-            macro_avg_loss,
-            tag_macro_loss,
-            tag_micro_loss,
-            iterator.total_time,
-            micro_bpb,
-            macro_avg_bpb,
-            tag_macro_bpb,
-            tag_micro_bpb,
+            micro_avg_loss=micro_loss,
+            macro_avg_loss=macro_loss,
+            tag_macro_losses=tag_macro_losses,
+            tag_micro_losses=tag_micro_losses,
+            total_eval_loading_time=loading_time_tracker.total_time,
+            micro_bpb=micro_bpb,
+            macro_bpb=macro_bpb,
+            tag_macro_bpb=tag_macro_bpb,
+            tag_micro_bpb=tag_micro_bpb,
+            per_token_loss=per_token_loss_named,
+            token_macro_loss=token_macro_loss,
         )
 
-    def _calculate_bytes_per_token_type(self, tokenizer: HfTokenizer) -> Optional[hax.NamedArray]:
-        if tokenizer is None:
-            return None
-        else:
-            # calculate the number of bytes in each token
-            Vocab = hax.Axis("vocab", len(tokenizer.get_vocab()))
-            bytes = np.ndarray((Vocab.size,), dtype=np.int32)
+    def log_eval_result(result: EvalResult):
+        log_dict = _construct_log_dict(result, prefix, use_ema=False)
+        levanter.tracker.log_metrics(log_dict)
 
-            for i in range(Vocab.size):
-                bytes[i] = byte_length_of_token(tokenizer, i)
-
-            return hax.named(jnp.array(bytes), Vocab)
+    return callback
 
 
-class _EvalRunningMeans(eqx.Module):
-    token_avg_loss: RunningMean  # average loss averaged over all tokens
-    loss_per_tag: RunningMean  # average loss per tag
-    bpb: RunningMean  # bits per byte averaged over all tokens
-    bpb_per_tag: RunningMean  # bits per byte per tag
+def _join_prefix(prefix: str, tag: str) -> str:
+    if prefix:
+        return f"{prefix}/{tag}"
+    return tag
 
-    @staticmethod
-    def zeros_like(total: Arrayish, per_tag: Arrayish) -> "_EvalRunningMeans":
-        z = RunningMean.zeros_like(total)
-        per_tag = RunningMean.zeros_like(per_tag)
-        return _EvalRunningMeans(z, per_tag, z, per_tag)
+
+def _compute_bpb(
+    running_means: _EvalRunningMeans,
+    tag_to_index: Mapping[str, int],
+    Tag: Axis,
+    has_tokenizer: bool,
+) -> tuple[Optional[float], Optional[float], Optional[dict[str, float]], Optional[dict[str, float]]]:
+    if not has_tokenizer:
+        return None, None, None, None
+
+    (total_bytes, total_tokens) = running_means.bytes_per_token_running_mean.get()
+    (tag_bytes, tag_tokens) = running_means.tag_bytes_per_token_running_mean.get()
+
+    (total_bytes, total_tokens, tag_bytes, tag_tokens) = jax.device_get(
+        (total_bytes, total_tokens, tag_bytes, tag_tokens)
+    )
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        micro_bpb = (total_bytes / total_tokens).item() / np.log(2)
+
+        tag_bpb = (tag_bytes / tag_tokens) / np.log(2)
+        tag_bpb[np.isnan(tag_bpb)] = 0.0
+
+        tag_bpb_dict = {tag: tag_bpb[i].item() for tag, i in tag_to_index.items()}
+
+        tag_micro_bpb, tag_macro_bpb = _aggregate_tagged_losses(tag_bpb_dict)
+
+        macro_bpb = np.mean([b for b in tag_bpb_dict.values() if b > 0.0])
+
+    return micro_bpb, macro_bpb, tag_macro_bpb, tag_micro_bpb
+
+
+def _aggregate_tagged_losses(tag_losses: dict[str, float]) -> tuple[dict[str, float], dict[str, float]]:
+    """Aggregate losses by tag hierarchy."""
+    tag_micro_losses = defaultdict(float)
+    tag_macro_losses = defaultdict(list)
+
+    for tag, loss in tag_losses.items():
+        parts = tag.split("/")
+        for i in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:i])
+            tag_micro_losses[prefix] += loss
+            tag_macro_losses[prefix].append(loss)
+
+    # now average the macro losses
+    tag_macro_losses_avg = {tag: np.mean(losses) for tag, losses in tag_macro_losses.items()}
+
+    return dict(tag_micro_losses), tag_macro_losses_avg
+
+
+def _construct_log_dict(result: EvalResult, prefix: str, use_ema: bool) -> dict[str, Arrayish]:
+    log_dict = {}
+    if use_ema:
+        prefix = f"ema/{prefix}"
+
+    log_dict[_join_prefix(prefix, "loss")] = result.micro_avg_loss
+    if result.micro_bpb is not None:
+        log_dict[_join_prefix(prefix, "bpb")] = result.micro_bpb
+
+    log_dict[_join_prefix(prefix, "macro_loss")] = result.macro_avg_loss
+    if result.macro_bpb is not None:
+        log_dict[_join_prefix(prefix, "macro_bpb")] = result.macro_bpb
+
+    if result.token_macro_loss is not None:
+        log_dict[_join_prefix(prefix, "token_macro_loss")] = result.token_macro_loss
+
+    for tag, loss in result.tag_macro_losses.items():
+        log_dict[_join_prefix(f"{prefix}/macro_loss", tag)] = loss
+        if result.tag_macro_bpb is not None and tag in result.tag_macro_bpb:
+            log_dict[_join_prefix(f"{prefix}/macro_bpb", tag)] = result.tag_macro_bpb[tag]
+
+    for tag, loss in result.tag_micro_losses.items():
+        log_dict[_join_prefix(f"{prefix}/micro_loss", tag)] = loss
+        if result.tag_micro_bpb is not None and tag in result.tag_micro_bpb:
+            log_dict[_join_prefix(f"{prefix}/micro_bpb", tag)] = result.tag_micro_bpb[tag]
+
+    return log_dict
