@@ -752,13 +752,22 @@ class LevanterHarnessLM(TemplateLM):
                 max_stop_seqs = max(max_stop_seqs, num_stop_seqs)
                 max_stop_tokens = max(max_stop_tokens, num_stop_tokens)
 
+        # Calculate max_seqs_in_prefill to handle all requests in one batch
+        # num_primary in _prefill_prompts counts requests, not sequences, so we need
+        # at least len(requests) capacity. Cap at max_seqs (256) which is the maximum
+        # concurrent sequences supported by the engine.
+        num_requests = len(prompt_token_lists)
+        max_seqs = 256  # Maximum concurrent sequences supported
+        max_seqs_in_prefill = min(num_requests, max_seqs)
+
         # [ChiHeem,2025-10-06] TODO: Pass this from marin to allow users to
         # optimize the inference based on hardware and model.
         engine_cfg = InferenceEngineConfig(
             max_stop_seqs=max_stop_seqs,
             max_stop_tokens=max_stop_tokens,
             max_seq_len=max_length,
-            max_seqs=256,
+            max_seqs=max_seqs,
+            max_seqs_in_prefill=max_seqs_in_prefill,
             page_size=8,
             compute_dtype=jnp.bfloat16,
         )
