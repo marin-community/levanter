@@ -7,6 +7,7 @@ from haliax import Axis, NamedArray
 from haliax.nn import hax
 import jax
 import jax.numpy as jnp
+from jaxtyping import PRNGKeyArray
 import numpy as np
 import pytest
 
@@ -153,48 +154,51 @@ def test_noise_span_to_unique_sentinel():
     )
     noise_mask = jnp.pad(noise_mask, (0, padded_length - 10), constant_values=False)
 
-    result = noise_span_to_unique_sentinel(tokens, noise_mask, sentinel_tokens, 10)
+    result = noise_span_to_unique_sentinel(tokens, noise_mask, sentinel_tokens, 10, force_initial_sentinel=False)
 
     expected = jnp.array([100, 13, 14, 15, 16, 17, 18, 19])
     np.testing.assert_array_equal(result[:8], expected)
     assert jnp.all(result[8:] == pad_token_id)
 
-    # Test case 2: First token is NOT a noise span (multiple noise spans)
+    # Test case 2: First token is NOT a noise span
+    # force_initial_sentinel=True (for use w/ targets, which must always start
+    # with a sentinel even if the noise mask is 010)
     tokens = jnp.arange(10, 25)  # [10, 11, 12, ..., 24]
     tokens = jnp.pad(tokens, (0, padded_length - 15), constant_values=pad_token_id)
     noise_mask = jnp.array(
         [
-            False,
+            False,  # Does not start with noise span
             True,
             True,
             False,
-            False,  # Span 1: [11, 12]
+            False,
             False,
             True,
             False,
             False,
-            False,  # Span 2: [16]
+            False,
             True,
             True,
             True,
             False,
-            False,  # Span 3: [20, 21, 22]
+            False,
         ]
     )
     noise_mask = jnp.pad(noise_mask, (0, padded_length - 15), constant_values=False)
 
-    result = noise_span_to_unique_sentinel(tokens, noise_mask, sentinel_tokens, 15)
+    result = noise_span_to_unique_sentinel(tokens, noise_mask, sentinel_tokens, 15, force_initial_sentinel=True)
 
-    expected = jnp.array([10, 100, 13, 14, 15, 101, 17, 18, 19, 102, 23, 24])
-    np.testing.assert_array_equal(result[:12], expected)
-    assert jnp.all(result[12:] == pad_token_id)
+    # Should still start with sentinel
+    expected = jnp.array([100, 10, 101, 13, 14, 15, 102, 17, 18, 19, 103, 23, 24])
+    np.testing.assert_array_equal(result[:13], expected)
+    assert jnp.all(result[13:] == pad_token_id)
 
     # Test case 3: Empty noise mask (no noise)
     tokens = jnp.arange(10, 20)
     tokens = jnp.pad(tokens, (0, padded_length - 10), constant_values=pad_token_id)
     noise_mask = jnp.zeros(padded_length, dtype=jnp.bool_)
 
-    result = noise_span_to_unique_sentinel(tokens, noise_mask, sentinel_tokens, 10)
+    result = noise_span_to_unique_sentinel(tokens, noise_mask, sentinel_tokens, 10, force_initial_sentinel=False)
 
     # Should be unchanged except for padding
     np.testing.assert_array_equal(result[:10], jnp.arange(10, 20))

@@ -95,8 +95,8 @@ class DenoisingConfig(draccus.ChoiceRegistry):
 @DenoisingConfig.register_subclass("rx")
 @dataclass(frozen=True)
 class RXDenoisingConfig(DenoisingConfig):
-    mask_prob: float # r in the paper
-    mean_span_length: float # mu in the paper
+    mask_prob: float  # r in the paper
+    mean_span_length: float  # mu in the paper
     random_roll: bool
 
     def to_task_params(self) -> jnp.ndarray:
@@ -286,72 +286,13 @@ def random_spans_noise_mask(
     return mask
 
 
-@jax.jit
-def noise_span_to_unique_sentinel_all_nonnoise(
-    tokens: jnp.ndarray, noise_mask: jnp.ndarray, sentinel_tokens: jnp.ndarray, length: int
-) -> jnp.ndarray:
-    # If the input noise mask is e.g. 10, we end up with a target noise mask of
-    # 01. The input will be <mask1> bar and length will truncate the target
-    # noise mask to just 0. But we want to output <mask1> foo, not foo.
-    return jnp.concatenate([sentinel_tokens[0:1], tokens[:-1]])
-
-
-@jax.jit
-def noise_span_to_unique_sentinel_some_noise(
-    tokens: jnp.ndarray, noise_mask: jnp.ndarray, sentinel_tokens: jnp.ndarray, length: int
-) -> jnp.ndarray:
-    # Identify first noise tokens in each span
-    prev_token_is_noise = jnp.roll(noise_mask, 1)
-    prev_token_is_noise = prev_token_is_noise.at[0].set(False)
-    first_noise_tokens = noise_mask & ~prev_token_is_noise
-    subsequent_noise_tokens = noise_mask & prev_token_is_noise
-
-    # Assign segment IDs to each noise span (subtract 1 to make it 0-indexed)
-    segments = jnp.cumsum(first_noise_tokens.astype(jnp.int32)) - 1
-    # max_segments = jnp.max(segments) + 1  # Number of unique noise spans
-
-    # If max_segments > len(sentinel_tokens) we will reuse sentinel tokens which
-    # isn't good. Ideally we'd log a warning but we can't do that inside of
-    # jax.jit.
-    # TODO Warn in the non-JIT wrapper?
-    # checkify.checkify(
-    #     lambda: checkify.check(
-    #         max_segments <= len(sentinel_tokens),
-    #         f"Too many noise spans: {max_segments} > {len(sentinel_tokens)}",
-    #     ),
-    #     errors=checkify.index_checks,
-    # )()
-
-    def loop_body(read_pos, state):
-        out, write_pos = state
-        # Advance the read position from left to right in `tokens`.
-        # When we see the first noise token for a span, write the sentinel for
-        # the span.
-        # When we see a subsequent noise token, advance the read position
-        # without writing anything.
-        # Otherwise just copy from `tokens`.
-        sentinel_id = sentinel_tokens[segments[read_pos] % len(sentinel_tokens)]
-        token_to_write = jax.lax.select(first_noise_tokens[read_pos], sentinel_id, tokens[read_pos])
-        out, write_pos = jax.lax.cond(
-            subsequent_noise_tokens[read_pos],
-            lambda: (out, write_pos),
-            lambda: (out.at[write_pos].set(token_to_write), write_pos + 1),
-        )
-
-        return out, write_pos
-
-    result = jnp.zeros_like(tokens)
-    result, _ = jax.lax.fori_loop(0, length, loop_body, (result, 0))
-
-    return result
-
-
-@jax.jit
+@functools.partial(jax.jit, static_argnames=["force_initial_sentinel"])
 def noise_span_to_unique_sentinel(
     tokens: jnp.ndarray,
     noise_mask: jnp.ndarray,
     sentinel_tokens: jnp.ndarray,
     length: int,
+    force_initial_sentinel: bool,
 ) -> jnp.ndarray:
     """
     Replace each run of consecutive noise tokens with a different sentinel.
@@ -371,13 +312,55 @@ def noise_span_to_unique_sentinel(
         A tensor with the same shape and dtype as `tokens`.
     """
 
-    indices = jnp.arange(tokens.shape[0])
-    is_all_nonnoise = ~jnp.any(jnp.where(indices < length, noise_mask, False))
-    return jax.lax.cond(
-        is_all_nonnoise,
-        lambda: noise_span_to_unique_sentinel_all_nonnoise(tokens, noise_mask, sentinel_tokens, length),
-        lambda: noise_span_to_unique_sentinel_some_noise(tokens, noise_mask, sentinel_tokens, length),
-    )
+    # Identify first noise tokens in each span
+    prev_token_is_noise = jnp.roll(noise_mask, 1)
+    prev_token_is_noise = prev_token_is_noise.at[0].set(False)
+    first_noise_tokens = noise_mask & ~prev_token_is_noise
+    subsequent_noise_tokens = noise_mask & prev_token_is_noise
+
+    # max_segments = jnp.max(segments) + 1  # Number of unique noise spans
+
+    # If max_segments > len(sentinel_tokens) we will reuse sentinel tokens which
+    # isn't good. Ideally we'd log a warning but we can't do that inside of
+    # jax.jit.
+    # TODO Warn in the non-JIT wrapper?
+    # checkify.checkify(
+    #     lambda: checkify.check(
+    #         max_segments <= len(sentinel_tokens),
+    #         f"Too many noise spans: {max_segments} > {len(sentinel_tokens)}",
+    #     ),
+    #     errors=checkify.index_checks,
+    # )()
+
+    def loop_body(read_pos, state):
+        out, write_pos, sentinel_count = state
+        # Advance the read position from left to right in `tokens`.
+        # When we see the first noise token for a span, write the sentinel for
+        # the span.
+        # When we see a subsequent noise token, advance the read position
+        # without writing anything.
+        # Otherwise just copy from `tokens`.
+        sentinel_id = sentinel_tokens[sentinel_count % len(sentinel_tokens)]
+        is_first_noise_token = first_noise_tokens[read_pos]
+        is_subsequent_noise_token = subsequent_noise_tokens[read_pos]
+
+        should_write_sentinel = jax.lax.select(read_pos == -1, force_initial_sentinel, is_first_noise_token)
+        should_write = jax.lax.select(read_pos == -1, should_write_sentinel, ~is_subsequent_noise_token)
+        token_to_write = jax.lax.select(should_write_sentinel, sentinel_id, tokens[read_pos])
+        sentinel_count = jax.lax.select(should_write_sentinel, sentinel_count + 1, sentinel_count)
+
+        out, write_pos = jax.lax.cond(
+            ~should_write,
+            lambda: (out, write_pos),
+            lambda: (out.at[write_pos].set(token_to_write), write_pos + 1),
+        )
+
+        return out, write_pos, sentinel_count
+
+    result = jnp.zeros_like(tokens)
+    result, _, _ = jax.lax.fori_loop(-1, length, loop_body, (result, 0, 0))
+
+    return result
 
 
 @jax.jit
@@ -429,12 +412,14 @@ def to_ul2r_rx_tokens(
         noise_mask,
         sentinel_token_ids,
         length,
+        force_initial_sentinel=False,
     )
     targets = noise_span_to_unique_sentinel(
         tokens,
         ~noise_mask,
         sentinel_token_ids,
         target_in_len,
+        force_initial_sentinel=True,
     )
 
     indices = jnp.arange(padded_length)
