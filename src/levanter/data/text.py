@@ -74,7 +74,7 @@ from levanter.data.sharded_datasource import (  # noqa
     UrlDataSource,
     WrappedHFDataSource,
 )
-from levanter.data.ul2r import DenoisingConfig, Ul2rDataset  # noqa
+from levanter.data.ul2r import SENTINEL_TOKEN_IDS, DenoisingConfig, Ul2rDataset  # noqa
 from levanter.shapes import NamedShapeSpec, ShapeSpec  # noqa
 from levanter.store.cache import build_or_load_cache  # noqa
 from levanter.utils.jax_utils import key_iterator, use_cpu_device  # noqa
@@ -444,7 +444,9 @@ class SupervisedLmDatasetFormat(LmDatasetFormatBase):
 class Ul2rDatasetFormat(TextLmDatasetFormat):
     task_configs: Dict[str, DenoisingConfig] = field(default_factory=dict)
     task_probs: Dict[str, float] = field(default_factory=dict)
-    rng_seed: int = 37
+    rng_seed: int = 0
+    sentinel_token_id_start: int = 0
+    sentinel_token_id_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -638,7 +640,7 @@ def dataset_for_format(
     ignore_index: int | None,
 ) -> AsyncDataset[LmExample]:
     match format:
-        case Ul2rDatasetFormat(task_configs=task_configs, task_probs=task_probs, rng_seed=rng_seed):
+        case Ul2rDatasetFormat(task_configs=task_configs, task_probs=task_probs, rng_seed=rng_seed, sentinel_token_id_start=sentinel_token_id_start, sentinel_token_id_count=sentinel_token_id_count):
             key = jax.random.PRNGKey(rng_seed)
             # TODO Get actual pad_token_id. Currently we only use this in ul2r_loss_mask.
             pad_token_id = 0
@@ -647,7 +649,8 @@ def dataset_for_format(
             # TODO Figure out whether to pass this in. Needs a lot of piping thru train_set etc.
             # Seems weird that only UL2R needs it.
             KPos = Pos.alias("key_position")
-            return Ul2rDataset(cache, Pos, KPos, task_configs, task_probs, key, pad_token_id, max_segments_per_example, slice_strategy)
+            sentinel_token_ids = jnp.arange(sentinel_token_id_start, sentinel_token_id_start + sentinel_token_id_count, dtype=jnp.int32)
+            return Ul2rDataset(cache, Pos, KPos, task_configs, task_probs, key, pad_token_id, sentinel_token_ids, max_segments_per_example, slice_strategy)
         case TextLmDatasetFormat():
             return CausalLmDataset(TokenSeqDataset(cache, Pos.size), Pos, eos_id=eos_id, ignore_index=ignore_index)
         case ChatLmDatasetFormat(single_turn=single_turn, pack=pack, mask_user_turns=mask_user_turns):

@@ -43,46 +43,44 @@ MIN_S_LENGTH = 3
 
 @dataclass(frozen=True)
 class DenoisingConfig(draccus.ChoiceRegistry):
-    task_token: Optional[str] = None
+    task_kind: int
+    task_token_id: int
 
-    def with_task_token(self, task_token: Optional[str]) -> "DenoisingConfig":
-        return dataclasses.replace(self, task_token=task_token)
+    def with_task_token_id(self, task_token_id: int) -> "DenoisingConfig":
+        return dataclasses.replace(self, task_token_id=task_token_id)
 
     @staticmethod
     def ul2_configs(
-        r_task_token: str = R_TASK_TOKEN,
-        x_task_token: str = X_TASK_TOKEN,
-        s_task_token: str = S_TASK_TOKEN,
+        r_task_token_id: int = R_TASK_TOKEN_ID,
+        x_task_token_id: int = X_TASK_TOKEN_ID,
+        s_task_token_id: int = S_TASK_TOKEN_ID,
     ) -> typing.Dict[str, "DenoisingConfig"]:
         # Table 1 https://arxiv.org/pdf/2205.05131
         return {
-            "r1": RDenoisingConfig(r_task_token, 0.15, 3.0),
-            "r2": RDenoisingConfig(r_task_token, 0.15, 8.0),
-            "x1": XDenoisingConfig(x_task_token, 0.5, 3.0),
-            "x2": XDenoisingConfig(x_task_token, 0.5, 8.0),
-            "x3": XDenoisingConfig(x_task_token, 0.15, 64.0),
-            "x4": XDenoisingConfig(x_task_token, 0.5, 64.0),
-            "s": SDenoisingConfig(s_task_token),
+            "r1": RXDenoisingConfig(RX_TASK_KIND, r_task_token_id, 0.15, 3.0, False),
+            "r2": RXDenoisingConfig(RX_TASK_KIND, r_task_token_id, 0.15, 8.0, False),
+            "x1": RXDenoisingConfig(RX_TASK_KIND, x_task_token_id, 0.5, 3.0, False),
+            "x2": RXDenoisingConfig(RX_TASK_KIND, x_task_token_id, 0.5, 8.0, False),
+            "x3": RXDenoisingConfig(RX_TASK_KIND, x_task_token_id, 0.15, 64.0, False),
+            "x4": RXDenoisingConfig(RX_TASK_KIND, x_task_token_id, 0.5, 64.0, False),
+            "s": SDenoisingConfig(S_TASK_KIND, s_task_token_id),
         }
 
     @staticmethod
     def ul2r_configs(
-        r_task_token: Optional[str] = R_TASK_TOKEN,
-        x_task_token: Optional[str] = X_TASK_TOKEN,
-        s_task_token: str = S_TASK_TOKEN,
+        r_task_token_id: int = R_TASK_TOKEN_ID,
+        x_task_token_id: int = X_TASK_TOKEN_ID,
+        s_task_token_id: int = S_TASK_TOKEN_ID,
     ) -> Dict[str, "DenoisingConfig"]:
         # Section 3.3 Loss Objectives https://arxiv.org/pdf/2210.11399v2
         return {
-            "r": RDenoisingConfig(r_task_token, 0.15, 3.0, True),
-            "x1": XDenoisingConfig(x_task_token, 0.15, 32.0, True),
-            "x2": XDenoisingConfig(x_task_token, 0.5, 3.0, True),
-            "s": SDenoisingConfig(s_task_token),
+            "r": RXDenoisingConfig(RX_TASK_KIND, r_task_token_id, 0.15, 3.0, False),
+            "x1": RXDenoisingConfig(RX_TASK_KIND, x_task_token_id, 0.15, 32.0, False),
+            "x2": RXDenoisingConfig(RX_TASK_KIND, x_task_token_id, 0.5, 3.0, False),
+            "s": SDenoisingConfig(S_TASK_KIND, s_task_token_id),
         }
 
     def to_task_params(self) -> jnp.ndarray:
-        raise NotImplementedError
-
-    def task_token_id(self) -> int:
         raise NotImplementedError
 
     @staticmethod
@@ -94,17 +92,17 @@ class DenoisingConfig(draccus.ChoiceRegistry):
         return task_params[1]
 
 
+@DenoisingConfig.register_subclass("rx")
 @dataclass(frozen=True)
-class MaskDenoisingConfig(DenoisingConfig):
-    task_kind = RX_TASK_KIND
-    mask_prob: float = 0.15  # r in the paper
-    mean_span_length: float = 3.0  # mu in the paper
-    random_roll: bool = False
+class RXDenoisingConfig(DenoisingConfig):
+    mask_prob: float # r in the paper
+    mean_span_length: float # mu in the paper
+    random_roll: bool
 
     def to_task_params(self) -> jnp.ndarray:
         args = [
             self.task_kind,
-            self.task_token_id(),
+            self.task_token_id,
             self.mask_prob,
             self.mean_span_length,
         ]
@@ -119,38 +117,14 @@ class MaskDenoisingConfig(DenoisingConfig):
         return task_params[3]
 
 
-@DenoisingConfig.register_subclass("x")
-@dataclass(frozen=True)
-class XDenoisingConfig(MaskDenoisingConfig):
-    task_token: Optional[str] = X_TASK_TOKEN
-    mask_prob: float = 0.5
-    mean_span_length: float = 3.0
-
-    # TODO This needs to integrate with the actual tokenizer.
-    def task_token_id(self) -> int:
-        return X_TASK_TOKEN_ID
-
-
-@DenoisingConfig.register_subclass("r")
-@dataclass(frozen=True)
-class RDenoisingConfig(MaskDenoisingConfig):
-    task_token: Optional[str] = R_TASK_TOKEN
-    mask_prob: float = 0.15
-    mean_span_length: float = 3.0
-
-    def task_token_id(self) -> int:
-        return R_TASK_TOKEN_ID
-
-
 @DenoisingConfig.register_subclass("s")
 @dataclass(frozen=True)
 class SDenoisingConfig(DenoisingConfig):
-    task_kind = S_TASK_KIND
-    task_token: Optional[str] = S_TASK_TOKEN
+    task_kind: int
 
     def to_task_params(self) -> jnp.ndarray:
-        # should match size of RDenoisingConfig / XDenoisingConfig
-        return jnp.array([self.task_kind, S_TASK_TOKEN_ID, 0, 0])
+        # should match size of RXDenoisingConfig
+        return jnp.array([self.task_kind, self.task_token_id, 0, 0])
 
 
 @functools.partial(jax.jit, static_argnames=["padded_length"])
@@ -497,6 +471,7 @@ def to_ul2r_s_tokens(
     key: PRNGKeyArray,
     tokens: jnp.ndarray,
     length: int,
+    sentinel_token_id: int,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Create a S-denoising example from the first `length` elements of `tokens`.
@@ -544,7 +519,7 @@ def to_ul2r_s_tokens(
     targets = jnp.roll(tokens, 1)
     indices = jnp.arange(n_tokens)
     result = jnp.where(indices < pivot, tokens, targets)
-    result = result.at[pivot].set(SENTINEL_TOKEN_IDS[0])
+    result = result.at[pivot].set(sentinel_token_id)
     return pivot, result
 
 
@@ -554,6 +529,7 @@ def to_ul2r_tokens(
     task_params: jnp.ndarray,
     tokens: jnp.ndarray,
     length: int,
+    sentinel_token_ids: jnp.ndarray,
     # TODO maybe we don't actually need the truncation logic in
     # to_ul2r_rx_tokens given that we truncate while packing
     # See slice_strategy.
@@ -578,8 +554,8 @@ def to_ul2r_tokens(
     task_token_id = DenoisingConfig.task_token_id_from_task_params(task_params)
 
     def rx_tokens():
-        noise_density = MaskDenoisingConfig.mask_prob_from_task_params(task_params)
-        mean_noise_span_length = MaskDenoisingConfig.mean_span_length_from_task_params(task_params)
+        noise_density = RXDenoisingConfig.mask_prob_from_task_params(task_params)
+        mean_noise_span_length = RXDenoisingConfig.mean_span_length_from_task_params(task_params)
         # TODO allow configuring random_roll
         inputs_len, out = to_ul2r_rx_tokens(
             key,
@@ -587,16 +563,16 @@ def to_ul2r_tokens(
             length,
             noise_density,
             mean_noise_span_length,
-            random_roll=True,
-            sentinel_token_ids=SENTINEL_TOKEN_IDS,
-            max_length=max_length - 1,
+            True,
+            sentinel_token_ids,
+            max_length - 1,
         )
         # Add 1 to inputs_len for the task token.
         return inputs_len + 1, jnp.concatenate([jnp.array([task_token_id], dtype=jnp.int32), out])
 
     def s_tokens():
         # TODO Do we ensure that the prefix/continuation isn't just <{begin,end}_of_text>?
-        inputs_len, out = to_ul2r_s_tokens(key, tokens[:-1], length)
+        inputs_len, out = to_ul2r_s_tokens(key, tokens[:-1], length, sentinel_token_ids[0])
         return inputs_len + 1, jnp.concatenate([jnp.array([task_token_id], dtype=jnp.int32), out])
 
     def too_short():
@@ -659,8 +635,8 @@ def compute_denoising_length(
     length: jnp.ndarray,
 ) -> jnp.ndarray:
     def rx_length() -> jnp.ndarray:
-        noise_density = MaskDenoisingConfig.mask_prob_from_task_params(task_params)
-        mean_noise_span_length = MaskDenoisingConfig.mean_span_length_from_task_params(task_params)
+        noise_density = RXDenoisingConfig.mask_prob_from_task_params(task_params)
+        mean_noise_span_length = RXDenoisingConfig.mean_span_length_from_task_params(task_params)
         _num_noise_tokens, num_noise_spans, _num_nonnoise_tokens = num_noise_spans_tokens_and_spans(
             length, noise_density, mean_noise_span_length
         )
@@ -678,16 +654,17 @@ def compute_denoising_length(
 @functools.partial(jax.jit, static_argnames=("max_segments_per_example", "QPos", "KPos"))
 def create_ul2r_example(
     key: PRNGKeyArray,
-    task_params: jnp.ndarray,
-    task_indices: jnp.ndarray,
-    max_segments_per_example: int,
     QPos: Axis,
     KPos: Axis,
     pad_token_id: int,
+    sentinel_token_ids: jnp.ndarray,
+    max_segments_per_example: int,
+    task_params: jnp.ndarray,
+    task_indices: jnp.ndarray,
     tokens: hax.NamedArray,
     segment_ids: hax.NamedArray,
 ) -> LmExample:
-    jax.debug.print("create_ul2r_example start")
+    # jax.debug.print("create_ul2r_example start")
 
     # TODO Use NamedArrays more idiomatically
     # `unique_seg_ids = [3, 4, ..., -1, ...]`
@@ -751,7 +728,9 @@ def create_ul2r_example(
         out_start = typing.cast(int, jnp.squeeze(out_starts[idx]))
 
         segment = jnp.roll(tokens.array, -in_start)
-        inputs_len, denoising_tokens = to_ul2r_tokens(key, task_params[task_idx], segment, in_length, QPos.size)
+        inputs_len, denoising_tokens = to_ul2r_tokens(
+            key, task_params[task_idx], segment, in_length, sentinel_token_ids, QPos.size
+        )
 
         n_tokens = tokens.array.shape[0]
         input_mask = jnp.arange(n_tokens) < inputs_len
@@ -786,11 +765,11 @@ def create_ul2r_example(
     out_seg_ids = jnp.full(tokens.array.shape, -1)
     acc = (key, 0, input_mask, denoising_tokens, out_seg_ids)
 
-    jax.debug.print("create_ul2r_example loop")
+    # jax.debug.print("create_ul2r_example loop")
 
     (_, _, input_mask, denoising_tokens, out_seg_ids) = jax.lax.while_loop(should_loop, loop, acc)
 
-    jax.debug.print("create_ul2r_example loss_mask")
+    # jax.debug.print("create_ul2r_example loss_mask")
     # TODO GreedyPrepackedDataset pads w/ zeros so can we end up with two
     # padding token IDs?
     loss_mask = ul2r_loss_mask(input_mask, out_seg_ids, denoising_tokens, pad_token_id)
@@ -823,6 +802,7 @@ class Ul2rDataset(MappedAsyncDataset[tuple[TokenizedDict, TokenizedDict], LmExam
         task_probs: Dict[str, float],
         key: PRNGKeyArray,
         pad_token_id: int,
+        sentinel_token_ids: jnp.ndarray,
         max_segments_per_example: int = 64,
         slice_strategy: Literal["left", "right", "raise"] = "left",
     ):
@@ -889,12 +869,13 @@ class Ul2rDataset(MappedAsyncDataset[tuple[TokenizedDict, TokenizedDict], LmExam
             segment_ids = hax.named(seg_ids["input_ids"], self.QPos)
             return create_ul2r_example(
                 key,
-                task_params,
-                task_indices,
-                max_segments_per_example,
                 self.QPos,
                 self.KPos,
                 self.pad_token_id,
+                sentinel_token_ids,
+                max_segments_per_example,
+                task_params,
+                task_indices,
                 tokens,
                 segment_ids,
             )

@@ -33,29 +33,32 @@ data:
     text_key: text
     task_configs:
       r:
-        type: r
+        type: rx
         mask_prob: 0.15
         mean_span_length: 3.0
         random_roll: true
-        task_token: "<|reserved_special_token_3|>"
+        task_token_id: 50155 # GPT2 vocab_size = 50257 - 100 - 2
       x1:
-        type: x # TODO just type: rx?
+        type: rx
         mask_prob: 0.15
         mean_span_length: 32.0
         random_roll: true
-        task_token: "<|reserved_special_token_4|>"
+        task_token_id: 50155
       x2:
-        type: x
+        type: rx
         mask_prob: 0.5
         mean_span_length: 3.0
         random_roll: true
-        task_token: "<|reserved_special_token_4|>"
+        task_token_id: 50155
       s:
         type: s
-        task_token: "<|reserved_special_token_5|>"
+        task_token_id: 50156 # GPT2 vocab_size = 50257 - 100 - 1
     task_probs:
       r: 0.5
       x1: 0.125
       x2: 0.125
       s: 0.25
     rng_seed: 42
+    # GPT2 vocab_size = 50257
+    sentinel_token_id_start: 50157
+    sentinel_token_id_count: 100

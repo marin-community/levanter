@@ -17,6 +17,8 @@ from levanter.data.text import (
     preprocessor_for_format,
 )
 from levanter.data.ul2r import (
+    RX_TASK_KIND,
+    S_TASK_KIND,
     TokenizedDict,
     compute_denoising_length,
     noise_span_to_unique_sentinel,
@@ -29,8 +31,7 @@ from levanter.data.ul2r import (
     to_ul2r_s_tokens,
     SENTINEL_TOKEN_IDS,
     create_ul2r_example,
-    RDenoisingConfig,
-    XDenoisingConfig,
+    RXDenoisingConfig,
     SDenoisingConfig,
     Ul2rDataset,
     R_TASK_TOKEN_ID,
@@ -424,7 +425,7 @@ def test_to_ul2r_s_tokens():
     length = 10
     key = jax.random.PRNGKey(42)
 
-    pivot, result = to_ul2r_s_tokens(key, padded_tokens, length)
+    pivot, result = to_ul2r_s_tokens(key, padded_tokens, length, SENTINEL_TOKEN_IDS[0])
 
     assert result.shape == padded_tokens.shape
     assert pivot.shape == ()
@@ -441,13 +442,13 @@ def test_to_ul2r_s_tokens():
     np.testing.assert_array_equal(result[pivot + 1 :], expected_continuation[:-1])
 
     # Test case 2: Determinism - same key should give same result
-    pivot2, result2 = to_ul2r_s_tokens(key, padded_tokens, length)
+    pivot2, result2 = to_ul2r_s_tokens(key, padded_tokens, length, SENTINEL_TOKEN_IDS[0])
     np.testing.assert_array_equal(result, result2)
     assert pivot == pivot2
 
     # Test case 3: Different keys should give different pivots (usually)
     key2 = jax.random.PRNGKey(43)
-    pivot3, result3 = to_ul2r_s_tokens(key2, padded_tokens, length)
+    pivot3, result3 = to_ul2r_s_tokens(key2, padded_tokens, length, SENTINEL_TOKEN_IDS[0])
     assert pivot != pivot3, "Different keys should produce different pivots"
 
 
@@ -458,9 +459,9 @@ def test_create_ul2r_example():
     max_segments_per_example = 8
 
     task_configs = [
-        RDenoisingConfig(mask_prob=0.15, mean_span_length=3.0),
-        XDenoisingConfig(mask_prob=0.5, mean_span_length=3.0),
-        SDenoisingConfig(),
+        RXDenoisingConfig(RX_TASK_KIND, R_TASK_TOKEN_ID, 0.15, 3.0, False),
+        RXDenoisingConfig(RX_TASK_KIND, X_TASK_TOKEN_ID, 0.5, 3.0, False),
+        SDenoisingConfig(S_TASK_KIND, S_TASK_TOKEN_ID),
     ]
     task_params = jnp.array([cfg.to_task_params() for cfg in task_configs])
     task_indices = jnp.array([0, 1, 2])
@@ -509,12 +510,13 @@ def test_create_ul2r_example():
 
     example = create_ul2r_example(
         key,
-        task_params,
-        task_indices,
-        max_segments_per_example,
         QPos,
         KPos,
         pad_token_id,
+        SENTINEL_TOKEN_IDS,
+        max_segments_per_example,
+        task_params,
+        task_indices,
         tokens,
         segment_ids,
     )
@@ -600,9 +602,9 @@ def test_ul2r_dataset_build(dummy_text_data, hf_tokenizer):
         QPos = hax.Axis("QPos", 128)
         KPos = hax.Axis("KPos", 128)
         task_configs = {
-            "r": RDenoisingConfig(mask_prob=0.15, mean_span_length=3.0),
-            "x": XDenoisingConfig(mask_prob=0.5, mean_span_length=3.0),
-            "s": SDenoisingConfig(),
+            "r": RXDenoisingConfig(RX_TASK_KIND, R_TASK_TOKEN_ID, 0.15, 3.0, False),
+            "x": RXDenoisingConfig(RX_TASK_KIND, X_TASK_TOKEN_ID, 0.5, 3.0, False),
+            "s": SDenoisingConfig(S_TASK_KIND, S_TASK_TOKEN_ID),
         }
 
         dataset = Ul2rDataset(
@@ -613,6 +615,7 @@ def test_ul2r_dataset_build(dummy_text_data, hf_tokenizer):
             task_probs={"r": 0.33, "x": 0.33, "s": 0.34},
             key=jax.random.PRNGKey(123),
             pad_token_id=tokenizer.pad_token_id or 0,
+            sentinel_token_ids=SENTINEL_TOKEN_IDS,
             max_segments_per_example=4,
         )
         dataset_sync = dataset.as_sync_dataset()
