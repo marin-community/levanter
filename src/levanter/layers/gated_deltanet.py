@@ -29,16 +29,39 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import dataclasses
+import functools
+import os
 from typing import Optional, Tuple
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.experimental import pallas as pl
+from jax._src.state.indexing import dslice
 
 import haliax as hax
 import haliax.nn as hnn
 from haliax import Axis, NamedArray
+
+_GDN_DBG = bool(int(os.environ.get("GDN_DEBUG_SHARDING", "0")))
+
+
+def _dbg(tag: str, arr):
+    if not _GDN_DBG:
+        return
+    try:
+        jax.debug.inspect_array_sharding(arr, callback=lambda s: print(f"[GDN][internal] {tag}: {s}"))
+    except Exception:
+        pass
+
+
+def _should_interpret_pallas() -> bool:
+    try:
+        platform = jax.devices()[0].platform
+    except RuntimeError:
+        platform = "cpu"
+    return platform == "cpu"
 
 
 # ---------- small utilities ----------
@@ -54,6 +77,58 @@ def _l2norm(x: NamedArray, axis: hax.AxisSelector, eps: float = 1e-6) -> NamedAr
     x32 = x.astype(jnp.float32)
     inv = hax.rsqrt(hax.sum(hax.square(x32), axis=axis) + jnp.asarray(eps, dtype=jnp.float32))
     return (x32 * inv).astype(x.dtype)
+
+
+def _rmsnorm_gated_reference(
+    x_2d: jnp.ndarray,
+    gate_2d: jnp.ndarray,
+    weight: jnp.ndarray,
+    eps: float,
+) -> jnp.ndarray:
+    """Fallback RMSNorm + SiLU gate."""
+
+    x32 = x_2d.astype(jnp.float32)
+    gate32 = gate_2d.astype(jnp.float32)
+    weight32 = weight.astype(jnp.float32)
+    inv = jax.lax.rsqrt(jnp.mean(x32 * x32, axis=-1, keepdims=True) + jnp.asarray(eps, dtype=jnp.float32))
+    y32 = x32 * inv * weight32[None, :]
+    gated32 = y32 * jax.nn.silu(gate32)
+    return gated32.astype(x_2d.dtype)
+
+
+def _fused_rmsnorm_gated_pallas(
+    x_2d: jnp.ndarray,
+    gate_2d: jnp.ndarray,
+    weight: jnp.ndarray,
+    eps: float,
+) -> jnp.ndarray:
+    n_rows, hidden_size = x_2d.shape
+
+    def kernel(x_ref, gate_ref, weight_ref, out_ref, *, eps):
+        x = x_ref[0, :].astype(jnp.float32)
+        gate = gate_ref[0, :].astype(jnp.float32)
+        weight = weight_ref[:].astype(jnp.float32)
+        eps32 = jnp.asarray(eps, dtype=jnp.float32)
+        inv = jax.lax.rsqrt(jnp.mean(x * x) + eps32)
+        y = x * inv * weight
+        gated = y * jax.nn.silu(gate)
+        out_ref[0, :] = gated.astype(out_ref.dtype)
+
+    kernel_partial = functools.partial(kernel, eps=float(eps))
+
+    out = pl.pallas_call(
+        kernel_partial,
+        out_shape=jax.ShapeDtypeStruct(x_2d.shape, x_2d.dtype),
+        grid=(n_rows,),
+        in_specs=[
+            pl.BlockSpec((1, hidden_size), lambda i: (i, 0)),
+            pl.BlockSpec((1, hidden_size), lambda i: (i, 0)),
+            pl.BlockSpec((hidden_size,), lambda i: (0,)),
+        ],
+        out_specs=pl.BlockSpec((1, hidden_size), lambda i: (i, 0)),
+        interpret=_should_interpret_pallas(),
+    )(x_2d, gate_2d, weight)
+    return out
 
 
 # ---------- depthwise conv: positional (lax) helpers with named wrappers ----------
@@ -75,13 +150,19 @@ def _causal_depthwise_conv1d_full(
     - rhs (w):    O=0, I=1, H=2  (we inject a singleton I=1 for depthwise)
     - out:        N=0, C=1, H=2
     """
+    in_dtype = x_ncl.dtype
     N, C, L = x_ncl.shape
     K = w_ck.shape[-1]
     # pad x on the left with K-1 zeros so that output length == L ("causal")
     x_pad = jnp.pad(x_ncl, ((0, 0), (0, 0), (K - 1, 0)))
-    w_oik = w_ck[:, None, :]  # (C, 1, K) → O=C, I=1, K
-    y = lax.conv_general_dilated(
-        lhs=x_pad,
+
+    # Upcast both sides to float32 for conv
+    x32 = x_pad.astype(jnp.float32)
+    w32 = w_ck.astype(jnp.float32)
+    w_oik = w32[:, None, :]  # (C, 1, K)
+
+    y32 = lax.conv_general_dilated(
+        lhs=x32,
         rhs=w_oik,
         window_strides=(1,),
         padding="VALID",
@@ -90,10 +171,13 @@ def _causal_depthwise_conv1d_full(
         precision=lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
+    _dbg("conv/full/y32", y32)
+
     if bias_c is not None:
-        y = y + bias_c[:, None]
-    y = jax.nn.silu(y)
-    return y
+        y32 = y32 + bias_c.astype(jnp.float32)[:, None]
+
+    y32 = jax.nn.silu(y32)
+    return y32.astype(in_dtype)
 
 
 def _causal_depthwise_conv1d_update(
@@ -116,48 +200,76 @@ def _causal_depthwise_conv1d_update(
 
     Used during decode to avoid re-convolving the entire history.
     """
-    x_hist = jnp.concatenate([prev_state_nck, x_ncl_1], axis=-1)  # (N, C, K+1)
-    y2 = lax.conv_general_dilated(
-        lhs=x_hist,
-        rhs=w_ck[:, None, :],
+    in_dtype = x_ncl_1.dtype
+
+    x_hist = jnp.concatenate([prev_state_nck, x_ncl_1], axis=-1)
+    x32 = x_hist.astype(jnp.float32)
+    w32 = w_ck.astype(jnp.float32)
+
+    y32_all = lax.conv_general_dilated(
+        lhs=x32,
+        rhs=w32[:, None, :],
         window_strides=(1,),
         padding="VALID",
         dimension_numbers=("NCH", "OIH", "NCH"),
-        feature_group_count=x_hist.shape[1],
+        feature_group_count=w32.shape[0],
         precision=lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32,
     )
-    y = y2[..., -1:]  # (N, C, 1): the newest output sample
+    y32 = y32_all[..., -1:]
+    _dbg("conv/update/y32", y32)
+
     if bias_c is not None:
-        y = y + bias_c[:, None]
-    y = jax.nn.silu(y)
+        y32 = y32 + bias_c.astype(jnp.float32)[:, None]
+
+    y32 = jax.nn.silu(y32)
     new_state = jnp.concatenate([prev_state_nck[..., 1:], x_ncl_1], axis=-1)
-    return y, new_state
+
+    return y32.astype(in_dtype), new_state.astype(in_dtype)
 
 
-# ---------- Gated RMSNorm with external gate ----------
+# ---------- Fused Gated RMSNorm ----------
 
 
-class GatedRmsNorm(eqx.Module):
-    """RMSNorm(x) * SiLU(gate)"""
+class FusedRMSNormGated(eqx.Module):
+    """RMSNorm(x) * SiLU(gate) using an optional fused Pallas kernel."""
 
     axis: Axis
     weight: NamedArray  # [axis]
     eps: float = eqx.field(default=1e-6, static=True)
+    use_flash: bool = eqx.field(default=True, static=True)
 
     @staticmethod
-    def init(axis: Axis, eps: float = 1e-6) -> "GatedRmsNorm":
-        return GatedRmsNorm(axis=axis, weight=hax.ones(axis), eps=eps)
+    def init(axis: Axis, eps: float = 1e-6, *, use_flash: bool = True) -> "FusedRMSNormGated":
+        return FusedRMSNormGated(axis=axis, weight=hax.ones(axis), eps=eps, use_flash=use_flash)
 
     def __call__(self, x: NamedArray, gate: NamedArray) -> NamedArray:
-        in_dtype = x.dtype
-        x32 = x.astype(jnp.float32)
-        var = hax.mean(hax.square(x32), axis=self.axis)
-        inv = hax.rsqrt(var + jnp.asarray(self.eps, dtype=jnp.float32))
-        y = (x32 * inv).astype(in_dtype)  # RMSNorm (from haliax/nn/normalization.py)
-        y = self.weight * y  # learned scale
-        gated = y * hnn.silu(gate)  # GDN's output gate
-        return gated.astype(in_dtype)
+        if x.resolve_axis(self.axis.name) != gate.resolve_axis(self.axis.name):
+            raise ValueError("x and gate must share the normalization axis")
+
+        # Move target axis to the end to make the flattened 2D view contiguous
+        other_axes = tuple(ax for ax in x.axes if ax.name != self.axis.name)
+        permuted_axes = other_axes + (self.axis,)
+        x_perm = hax.rearrange(x, permuted_axes)
+        gate_perm = hax.rearrange(gate, permuted_axes)
+
+        x_arr = x_perm.array.reshape(-1, self.axis.size)
+        gate_arr = gate_perm.array.reshape(-1, self.axis.size)
+        weight_arr = self.weight.array
+
+        if self.use_flash:
+            try:
+                out_arr = _fused_rmsnorm_gated_pallas(x_arr, gate_arr, weight_arr, self.eps)
+            except Exception:
+                if self.use_flash:
+                    raise
+                out_arr = _rmsnorm_gated_reference(x_arr, gate_arr, weight_arr, self.eps)
+        else:
+            out_arr = _rmsnorm_gated_reference(x_arr, gate_arr, weight_arr, self.eps)
+
+        out_perm = out_arr.reshape(x_perm.array.shape)
+        out_named = hax.named(out_perm, permuted_axes)
+        return hax.rearrange(out_named, x.axes)
 
 
 # ---------- Config ----------
@@ -191,6 +303,11 @@ class GatedDeltaNetConfig:
     @property
     def VHeads(self) -> Axis:
         return Axis("v_heads", self.num_v_heads)
+
+    @property
+    def Heads(self) -> Axis:
+        # expose VHeads as heads for tensor-parallel sharding
+        return Axis("heads", self.num_v_heads)
 
     @property
     def KHeadDim(self) -> Axis:
@@ -246,7 +363,7 @@ def _diag_mask(Ci: Axis, Cj: Axis) -> NamedArray:
 # ---------- Kernels ----------
 
 
-def recurrent_gated_delta_rule(
+def _recurrent_gated_delta_rule_reference(
     query: NamedArray,  # [batch, position, heads, k_head_dim]
     key: NamedArray,  # [batch, position, heads, k_head_dim]
     value: NamedArray,  # [batch, position, heads, v_head_dim]
@@ -300,6 +417,7 @@ def recurrent_gated_delta_rule(
     # Prepare initial S
     B_, H_, L_, dk_, dv_ = Batch.size, Heads.size, Pos.size, Dk.size, Dv.size
     S0 = jnp.zeros((B_, H_, dk_, dv_), dtype=v.dtype) if initial_state is None else initial_state.astype(v.dtype)
+    _dbg("recurrent/S0", S0)
 
     # Re-layout to positional major for lax.scan
     q_bhld = hax.rearrange(q, (Batch, Heads, Pos, Dk)).array  # (B,H,L,d_k)
@@ -350,11 +468,224 @@ def recurrent_gated_delta_rule(
     out_bhlv = jnp.moveaxis(out_seq, 0, 2)  # (B,H,L,Dv)
     out_bhlv = hax.named(out_bhlv, (Batch, Heads, Pos, Dv))
     out_final = hax.rearrange(out_bhlv, (Batch, Pos, Heads, Dv))
+    _dbg("recurrent/out", out_final.array)
 
     if output_final_state:
         return out_final, S_final
     else:
         return out_final, None
+
+
+def _recurrent_gated_delta_rule_flash(
+    query: NamedArray,
+    key: NamedArray,
+    value: NamedArray,
+    g: NamedArray,
+    beta: NamedArray,
+    *,
+    initial_state: Optional[jnp.ndarray] = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = True,
+) -> Tuple[NamedArray, Optional[jnp.ndarray]]:
+    Batch = query.resolve_axis("batch")
+    Pos = query.resolve_axis("position")
+    Heads = query.resolve_axis("heads")
+    Dk = query.resolve_axis("k_head_dim")
+    Dv = value.resolve_axis("v_head_dim")
+
+    q = query.astype(jnp.float32)
+    k = key.astype(jnp.float32)
+    v = value.astype(jnp.float32)
+    gg = g.astype(jnp.float32)
+    b = beta.astype(jnp.float32)
+
+    q_arr = hax.rearrange(q, (Batch, Heads, Pos, Dk)).array
+    k_arr = hax.rearrange(k, (Batch, Heads, Pos, Dk)).array
+    v_arr = hax.rearrange(v, (Batch, Heads, Pos, Dv)).array
+    g_arr = hax.rearrange(gg, (Batch, Heads, Pos)).array
+
+    beta_axis_names = tuple(ax.name for ax in beta.axes)
+    if Dv.name in beta_axis_names:
+        beta_arr = hax.rearrange(b, (Batch, Heads, Pos, Dv)).array
+        is_beta_headwise = False
+    else:
+        beta_arr = hax.rearrange(b, (Batch, Heads, Pos)).array
+        is_beta_headwise = True
+
+    B_, H_, T_, K_ = q_arr.shape
+    V_ = v_arr.shape[-1]
+    NH = B_ * H_
+
+    q_flat = q_arr.reshape(NH, T_, K_)
+    k_flat = k_arr.reshape(NH, T_, K_)
+    v_flat = v_arr.reshape(NH, T_, V_)
+    g_flat = g_arr.reshape(NH, T_)
+    if is_beta_headwise:
+        beta_flat = beta_arr.reshape(NH, T_)
+    else:
+        beta_flat = beta_arr.reshape(NH, T_, V_)
+
+    if initial_state is None:
+        init_state = jnp.zeros((NH, K_, V_), dtype=jnp.float32)
+    else:
+        init_state = initial_state.astype(jnp.float32).reshape(NH, K_, V_)
+
+    def kernel(
+        q_ref,
+        k_ref,
+        v_ref,
+        g_ref,
+        beta_ref,
+        init_ref,
+        out_ref,
+        final_ref,
+        *,
+        T,
+        K,
+        V,
+        use_qk_l2norm,
+        store_final_state,
+        has_initial_state,
+        is_beta_headwise,
+        scale,
+    ):
+        head = pl.program_id(0)
+        q_view = q_ref[dslice(head, 1), dslice(0, T), dslice(0, K)][0]
+        k_view = k_ref[dslice(head, 1), dslice(0, T), dslice(0, K)][0]
+        v_view = v_ref[dslice(head, 1), dslice(0, T), dslice(0, V)][0]
+        g_view = g_ref[dslice(head, 1), dslice(0, T)][0]
+        beta_view = (
+            beta_ref[dslice(head, 1), dslice(0, T)][0]
+            if is_beta_headwise
+            else beta_ref[dslice(head, 1), dslice(0, T), dslice(0, V)][0]
+        )
+        if has_initial_state:
+            state = init_ref[dslice(head, 1), dslice(0, K), dslice(0, V)][0].astype(jnp.float32)
+        else:
+            state = jnp.zeros((K, V), dtype=jnp.float32)
+
+        scale32 = jnp.asarray(scale, dtype=jnp.float32)
+
+        out_tile = jnp.zeros((T, V), dtype=out_ref.dtype)
+        for t in range(T):
+            q_t = q_view[t].astype(jnp.float32)
+            k_t = k_view[t].astype(jnp.float32)
+            if use_qk_l2norm:
+                q_t = q_t / jnp.sqrt(jnp.sum(q_t * q_t) + 1e-6)
+                k_t = k_t / jnp.sqrt(jnp.sum(k_t * k_t) + 1e-6)
+            q_t = q_t * scale32
+            v_t = v_view[t].astype(jnp.float32)
+            g_t = g_view[t].astype(jnp.float32)
+            state = state * jnp.exp(g_t)
+
+            kv = jnp.sum(state * k_t[:, None], axis=0)
+            if is_beta_headwise:
+                beta_t = beta_view[t].astype(jnp.float32)
+                delta = (v_t - kv) * beta_t
+            else:
+                beta_t = beta_view[t].astype(jnp.float32)
+                delta = (v_t - kv) * beta_t
+            state = state + k_t[:, None] * delta[None, :]
+
+            out_tile = out_tile.at[t].set(jnp.sum(state * q_t[:, None], axis=0).astype(out_ref.dtype))
+
+        out_ref[dslice(head, 1), dslice(0, T), dslice(0, V)] = out_tile[None, :, :]
+
+        if store_final_state:
+            final_ref[dslice(head, 1), dslice(0, K), dslice(0, V)] = state.astype(final_ref.dtype)[None, :, :]
+
+    out_struct = jax.ShapeDtypeStruct((NH, T_, V_), v_flat.dtype)
+    final_struct = jax.ShapeDtypeStruct((NH, K_, V_), jnp.float32)
+
+    kernel_partial = functools.partial(
+        kernel,
+        T=T_,
+        K=K_,
+        V=V_,
+        use_qk_l2norm=use_qk_l2norm_in_kernel,
+        store_final_state=output_final_state,
+        has_initial_state=initial_state is not None,
+        is_beta_headwise=is_beta_headwise,
+        scale=Dk.size**-0.5,
+    )
+
+    beta_spec: pl.BlockSpec
+    if is_beta_headwise:
+        beta_spec = pl.BlockSpec((1, T_), lambda bid_nh: (bid_nh, 0))
+    else:
+        beta_spec = pl.BlockSpec((1, T_, V_), lambda bid_nh: (bid_nh, 0, 0))
+
+    result = pl.pallas_call(
+        kernel_partial,
+        out_shape=(out_struct, final_struct),
+        grid=(NH,),
+        in_specs=(
+            pl.BlockSpec((1, T_, K_), lambda bid_nh: (bid_nh, 0, 0)),
+            pl.BlockSpec((1, T_, K_), lambda bid_nh: (bid_nh, 0, 0)),
+            pl.BlockSpec((1, T_, V_), lambda bid_nh: (bid_nh, 0, 0)),
+            pl.BlockSpec((1, T_), lambda bid_nh: (bid_nh, 0)),
+            beta_spec,
+            pl.BlockSpec((1, K_, V_), lambda bid_nh: (bid_nh, 0, 0)),
+        ),
+        out_specs=(
+            pl.BlockSpec((1, T_, V_), lambda bid_nh: (bid_nh, 0, 0)),
+            pl.BlockSpec((1, K_, V_), lambda bid_nh: (bid_nh, 0, 0)),
+        ),
+        interpret=_should_interpret_pallas(),
+    )(q_flat, k_flat, v_flat, g_flat, beta_flat, init_state)
+
+    out_flat, final_flat = result
+    out_arr = out_flat.reshape(B_, H_, T_, V_)
+    out_named = hax.named(out_arr, (Batch, Heads, Pos, Dv))
+    out_final = hax.rearrange(out_named, (Batch, Pos, Heads, Dv))
+
+    if output_final_state:
+        final_arr = final_flat.reshape(B_, H_, K_, V_)
+        return out_final, final_arr
+    else:
+        return out_final, None
+
+
+def recurrent_gated_delta_rule(
+    query: NamedArray,
+    key: NamedArray,
+    value: NamedArray,
+    g: NamedArray,
+    beta: NamedArray,
+    *,
+    initial_state: Optional[jnp.ndarray] = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = True,
+    use_flash: bool = True,
+) -> Tuple[NamedArray, Optional[jnp.ndarray]]:
+    if use_flash:
+        try:
+            return _recurrent_gated_delta_rule_flash(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+        except Exception:
+            if use_flash:
+                raise
+    return _recurrent_gated_delta_rule_reference(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+
+
+recurrent_gated_delta_rule.__doc__ = _recurrent_gated_delta_rule_reference.__doc__
 
 
 def chunk_gated_delta_rule(
@@ -368,6 +699,7 @@ def chunk_gated_delta_rule(
     initial_state: Optional[jnp.ndarray] = None,  # (B,H,dk,dv)
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = True,
+    use_flash: bool = True,
 ) -> tuple[NamedArray, Optional[jnp.ndarray]]:
     """Chunkwise-parallel GDN (DeltaNet UT/WY extended with decay).
 
@@ -380,6 +712,11 @@ def chunk_gated_delta_rule(
       5) Bridge chunks with the cross-chunk state S (decayed carry and innovation).
       6) Produce outputs by combining inter-chunk (from S) and intra-chunk terms.
     """
+
+    if use_flash:
+        # Flash-optimized chunk kernel will be added in a follow-up change.
+        # For now we intentionally fall back to the reference implementation.
+        pass
     # ---- axes ----
     Batch = query.resolve_axis("batch")
     Pos = query.resolve_axis("position")
@@ -458,6 +795,8 @@ def chunk_gated_delta_rule(
 
     # --- Forward substitution (UT transform) to get T = (I - A)^{-1} ---
     A_bhcc = hax.rearrange(A, (Batch, Heads, Chunks, Ci, Cj)).array
+    _dbg("chunk/A_bhcc", A_bhcc)
+
     eyeC = jnp.eye(C.size, dtype=A_bhcc.dtype)
 
     def body(i, attn):
@@ -483,6 +822,7 @@ def chunk_gated_delta_rule(
 
     attn_low = lax.fori_loop(1, C.size, body, A_bhcc)
     T = attn_low + eyeC  # lower-triangular with ones on diagonal; acts like (I - A)^-1
+    _dbg("chunk/T", T)
 
     # --- Pseudo values and decayed key summaries (intra-chunk) ---
     # v_pseudo = T @ (β V)
@@ -493,6 +833,8 @@ def chunk_gated_delta_rule(
     kbeta_bhccd = hax.rearrange(k_beta.rename({C.name: Cj.name}), (Batch, Heads, Chunks, Cj, Dk)).array
     exp_g_bhcc = hax.rearrange(hax.exp(g_cum).rename({C.name: Cj.name}), (Batch, Heads, Chunks, Cj)).array
     k_cumdecay = jnp.einsum("bhnij,bhnjd->bhnid", T, kbeta_bhccd * exp_g_bhcc[..., None])  # (B,H,Nc,C,d_k)
+    _dbg("chunk/v_pseudo", v_pseudo)
+    _dbg("chunk/k_cumdecay", k_cumdecay)
 
     # --- Scan over chunks: bridge with cross-chunk S ---
     q_bhccd = hax.rearrange(q_c, (Batch, Heads, Chunks, C, Dk)).array
@@ -551,6 +893,7 @@ def chunk_gated_delta_rule(
     out_flat_bhPd = out_bhcd.flatten_axes((Chunks, C), PosPad)
     out_bhLd = out_flat_bhPd["position", hax.ds(0, L)]
     out_final = hax.rearrange(out_bhLd, (Batch, PosPad.name, Heads, Dv))
+    _dbg("chunk/out", out_final.array)
 
     return (out_final, S) if output_final_state else (out_final, None)
 
@@ -590,16 +933,16 @@ class GatedDeltaNet(eqx.Module):
     in_proj_ba: hnn.Linear  # [Embed] -> [b|a]
 
     # depthwise conv parameters over concatenated [Q|K|V] channels
-    conv_weight: jnp.ndarray
-    conv_bias: Optional[jnp.ndarray]
+    conv_weight: NamedArray  # [channels, conv_kernel]
+    conv_bias: Optional[NamedArray]  # [channels] or None
 
     # discretization params per V head (Mamba2-style)
-    A_log: jnp.ndarray
-    dt_bias: jnp.ndarray
+    A_log: NamedArray  # [Heads]
+    dt_bias: NamedArray  # [Heads]
 
     # gated RMSNorm and output projection
-    o_norm: GatedRmsNorm
-    out_proj: hnn.Linear  # [VHeads, VHeadDim] -> [Embed]
+    o_norm: FusedRMSNormGated
+    out_proj: hnn.Linear  # [Heads, VHeadDim] -> [Embed]
 
     @staticmethod
     def init(config: GatedDeltaNetConfig, *, key) -> "GatedDeltaNet":
@@ -624,16 +967,23 @@ class GatedDeltaNet(eqx.Module):
         # Depthwise conv over channels = 2*key_dim + value_dim
         C = config.key_dim * 2 + config.value_dim
         K = config.conv_kernel_size
-        conv_weight = jax.random.normal(k_conv, (C, K), dtype=jnp.float32) * (1.0 / jnp.sqrt(C * K))
+        ConvChannels = Axis("channels", C)
+        ConvKernel = Axis("conv_kernel", K)
+
+        conv_w = jax.random.normal(k_conv, (C, K), dtype=jnp.float32) * (1.0 / jnp.sqrt(C * K))
+        conv_weight = hax.named(conv_w, (ConvChannels, ConvKernel))
         conv_bias = None
 
         # GDN discretization parameters (per V-head)
-        A_log = jnp.log(jax.random.uniform(k_out, (config.num_v_heads,), minval=1e-6, maxval=16.0, dtype=jnp.float32))
-        dt_bias = jnp.ones((config.num_v_heads,), dtype=jnp.float32)
+        A_log = hax.named(
+            jnp.log(jax.random.uniform(k_out, (config.Heads.size,), minval=1e-6, maxval=16.0, dtype=jnp.float32)),
+            (config.Heads.name,),
+        )
+        dt_bias = hax.named(jnp.ones((config.Heads.size,), dtype=jnp.float32), (config.Heads.name,))
 
-        o_norm = GatedRmsNorm.init(config.VHeadDim, eps=config.rms_norm_eps)
+        o_norm = FusedRMSNormGated.init(config.VHeadDim, eps=config.rms_norm_eps)
         out_proj = hnn.Linear.init(
-            In=(config.VHeads, config.VHeadDim), Out=config.Embed, out_first=True, use_bias=False, key=k_out
+            In=(config.Heads, config.VHeadDim), Out=config.Embed, out_first=True, use_bias=False, key=k_out
         )
         return GatedDeltaNet(
             config=config,
@@ -649,7 +999,7 @@ class GatedDeltaNet(eqx.Module):
 
     def _fix_qkvz_ordering(
         self,
-        mixed_qkvz: NamedArray,  # [B, Pos, qkvz]
+        mixed_qkvz: NamedArray,  # [B, Pos, qkvz=2*key_dim + 2*value_dim]
         mixed_ba: NamedArray,  # [B, Pos, 2*num_v_heads]
     ) -> Tuple[NamedArray, NamedArray, NamedArray, NamedArray, NamedArray, NamedArray]:
         """Split packed projections into per-head tensors and align head layout. (match HF version)
@@ -730,9 +1080,13 @@ class GatedDeltaNet(eqx.Module):
             m3 = attention_mask.astype(x.dtype).broadcast_axis(cfg.Embed)
             x = x * m3
 
+        _dbg("layer/in_x", x.array if hasattr(x, "array") else x)
+
         # 1) Project to [Q|K|V|Z] and [b|a]
         mixed_qkvz = self.in_proj_qkvz(x)  # [B, Pos, qkvz=2*key_dim + 2*value_dim]
         mixed_ba = self.in_proj_ba(x)  # [B, Pos, ba=2*num_v_heads]
+        _dbg("layer/mixed_qkvz", mixed_qkvz.array if hasattr(mixed_qkvz, "array") else mixed_qkvz)
+        _dbg("layer/mixed_ba", mixed_ba.array if hasattr(mixed_ba, "array") else mixed_ba)
 
         # 1b) Re-group like HF for parity (also used for conv channel ordering)
         q, k, v, z, b, a = self._fix_qkvz_ordering(mixed_qkvz, mixed_ba)
@@ -744,30 +1098,39 @@ class GatedDeltaNet(eqx.Module):
         v_ch = v.flatten_axes((cfg.VHeads, cfg.VHeadDim), Axis("channels", cfg.value_dim))
         qkv_ch = hax.concatenate("channels", [q_ch, k_ch, v_ch])  # [B, Pos, channels]
         qkv_ncl = hax.rearrange(qkv_ch, ("batch", "channels", "position")).array  # (N, C, L)
+        _dbg("conv/in_ncl", qkv_ncl)
 
         S_state: Optional[jnp.ndarray] = None
         if decode_state is not None and x.axis_size("position") == 1:
             # Streaming decode: cheap single-step conv update + carry conv_state
             conv_state, S_state = decode_state
-            K = self.conv_weight.shape[-1]
+            K = self.conv_weight.resolve_axis("conv_kernel").size
             assert conv_state.shape[-1] == K
+            _dbg("conv/state_in_decode", conv_state)
             y_ncl, new_conv_state = _causal_depthwise_conv1d_update(
-                qkv_ncl, self.conv_weight, self.conv_bias, conv_state
+                qkv_ncl,
+                self.conv_weight.array,
+                self.conv_bias.array if self.conv_bias is not None else None,
+                conv_state,
             )
         else:
             # Prefill/train: full causal conv over the sequence
-            y_ncl = _causal_depthwise_conv1d_full(qkv_ncl, self.conv_weight, self.conv_bias)
+            y_ncl = _causal_depthwise_conv1d_full(
+                qkv_ncl, self.conv_weight.array, self.conv_bias.array if self.conv_bias is not None else None
+            )
             if inference:
                 # cache the rightmost K samples of channels as the next conv_state
-                K = self.conv_weight.shape[-1]
-                L = x.axis_size("position")
-                if L >= K:
+                K = self.conv_weight.resolve_axis("conv_kernel").size
+                Lpos = x.axis_size("position")
+                if Lpos >= K:
                     new_conv_state = qkv_ncl[..., -K:]
                 else:
-                    new_conv_state = jnp.pad(qkv_ncl, ((0, 0), (0, 0), (K - L, 0)))
+                    new_conv_state = jnp.pad(qkv_ncl, ((0, 0), (0, 0), (K - Lpos, 0)))
             else:
                 new_conv_state = None
                 S_state = None
+
+        _dbg("conv/out_ncl", y_ncl)
 
         # Unpack [Q|K|V] after conv back to per-head tensors (mirror the same channel order)
         y_bpc = hax.rearrange(hax.named(y_ncl, ("batch", "channels", "position")), ("batch", "position", "channels"))
@@ -779,37 +1142,48 @@ class GatedDeltaNet(eqx.Module):
         v = v_y.unflatten_axis("channels", (cfg.VHeads, cfg.VHeadDim))
 
         # 3) Gates: β via sigmoid(b); α via g = -exp(A) * softplus(a + dt_bias), α=exp(g)
-        beta = hnn.sigmoid(b)
-        a32 = a.astype(jnp.float32)
-        dt_bias_na = hax.named(jnp.asarray(self.dt_bias, dtype=jnp.float32), cfg.VHeads)
-        A_exp = hax.exp(hax.named(jnp.asarray(self.A_log, dtype=jnp.float32), cfg.VHeads))
-        g = -(A_exp * hnn.softplus(a32 + dt_bias_na)).astype(x.dtype)  # log-decay
-
-        # If we have more V-heads than K-heads, repeat Q,K across V-groups so
-        # every V-head has its own (q,k) and thus its own rectangular S.
+        # Map a, b to Heads axis to line up with TP and kernels.
         ratio = cfg.num_v_heads // cfg.num_k_heads
         if ratio > 1:
             VGroup = Axis("v_group", ratio)
-            q = q.broadcast_axis(VGroup).flatten_axes((cfg.KHeads, VGroup), cfg.VHeads)
-            k = k.broadcast_axis(VGroup).flatten_axes((cfg.KHeads, VGroup), cfg.VHeads)
+            # Repeat Q,K to Heads (num_v_heads)
+            q = q.broadcast_axis(VGroup).flatten_axes((cfg.KHeads, VGroup), cfg.Heads)
+            k = k.broadcast_axis(VGroup).flatten_axes((cfg.KHeads, VGroup), cfg.Heads)
+            # Map V/Z/B/A to Heads as well
+            v_h = v.rename({cfg.VHeads.name: cfg.Heads.name})
+            z_h = z.rename({cfg.VHeads.name: cfg.Heads.name})
+            b_hparam = b.rename({cfg.VHeads.name: cfg.Heads.name})
+            a_hparam = a.rename({cfg.VHeads.name: cfg.Heads.name})
         else:
-            q = q.rename({cfg.KHeads.name: cfg.VHeads.name})
-            k = k.rename({cfg.KHeads.name: cfg.VHeads.name})
+            # 1:1 map KHeads -> Heads; and VHeads -> Heads for v/z/a/b
+            q = q.rename({cfg.KHeads.name: cfg.Heads.name})
+            k = k.rename({cfg.KHeads.name: cfg.Heads.name})
+            v_h = v.rename({cfg.VHeads.name: cfg.Heads.name})
+            z_h = z.rename({cfg.VHeads.name: cfg.Heads.name})
+            b_hparam = b.rename({cfg.VHeads.name: cfg.Heads.name})
+            a_hparam = a.rename({cfg.VHeads.name: cfg.Heads.name})
 
-        # 4) Kernels expect [batch, position, heads, dim] with axis name "heads"
-        q_h = q.rename({cfg.VHeads.name: "heads"})
-        k_h = k.rename({cfg.VHeads.name: "heads"})
-        v_h = v.rename({cfg.VHeads.name: "heads"})
-        g_h = g.rename({cfg.VHeads.name: "heads"})
-        b_h = beta.rename({cfg.VHeads.name: "heads"})
+        beta = hnn.sigmoid(b_hparam)
+        a32 = a_hparam.astype(jnp.float32)
+        dt_bias_na = self.dt_bias.astype(jnp.float32)
+        A_exp = hax.exp(self.A_log.astype(jnp.float32))
+        g = -(A_exp * hnn.softplus(a32 + dt_bias_na)).astype(x.dtype)  # log-decay on Heads
+
+        # 4) Kernels expect [batch, position, heads, dim] (axis name "heads")
+        q_h = q.rename({cfg.Heads.name: "heads"})
+        k_h = k.rename({cfg.Heads.name: "heads"})
+        v_kern = v_h.rename({cfg.Heads.name: "heads"})
+        g_h = g.rename({cfg.Heads.name: "heads"})
+        b_h = beta.rename({cfg.Heads.name: "heads"})
 
         q_bphd = hax.rearrange(q_h, ("batch", "position", "heads", cfg.KHeadDim.name))
         k_bphd = hax.rearrange(k_h, ("batch", "position", "heads", cfg.KHeadDim.name))
-        v_bphd = hax.rearrange(v_h, ("batch", "position", "heads", cfg.VHeadDim.name))
+        v_bphd = hax.rearrange(v_kern, ("batch", "position", "heads", cfg.VHeadDim.name))
+        _dbg("kernel/q_bphd", q_bphd.array)
+        _dbg("kernel/k_bphd", k_bphd.array)
+        _dbg("kernel/v_bphd", v_bphd.array)
 
         # Choose the kernel:
-        #  - decode (1 token, with state): recurrent rule
-        #  - else: chunkwise-parallel rule
         if decode_state is not None and x.axis_size("position") == 1 and S_state is not None:
             out_bphd, S_new = recurrent_gated_delta_rule(
                 q_bphd,
@@ -829,19 +1203,22 @@ class GatedDeltaNet(eqx.Module):
                 g_h,
                 b_h,
                 chunk_size=chunk_size,
-                initial_state=None,  # could feed S_state if continuing
-                output_final_state=inference,  # return S_T for caching if inference
+                initial_state=None,
+                output_final_state=inference,
                 use_qk_l2norm_in_kernel=True,
             )
 
-        # Back to [B, Pos, VHeads, VHeadDim]
-        out = out_bphd.rename({"heads": cfg.VHeads.name})
+        # Keep the kernel output on "heads" so TP can shard the out-projection.
+        out = out_bphd  # [B, Pos, heads, VHeadDim]
+        _dbg("kernel/out_bphd", out.array)
 
-        # 5) Gated RMSNorm with Z (GDN block’s output gate)
-        y_norm = self.o_norm(out, gate=z)
+        # 5) Gated RMSNorm with Z (rename Z to "heads" to match)
+        z_gate = z_h.rename({cfg.Heads.name: "heads"})
+        y_norm = self.o_norm(out, gate=z_gate)
 
-        # 6) Output projection back to model dimension
+        # 6) Output projection back to model dimension (In=(Heads, VHeadDim) -> Out=Embed)
         y_out = self.out_proj(y_norm.astype(x.dtype))
+        _dbg("layer/y_out", y_out.array)
 
         # State packing for streaming
         new_state: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None
@@ -853,9 +1230,9 @@ class GatedDeltaNet(eqx.Module):
         return {
             "in_proj_qkvz.weight": jnp.array(self.in_proj_qkvz.weight.array),
             "in_proj_ba.weight": jnp.array(self.in_proj_ba.weight.array),
-            "conv_weight": jnp.array(self.conv_weight),
-            "A_log": jnp.array(self.A_log),
-            "dt_bias": jnp.array(self.dt_bias),
+            "conv_weight": jnp.array(self.conv_weight.array),
+            "A_log": jnp.array(self.A_log.array),
+            "dt_bias": jnp.array(self.dt_bias.array),
             "o_norm.weight": jnp.array(self.o_norm.weight.array),
             "out_proj.weight": jnp.array(self.out_proj.weight.array),
         }
@@ -871,15 +1248,23 @@ class GatedDeltaNet(eqx.Module):
             self.in_proj_qkvz, state["in_proj_qkvz.weight"], cfg.mix_qkvz_axis, cfg.Embed
         )
         new_in_proj_ba = _assign_linear_weight(self.in_proj_ba, state["in_proj_ba.weight"], cfg.ba_axis, cfg.Embed)
-        new_conv_weight = jnp.asarray(state["conv_weight"], dtype=jnp.float32)
-        new_A_log = jnp.asarray(state["A_log"], dtype=jnp.float32)
-        new_dt_bias = jnp.asarray(state["dt_bias"], dtype=jnp.float32)
+
+        # Rebuild named conv axes
+        ConvChannels = Axis("channels", cfg.key_dim * 2 + cfg.value_dim)
+        ConvKernel = Axis("conv_kernel", cfg.conv_kernel_size)
+        new_conv_weight = hax.named(jnp.asarray(state["conv_weight"], dtype=jnp.float32), (ConvChannels, ConvKernel))
+
+        # Heads-based params
+        new_A_log = hax.named(jnp.asarray(state["A_log"], dtype=jnp.float32), (cfg.Heads.name,))
+        new_dt_bias = hax.named(jnp.asarray(state["dt_bias"], dtype=jnp.float32), (cfg.Heads.name,))
         new_o_norm = dataclasses.replace(
             self.o_norm, weight=hax.named(jnp.asarray(state["o_norm.weight"], dtype=jnp.float32), (cfg.VHeadDim.name,))
         )
-        out_w = jnp.asarray(state["out_proj.weight"], dtype=jnp.float32)  # (embed, v_heads, v_head_dim)
+
+        # out_proj.weight is (Embed, Heads, VHeadDim)
+        out_w = jnp.asarray(state["out_proj.weight"], dtype=jnp.float32)
         new_out_proj = dataclasses.replace(
-            self.out_proj, weight=hax.named(out_w, (cfg.Embed.name, cfg.VHeads.name, cfg.VHeadDim.name))
+            self.out_proj, weight=hax.named(out_w, (cfg.Embed.name, cfg.Heads.name, cfg.VHeadDim.name))
         )
 
         return dataclasses.replace(
@@ -895,8 +1280,5 @@ class GatedDeltaNet(eqx.Module):
 
     @classmethod
     def from_state_dict(cls, config: GatedDeltaNetConfig, state: dict[str, jnp.ndarray], *, key) -> "GatedDeltaNet":
-        """
-        Build a fresh layer from config + state dict.
-        """
         layer = cls.init(config, key=key)
         return layer.load_state_dict(state)

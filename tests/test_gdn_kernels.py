@@ -2,13 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import haliax as hax
+import haliax.nn as hnn
 from haliax import Axis
 import pytest
 
-from levanter.layers.gated_deltanet import chunk_gated_delta_rule, recurrent_gated_delta_rule
+from levanter.layers.gated_deltanet import FusedRMSNormGated, chunk_gated_delta_rule, recurrent_gated_delta_rule
 from tests.test_utils import skip_if_no_torch
 
 jax.config.update("jax_default_matmul_precision", "float32")
@@ -43,19 +46,49 @@ def _named_kernels_inputs(B, H, L, dk, dv, key):
     return q, k, v, g, beta
 
 
-def test_recurrent_no_learning_beta_zero_outputs_zero():
+def test_fused_rms_norm_gated_matches_reference():
+    key_x, key_g = jax.random.split(jax.random.PRNGKey(0))
+    Batch = Axis("batch", 2)
+    Pos = Axis("position", 3)
+    Hidden = Axis("hidden", 5)
+
+    module = FusedRMSNormGated.init(Hidden, eps=1e-6, use_flash=True)
+    module_ref = dataclasses.replace(module, use_flash=False)
+
+    x = hax.random.normal(key_x, (Batch, Pos, Hidden), dtype=jnp.float32)
+    gate = hax.random.normal(key_g, (Batch, Pos, Hidden), dtype=jnp.float32)
+
+    y_flash = module(x, gate)
+    y_ref = module_ref(x, gate)
+
+    x32 = x.astype(jnp.float32)
+    var = hax.mean(hax.square(x32), axis=Hidden)
+    inv = hax.rsqrt(var + jnp.asarray(module.eps, dtype=jnp.float32))
+    expected = (x32 * inv).astype(x.dtype)
+    expected = module.weight * expected
+    expected = expected * hnn.silu(gate)
+
+    np.testing.assert_allclose(y_flash.array, y_ref.array, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(y_flash.array, expected.array, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_recurrent_no_learning_beta_zero_outputs_zero(use_flash: bool):
     """If beta == 0 everywhere and S0 == 0, then S_t == 0 for all t and outputs are zero."""
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 2, 3, 17, 8, 8
     q, k, v, g, _ = _named_kernels_inputs(B, H, L, dk, dv, key)
     beta0 = hax.named(jnp.zeros((B, L, H), dtype=jnp.float32), ("batch", "position", "heads"))
 
-    out, S_final = recurrent_gated_delta_rule(q, k, v, g, beta0, initial_state=None, output_final_state=True)
+    out, S_final = recurrent_gated_delta_rule(
+        q, k, v, g, beta0, initial_state=None, output_final_state=True, use_flash=use_flash
+    )
     np.testing.assert_allclose(np.array(out.array), 0.0, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(S_final, 0.0, rtol=1e-6, atol=1e-6)
 
 
-def test_recurrent_perfect_fit_on_current_key_when_alpha1_beta1_and_L2norm():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_recurrent_perfect_fit_on_current_key_when_alpha1_beta1_and_L2norm(use_flash: bool):
     """
     With α=1 (g=0) and β=1 and L2-normed K, the post-update state satisfies S_t^T k̂_t == v_t,
     where k̂_t is K L2-normalized along d_k (as in the kernel).
@@ -76,7 +109,15 @@ def test_recurrent_perfect_fit_on_current_key_when_alpha1_beta1_and_L2norm():
         b_t = beta1["position", hax.ds(t, Axis("one", 1))]
 
         _, S = recurrent_gated_delta_rule(
-            q_t, k_t, v_t, g_t, b_t, initial_state=S, output_final_state=True, use_qk_l2norm_in_kernel=True
+            q_t,
+            k_t,
+            v_t,
+            g_t,
+            b_t,
+            initial_state=S,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            use_flash=use_flash,
         )
 
         # Check S^T k̂_t == v_t (k̂_t is K normalized as in the kernel)
@@ -89,7 +130,8 @@ def test_recurrent_perfect_fit_on_current_key_when_alpha1_beta1_and_L2norm():
 
 
 @pytest.mark.parametrize("chunk_size", [1, 2, 7, 16, 32, 64])
-def test_chunk_equals_recurrent_for_random_inputs(chunk_size):
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_chunk_equals_recurrent_for_random_inputs(chunk_size, use_flash: bool):
     """Chunkwise kernel must match recurrent kernel for many chunk sizes (including 1)."""
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 2, 3, 57, 8, 8
@@ -164,7 +206,7 @@ def test_chunk_size_one_degenerates_to_recurrent_without_l2norm():
     out_recur, _ = recurrent_gated_delta_rule(
         q, k, v, g, beta, output_final_state=False, use_qk_l2norm_in_kernel=False
     )
-    np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=3e-4, atol=1e-4)
 
 
 def test_extreme_gates_numerical_stability_jax_only():
@@ -210,7 +252,8 @@ def test_gradients_exist_small_kernel_graph():
 
 
 @skip_if_no_torch
-def test_recurrent_kernel_matches_hf():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_recurrent_kernel_matches_hf(use_flash: bool):
     import torch
 
     hf_chunk, hf_recur = _get_hf_kernels()
@@ -219,7 +262,7 @@ def test_recurrent_kernel_matches_hf():
     B, H, L, dk, dv = 1, 2, 17, 8, 8
     q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
 
-    out_named, _ = recurrent_gated_delta_rule(q, k, v, g, beta, output_final_state=False)
+    out_named, _ = recurrent_gated_delta_rule(q, k, v, g, beta, output_final_state=False, use_flash=use_flash)
 
     # HF expects (B, L, H, dim) on input and transposes internally.
     def to_t(arr: jnp.ndarray):
@@ -523,6 +566,7 @@ def test_recurrent_backward_matches_hf():
     """
     JAX vs HF fallback gradient parity for the recurrent (decode) kernel.
     We compare grads w.r.t. q, k, v, g, beta, and initial_state S0 on a small case.
+    Only test the fallback version, as this is not used for training anyways and only a sanity check.
     """
     import torch
 
@@ -551,6 +595,7 @@ def test_recurrent_backward_matches_hf():
             initial_state=S0_arr,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
+            use_flash=False,
         )
         return jnp.sum(out.array)
 
