@@ -28,12 +28,12 @@ classifiers = [
 ]
 
 dependencies = [
-    "haliax>=1.4.dev443",
+    "haliax>=1.4.dev450",
     "equinox>=0.11.7,!=0.12.0",
     "jax>=0.6.2,!=0.7.0,!=0.7.1",
     "jaxtyping>=0.2.34",
     "tokenizers>=0.15.2",
-    "transformers>=4.57.0,<5.0",
+    "transformers>=4.57.1,<5.0",
     "optax>=0.1.9",
     "wandb>=0.17.8",
     "draccus>=0.11.5",
@@ -110,7 +110,7 @@ test = [
   "chex>=0.1.86",
   "httpx>=0.28.1",
   "pytest-profiling>=1.8.1",
-  "trackio",
+  "trackio>=0.5.0",
 ]
 
 docs = [
