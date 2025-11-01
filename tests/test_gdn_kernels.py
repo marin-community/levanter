@@ -130,8 +130,7 @@ def test_recurrent_perfect_fit_on_current_key_when_alpha1_beta1_and_L2norm(use_f
 
 
 @pytest.mark.parametrize("chunk_size", [1, 2, 7, 16, 32, 64])
-@pytest.mark.parametrize("use_flash", [True, False])
-def test_chunk_equals_recurrent_for_random_inputs(chunk_size, use_flash: bool):
+def test_chunk_equals_recurrent_for_random_inputs(chunk_size):
     """Chunkwise kernel must match recurrent kernel for many chunk sizes (including 1)."""
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 2, 3, 57, 8, 8
