@@ -1226,170 +1226,282 @@ def _chunk_gated_delta_rule_reference(
     return (out_final, S) if output_final_state else (out_final, None)
 
 
-def _ceil_div(x: int, y: int) -> int:
-    return (x + y - 1) // y
+def _build_T_from_kbeta(
+    k_c: jnp.ndarray,  # (C, K)  L2-normalized K for this chunk (fp32)
+    b_c: jnp.ndarray,  # (C,)    beta for this chunk (fp32)
+    g_cum: jnp.ndarray,  # (C,)    cumulative g within chunk (fp32)
+    *,
+    K: int,
+    BK: int,
+) -> jnp.ndarray:
+    """Build T = (I - A)^(-1) for a chunk with only static-shape slices (Pallas-safe)."""
+    C = k_c.shape[0]
+
+    # --- A[i,j] = -exp(g_i - g_j) * <kβ_i, k_j> for j < i; else 0 ---
+    def dot_full(i, j):
+        # <kβ_i, k_j> = b_i * <k_i, k_j>, reduced over K in BK tiles
+        def body(kb2, s):
+            kk = kb2 * BK
+            ki = lax.dynamic_slice(k_c, (i, kk), (1, BK))[0]  # (BK,)
+            kj = lax.dynamic_slice(k_c, (j, kk), (1, BK))[0]  # (BK,)
+            return s + jnp.sum((b_c[i] * ki) * kj, dtype=jnp.float32)
+
+        n_kb2 = (K + BK - 1) // BK
+        return lax.fori_loop(0, n_kb2, body, jnp.array(0.0, jnp.float32))
+
+    # Fill A one row at a time, writing only j<i
+    A = jnp.zeros((C, C), dtype=jnp.float32)
+
+    def fill_A_row(i, A_cur):
+        row = jnp.zeros((C,), dtype=jnp.float32)
+
+        def inner(j, r):
+            coeff = -jnp.exp(g_cum[i] - g_cum[j]) * dot_full(i, j)
+            return r.at[j].set(coeff)
+
+        row = lax.fori_loop(0, i, inner, row)  # j = 0..i-1
+        return lax.dynamic_update_slice(A_cur, row[None, :], (i, 0))
+
+    A = lax.fori_loop(1, C, fill_A_row, A)
+
+    # --- Forward substitution to get T - I, row by row ---
+    # Invariant: after processing i-1, TL[:i,:] holds (T - I) rows 0..i-1.
+    TL = A
+
+    def fwd_sub_row(i, TL_cur):
+        row = lax.dynamic_slice(TL_cur, (i, 0), (1, C))[0]  # A[i,:]
+        # zero out entries >= i so 'row @ TL_cur' only uses j < i automatically
+        ar = lax.broadcasted_iota(jnp.int32, (C,), 0)
+        m1 = (ar < jnp.int32(i)).astype(jnp.float32)
+        row_pref = row * m1  # (C,)
+        incr = row_pref @ TL_cur  # (C,) == Σ_{j<i} row[j] * TL[j,:]
+        row_new = row + incr * m1  # keep strictly-lower structure
+        return lax.dynamic_update_slice(TL_cur, row_new[None, :], (i, 0))
+
+    TL = lax.fori_loop(1, C, fwd_sub_row, TL)
+    T = TL + jnp.eye(C, dtype=jnp.float32)
+    return T
 
 
-@dataclass(frozen=True)
-class _Tiles:
-    BK: int = 64
-    BV: int = 64
+# --- per-chunk UT to form yk = T @ (βK ⊙ exp(g_cum)) ---
+def _gdn_chunk_prepare_yk_kernel(
+    k_ref,  # [NH, T_pad, K]
+    g_ref,  # [NH, T_pad]
+    beta_ref,  # [NH, T_pad]
+    yk_ref,  # [NH, Nc, C, K]  (output)
+    *,
+    T_pad: int,
+    K: int,
+    chunk_len: int,
+    BK: int,
+):
+    nhc = pl.program_id(0)
+    kt = pl.program_id(1)
+    Nc = T_pad // chunk_len
+    nh = nhc // Nc
+    ci = nhc - nh * Nc
+    k0 = kt * BK  # K-tile start (BK already clamped ≤ K)
+
+    c0 = ci * chunk_len
+    k_c = k_ref[dslice(nh, 1), dslice(c0, chunk_len), dslice(0, K)][0].astype(jnp.float32)  # (C,K)
+    g_c = g_ref[dslice(nh, 1), dslice(c0, chunk_len)][0].astype(jnp.float32)  # (C,)
+    b_c = beta_ref[dslice(nh, 1), dslice(c0, chunk_len)][0].astype(jnp.float32)  # (C,)
+
+    g_cum = jnp.cumsum(g_c, axis=0).astype(jnp.float32)
+    Tmat = _build_T_from_kbeta(k_c, b_c, g_cum, K=K, BK=BK)  # (C,C)
+
+    # rhs for YK: (β K) ⊙ exp(g_cum) row-wise
+    rhs_blk = jnp.exp(g_cum)[:, None] * (k_c * b_c[:, None])  # (C,K)
+    rhs_tile = lax.dynamic_slice(rhs_blk, (0, k0), (chunk_len, BK))  # (C,BK)
+
+    # YK_tile = T @ rhs_tile  → (C, BK)
+    # Implement as explicit sum to maintain identical accumulation order across dtypes
+    def col_body(c, acc):
+        col = lax.dynamic_slice(rhs_tile, (0, c), (chunk_len, 1))[:, 0]  # (C,)
+        y = Tmat @ col  # (C,)
+        return acc.at[:, c].set(y)
+
+    yk_tile = jnp.zeros((chunk_len, BK), dtype=jnp.float32)
+    yk_tile = lax.fori_loop(0, BK, col_body, yk_tile)
+
+    yk_ref[dslice(nhc, 1), dslice(ci, 1), dslice(0, chunk_len), dslice(k0, BK)] = yk_tile[None, None, :, :]
 
 
-def _pick_tiles(dk: int, dv: int) -> _Tiles:
-    bk = 64 if dk >= 128 else 32
-    bv = 64 if dv >= 128 else 32
-    return _Tiles(BK=bk, BV=bv)
+def _prepare_yk_pallas(k_flat, g_flat, b_flat, *, T_pad, K, chunk_len, BK):
+    NH = k_flat.shape[0]
+    Nc = T_pad // chunk_len
+    out_yk = jnp.zeros((NH, Nc, chunk_len, K), dtype=jnp.float32)
+
+    grid = (NH * Nc, (K + BK - 1) // BK)
+    (out_yk,) = pl.pallas_call(
+        functools.partial(
+            _gdn_chunk_prepare_yk_kernel,
+            T_pad=T_pad,
+            K=K,
+            chunk_len=int(chunk_len),
+            BK=int(BK),
+        ),
+        out_shape=(jax.ShapeDtypeStruct(out_yk.shape, out_yk.dtype),),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((1, T_pad, K), lambda nhc, kt: (nhc // Nc, 0, 0)),  # k
+            pl.BlockSpec((1, T_pad), lambda nhc, kt: (nhc // Nc, 0)),  # g
+            pl.BlockSpec((1, T_pad), lambda nhc, kt: (nhc // Nc, 0)),  # β
+        ),
+        out_specs=(pl.BlockSpec((1, 1, chunk_len, BK), lambda nhc, kt: (nhc // Nc, nhc % Nc, 0, kt * BK)),),
+        interpret=_should_interpret_pallas(),
+    )(k_flat, g_flat, b_flat)
+    return out_yk
 
 
-def _pad_L_axis(x: jnp.ndarray, width: int) -> jnp.ndarray:
-    if width <= 0:
-        return x
-    if x.ndim == 2:  # [NH, L]
-        return jnp.pad(x, ((0, 0), (0, width)))
-    elif x.ndim == 3:  # [NH, L, D]
-        return jnp.pad(x, ((0, 0), (0, width), (0, 0)))
-    elif x.ndim == 4:  # [B, H, L, D]
-        return jnp.pad(x, ((0, 0), (0, 0), (0, width), (0, 0)))
-    else:
-        raise ValueError(f"Unexpected rank for length-padding: {x.ndim}")
-
-
-def _gdn_chunk_fwd_kernel(
-    q_ref,  # [NH, T_pad, K]
+def _gdn_chunk_prepare_yv_kernel(
     k_ref,  # [NH, T_pad, K]
     v_ref,  # [NH, T_pad, V]
     g_ref,  # [NH, T_pad]
     beta_ref,  # [NH, T_pad]
-    init_ref,  # [NH, K, V]
-    lengths_ref,  # [NH]  (real lengths, but we rely on zero padding)
-    out_ref,  # [NH, T_pad, V]
-    final_ref,  # [NH, K, V]
+    yv_ref,  # [NH, Nc, C, V]
     *,
     T_pad: int,
     K: int,
     V: int,
     chunk_len: int,
-    head_first: bool,
-    store_final_state: bool,
-    use_qk_l2norm_in_kernel: bool,
-    BK: int,
-    BV: int,
+    BK: int,  # used to scan K for dot_ij
+    BV: int,  # V tile
 ):
-    nh = pl.program_id(axis=0)
+    nhc = pl.program_id(0)
+    vt = pl.program_id(1)
+    Nc = T_pad // chunk_len
+    nh = nhc // Nc
+    ci = nhc - nh * Nc
+    v0 = vt * BV  # V-tile start (BV already clamped ≤ V)
 
-    # Per-(seq,head) views (depend on refs → no capture)
-    q_view = q_ref[dslice(nh, 1), dslice(0, T_pad), dslice(0, K)][0]
-    k_view = k_ref[dslice(nh, 1), dslice(0, T_pad), dslice(0, K)][0]
-    v_view = v_ref[dslice(nh, 1), dslice(0, T_pad), dslice(0, V)][0]
-    g_view = g_ref[dslice(nh, 1), dslice(0, T_pad)][0]
-    b_view = beta_ref[dslice(nh, 1), dslice(0, T_pad)][0]
+    c0 = ci * chunk_len
+    k_c = k_ref[dslice(nh, 1), dslice(c0, chunk_len), dslice(0, K)][0].astype(jnp.float32)  # (C,K)
+    v_c = v_ref[dslice(nh, 1), dslice(c0, chunk_len), dslice(0, V)][0].astype(jnp.float32)  # (C,V)
+    g_c = g_ref[dslice(nh, 1), dslice(c0, chunk_len)][0].astype(jnp.float32)
+    b_c = beta_ref[dslice(nh, 1), dslice(c0, chunk_len)][0].astype(jnp.float32)
 
-    # FP32 state S
-    S = init_ref[dslice(nh, 1), dslice(0, K), dslice(0, V)][0].astype(jnp.float32)
+    g_cum = jnp.cumsum(g_c, axis=0).astype(jnp.float32)
+    Tmat = _build_T_from_kbeta(k_c, b_c, g_cum, K=K, BK=BK)  # (C,C)
 
-    # “zero” scratch derived from inputs (no captured zero)
-    out_tile = v_view * (g_view[:, None] - g_view[:, None])  # [T_pad, V], all zeros
+    rhs_blk = v_c * b_c[:, None]  # (C,V)
+    rhs_tile = lax.dynamic_slice(rhs_blk, (0, v0), (chunk_len, BV))  # (C,BV)
 
-    # 1/sqrt(K) passed as kwarg would be nice, but this constant is tiny and stable
-    # Make it an input-like traced scalar: multiply sum-by-sum to get 1 then divide by sqrt(K)
-    # However, to keep things simple and JAX-friendly, do this:
-    scale = jnp.asarray(1.0 / jnp.sqrt(K), dtype=jnp.float32)
+    def col_body(c, acc):
+        col = lax.dynamic_slice(rhs_tile, (0, c), (chunk_len, 1))[:, 0]  # (C,)
+        y = Tmat @ col  # (C,)
+        return acc.at[:, c].set(y)
 
-    nchunks_max = T_pad // chunk_len
+    yv_tile = jnp.zeros((chunk_len, BV), dtype=jnp.float32)
+    yv_tile = lax.fori_loop(0, BV, col_body, yv_tile)
 
-    def chunk_body(c_idx, carry):
-        S_carry, out_tile_carry = carry
-        # dynamic indices only: derive zero from c_start
-        c_start = c_idx * chunk_len
-        zero_col_dyn = c_start - c_start
-
-        # Fixed-size chunk slices
-        q_c = lax.dynamic_slice(q_view, (c_start, zero_col_dyn), (chunk_len, K)).astype(jnp.float32)
-        k_c = lax.dynamic_slice(k_view, (c_start, zero_col_dyn), (chunk_len, K)).astype(jnp.float32)
-        v_c = lax.dynamic_slice(v_view, (c_start, zero_col_dyn), (chunk_len, V)).astype(jnp.float32)
-        g_c = lax.dynamic_slice(g_view, (c_start,), (chunk_len,)).astype(jnp.float32)
-        b_c = lax.dynamic_slice(b_view, (c_start,), (chunk_len,)).astype(jnp.float32)
-
-        # Optional L2-norm + scale
-        if use_qk_l2norm_in_kernel:
-            qn = jnp.sqrt(jnp.sum(q_c * q_c, axis=1, keepdims=True) + 1e-6)
-            kn = jnp.sqrt(jnp.sum(k_c * k_c, axis=1, keepdims=True) + 1e-6)
-            q_c = q_c / jnp.where(qn > 0, qn, 1.0)
-            k_c = k_c / jnp.where(kn > 0, kn, 1.0)
-        q_c = q_c * scale
-
-        # Chunkwise cumsum/exp
-        g_cum = jnp.cumsum(g_c, axis=0)  # (C,)
-        eg_cum = jnp.exp(g_cum)  # (C,)
-
-        v_beta = v_c * b_c[:, None]  # (C,V)
-        k_beta = k_c * b_c[:, None]  # (C,K)
-
-        # UT buffers as "zeros" from inputs
-        yv = v_c * (g_c[:, None] - g_c[:, None])  # (C,V)
-        yk = k_c * (g_c[:, None] - g_c[:, None])  # (C,K)
-
-        def ut_row_update(i, carry_ut):
-            yv_cur, yk_cur = carry_ut
-
-            # accumulate over j < i
-            def acc_j(j, acc):
-                acc_v, acc_k = acc
-                dot_ij = jnp.dot(k_beta[i], k_c[j])
-                coeff = -dot_ij * jnp.exp(g_cum[i] - g_cum[j])
-                acc_v = acc_v + coeff * yv_cur[j]
-                acc_k = acc_k + coeff * yk_cur[j]
-                return (acc_v, acc_k)
-
-            zero_v = v_c[0] * (g_c[0] - g_c[0])
-            zero_k = k_c[0] * (g_c[0] - g_c[0])
-            acc_v, acc_k = lax.fori_loop(0, i, acc_j, (zero_v, zero_k))
-            yv_cur = yv_cur.at[i].set(v_beta[i] + acc_v)
-            yk_cur = yk_cur.at[i].set(k_beta[i] * eg_cum[i] + acc_k)
-            return (yv_cur, yk_cur)
-
-        # device loop over rows
-        yv, yk = lax.fori_loop(0, chunk_len, ut_row_update, (yv, yk))
-
-        # ---- bridge with cross-chunk S and compute outputs ----
-        qexp = q_c * eg_cum[:, None]
-        v_prime = yk @ S_carry
-        inter = qexp @ S_carry
-
-        # lower-triangular (incl. diagonal) attention-like term (vectorized)
-        attn_raw = (q_c @ k_c.T) * jnp.exp(g_cum[:, None] - g_cum[None, :])
-        idx_i = lax.broadcasted_iota(jnp.int32, (chunk_len, chunk_len), 0)
-        idx_j = lax.broadcasted_iota(jnp.int32, (chunk_len, chunk_len), 1)
-        zero_scalar = jnp.sum(g_c[:1] - g_c[:1])
-        attn = jnp.where(idx_i >= idx_j, attn_raw, zero_scalar)
-        v_new = yv - v_prime
-        out_chunk = inter + attn @ v_new
-
-        # write chunk result
-        out_tile_next = lax.dynamic_update_slice(
-            out_tile_carry, out_chunk.astype(out_ref.dtype), (c_start, zero_col_dyn)
-        )
-
-        # ---- Update S ----
-        g_tail = jnp.sum(g_c, axis=0)
-        decay_tail = jnp.exp(g_tail)
-        S_carry = S_carry * decay_tail
-        dw_full = jnp.exp(g_tail - g_cum)
-        k_scaled = k_c * dw_full[:, None]
-        S_carry = S_carry + k_scaled.T @ v_new
-
-        return (S_carry, out_tile_next)
-
-    S, out_tile = lax.fori_loop(0, nchunks_max, chunk_body, (S, out_tile))
-
-    # final writes (add singleton to match NDIndexer slice)
-    out_ref[dslice(nh, 1), dslice(0, T_pad), dslice(0, V)] = out_tile[None, :, :]
-    if store_final_state:
-        final_ref[dslice(nh, 1), dslice(0, K), dslice(0, V)] = S.astype(final_ref.dtype)[None, :, :]
+    yv_ref[dslice(nhc, 1), dslice(ci, 1), dslice(0, chunk_len), dslice(v0, BV)] = yv_tile[None, None, :, :]
 
 
-def _chunk_gated_delta_rule_flash_tiled(
+def _prepare_yv_pallas(k_flat, v_flat, g_flat, b_flat, *, T_pad, K, V, chunk_len, BK, BV):
+    NH = k_flat.shape[0]
+    Nc = T_pad // chunk_len
+    out_yv = jnp.zeros((NH, Nc, chunk_len, V), dtype=jnp.float32)
+
+    grid = (NH * Nc, (V + BV - 1) // BV)
+    (out_yv,) = pl.pallas_call(
+        functools.partial(
+            _gdn_chunk_prepare_yv_kernel,
+            T_pad=T_pad,
+            K=K,
+            V=V,
+            chunk_len=int(chunk_len),
+            BK=int(BK),
+            BV=int(BV),
+        ),
+        out_shape=(jax.ShapeDtypeStruct(out_yv.shape, out_yv.dtype),),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((1, T_pad, K), lambda nhc, vt: (nhc // (T_pad // chunk_len), 0, 0)),  # k
+            pl.BlockSpec((1, T_pad, V), lambda nhc, vt: (nhc // (T_pad // chunk_len), 0, 0)),  # v
+            pl.BlockSpec((1, T_pad), lambda nhc, vt: (nhc // (T_pad // chunk_len), 0)),  # g
+            pl.BlockSpec((1, T_pad), lambda nhc, vt: (nhc // (T_pad // chunk_len), 0)),  # β
+        ),
+        out_specs=(
+            pl.BlockSpec(
+                (1, 1, chunk_len, BV),
+                lambda nhc, vt: (nhc // (T_pad // chunk_len), nhc % (T_pad // chunk_len), 0, vt * BV),
+            ),
+        ),
+        interpret=_should_interpret_pallas(),
+    )(k_flat, v_flat, g_flat, b_flat)
+    return out_yv
+
+
+def _gdn_chunk_bridge_reference_from_pseudo(
+    q_flat,
+    k_flat,
+    g_flat,
+    yk,
+    yv,  # [NH, Nc, C, K] / [NH, Nc, C, V]
+    *,
+    T_pad: int,
+    chunk_len: int,
+    initial_state: Optional[jnp.ndarray],
+    output_dtype: jnp.dtype,
+    output_final_state: bool,
+):
+    NH, L, K = q_flat.shape
+    V = yv.shape[-1]
+    Nc = T_pad // chunk_len
+    C = chunk_len
+
+    # State per sequence/head
+    S0 = jnp.zeros((NH, K, V), dtype=jnp.float32) if initial_state is None else initial_state.astype(jnp.float32)
+
+    # Convenience views
+    def slice_chunk(x, n, d=None):
+        c0 = n * C
+        if d is None:
+            return x[:, c0 : c0 + C]
+        else:
+            return x[:, c0 : c0 + C, :d]
+
+    outs = []
+    S = S0
+
+    for ci in range(Nc):
+        q_c = slice_chunk(q_flat, ci)  # [NH, C, K]
+        k_c = slice_chunk(k_flat, ci)  # [NH, C, K]
+        g_c = slice_chunk(g_flat, ci, d=None)  # [NH, C]
+        g_cum = jnp.cumsum(g_c, axis=1)  # [NH, C]
+        eg_cum = jnp.exp(g_cum)
+
+        yk_c = yk[:, ci]  # [NH, C, K]
+        yv_c = yv[:, ci]  # [NH, C, V]
+
+        # predicted by previous state within chunk & innovation
+        v_prime = jnp.einsum("nck,nkv->ncv", yk_c, S)  # [NH, C, V]
+        v_new = yv_c - v_prime
+
+        # inter-chunk term (from decayed state)
+        inter = jnp.einsum("nck,nkv->ncv", q_c * eg_cum[..., None], S)
+
+        # in-chunk "attention-like" strictly lower-triangular mixing with relative decays
+        # attn_ij = <q_i, k_j> * exp(g_cum[i] - g_cum[j]) for j<=i else 0
+        dots = jnp.einsum("nck,njk->ncj", q_c, k_c)  # [NH, C, C]
+        decay = jnp.exp(g_cum[..., None] - g_cum[:, None, :])  # [NH, C, C]
+        attn = dots * jnp.tril(decay)  # mask strict upper
+        out_c = inter + jnp.einsum("ncj,njv->ncv", attn, v_new)  # [NH, C, V]
+        outs.append(out_c.astype(output_dtype))
+
+        # state update to the next chunk
+        g_tail = g_cum[:, -1]  # [NH]
+        decay_tail = jnp.exp(g_tail)[:, None, None]  # [NH,1,1]
+        dw_full = jnp.exp(g_tail[:, None] - g_cum)  # [NH, C]
+        add = jnp.einsum("nck,ncv->nkv", k_c * dw_full[..., None], v_new)
+        S = S * decay_tail + add
+
+    out = jnp.concatenate(outs, axis=1)  # [NH, T_pad, V]
+    return (out, S) if output_final_state else (out, None)
+
+
+def _chunk_gated_delta_rule_flash_split(
     query,
     key,
     value,
@@ -1401,298 +1513,107 @@ def _chunk_gated_delta_rule_flash_tiled(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = True,
     head_first: bool = False,
-    offsets: Optional[jnp.ndarray] = None,
 ):
-    if not head_first:
-        Batch = query.resolve_axis("batch")
-        Pos = query.resolve_axis("position")
-        Heads = query.resolve_axis("heads")
-        Dk = query.resolve_axis("k_head_dim")
-        Dv = value.resolve_axis("v_head_dim")
-        B_, L_, H_, K_ = Batch.size, Pos.size, Heads.size, Dk.size
-        V_ = Dv.size
-        NH = B_ * H_
-
-        q_bhlk = hax.rearrange(query, (Batch, Heads, Pos, Dk)).array
-        k_bhlk = hax.rearrange(key, (Batch, Heads, Pos, Dk)).array
-        v_bhlv = hax.rearrange(value, (Batch, Heads, Pos, Dv)).array
-        g_bhl = hax.rearrange(g, (Batch, Heads, Pos)).array
-        b_bhl = hax.rearrange(beta, (Batch, Heads, Pos)).array
+    # Shapes & flatten BH→NH
+    if head_first:
+        B, H, L, K = query.shape[:4]
+        V = value.shape[-1]
+        q_bhlk, k_bhlk = query, key
+        v_bhlv = value
+        g_bhl, b_bhl = g, beta
     else:
-        Batch = query.resolve_axis("batch")
-        Heads = query.resolve_axis("heads")
-        Pos = query.resolve_axis("position")
-        Dk = query.resolve_axis("k_head_dim")
-        Dv = value.resolve_axis("v_head_dim")
-        B_, H_, L_, K_ = Batch.size, Heads.size, Pos.size, Dk.size
-        V_ = Dv.size
-        NH = B_ * H_
-        q_bhlk = query.array
-        k_bhlk = key.array
-        v_bhlv = value.array
-        g_bhl = g.array
-        b_bhl = beta.array
+        B, L, H, K = query.shape[:4]
+        V = value.shape[-1]
+        q_bhlk = jnp.transpose(query, (0, 2, 1, 3))  # [B,H,L,K]
+        k_bhlk = jnp.transpose(key, (0, 2, 1, 3))
+        v_bhlv = jnp.transpose(value, (0, 2, 1, 3))  # [B,H,L,V]
+        g_bhl = jnp.transpose(g, (0, 2, 1))  # [B,H,L]
+        b_bhl = jnp.transpose(beta, (0, 2, 1))
 
-    q_flat = q_bhlk.reshape(NH, L_, K_)
-    k_flat = k_bhlk.reshape(NH, L_, K_)
-    v_flat = v_bhlv.reshape(NH, L_, V_)
-    g_flat = g_bhl.reshape(NH, L_)
-    b_flat = b_bhl.reshape(NH, L_)
+    NH = B * H
+    q_flat = q_bhlk.reshape(NH, L, K).astype(jnp.float32)
+    k_flat = k_bhlk.reshape(NH, L, K).astype(jnp.float32)
+    v_flat = v_bhlv.reshape(NH, L, V).astype(jnp.float32)
+    g_flat = g_bhl.reshape(NH, L).astype(jnp.float32)
+    b_flat = b_bhl.reshape(NH, L).astype(jnp.float32)
 
-    lengths = (
-        jnp.full((NH,), L_, dtype=jnp.int32)
-        if offsets is None
-        else (offsets.astype(jnp.int32)[1:] - offsets.astype(jnp.int32)[:-1])
-    )
+    # Optional L2-norm + scaling (kept in JAX for simplicity; can be moved into kernels)
+    if use_qk_l2norm_in_kernel:
+        eps = 1e-6
+        qn = jnp.sqrt(jnp.sum(q_flat * q_flat, axis=-1, keepdims=True) + eps)
+        kn = jnp.sqrt(jnp.sum(k_flat * k_flat, axis=-1, keepdims=True) + eps)
+        q_flat = (q_flat / jnp.maximum(qn, 1.0)) * (K**-0.5)
+        k_flat = k_flat / jnp.maximum(kn, 1.0)
+    else:
+        q_flat = q_flat * (K**-0.5)
 
-    T_pad = int(_ceil_div(L_, chunk_size) * chunk_size)
-    pad_amt = T_pad - L_
-    q_flat = _pad_L_axis(q_flat, pad_amt)
-    k_flat = _pad_L_axis(k_flat, pad_amt)
-    v_flat = _pad_L_axis(v_flat, pad_amt)
-    g_flat = _pad_L_axis(g_flat, pad_amt)
-    b_flat = _pad_L_axis(b_flat, pad_amt)
+    # Pad L to multiple of C
+    C = int(chunk_size)
+    Nc = (L + C - 1) // C
+    T_pad = Nc * C
 
-    init_flat = (
-        jnp.zeros((NH, K_, V_), dtype=jnp.float32)
-        if initial_state is None
-        else initial_state.reshape(NH, K_, V_).astype(jnp.float32)
-    )
+    def _pad_last(x, width, val=0.0):
+        pad = T_pad - width
+        if pad == 0:
+            return x
+        if x.ndim == 2:
+            return jnp.pad(x, ((0, 0), (0, pad)))
+        if x.ndim == 3:
+            return jnp.pad(x, ((0, 0), (0, pad), (0, 0)))
+        raise ValueError
 
-    tiles = _pick_tiles(K_, V_)
-    BK, BV = int(tiles.BK), int(tiles.BV)
+    q_flat = _pad_last(q_flat, L)
+    k_flat = _pad_last(k_flat, L)
+    v_flat = _pad_last(v_flat, L)
+    g_flat = _pad_last(g_flat, L)
+    b_flat = _pad_last(b_flat, L)
 
-    out_struct = jax.ShapeDtypeStruct((NH, T_pad, V_), value.dtype)
-    final_struct = jax.ShapeDtypeStruct((NH, K_, V_), jnp.float32)
+    # --- Choose tiles (can be autotuned later) ---
+    BK = min(64 if K >= 128 else 32, K)
+    BV = min(64 if V >= 128 else 32, V)
 
-    kernel_partial = functools.partial(
-        _gdn_chunk_fwd_kernel,
+    # --- Stage A: UT for YK and YV with grid tiling ---
+    yk = _prepare_yk_pallas(k_flat, g_flat, b_flat, T_pad=T_pad, K=K, chunk_len=C, BK=BK)  # [NH,Nc,C,K]
+    yv = _prepare_yv_pallas(k_flat, v_flat, g_flat, b_flat, T_pad=T_pad, K=K, V=V, chunk_len=C, BK=BK, BV=BV)
+
+    # --- Stage B: Bridge + outputs from pseudo streams ---
+    out_flat, S_final = _gdn_chunk_bridge_reference_from_pseudo(
+        q_flat,
+        k_flat,
+        g_flat,
+        yk,
+        yv,
         T_pad=T_pad,
-        K=K_,
-        V=V_,
-        chunk_len=int(chunk_size),
-        head_first=head_first,
-        store_final_state=output_final_state,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        BK=BK,
-        BV=BV,
-    )
-
-    out_flat, final_flat = pl.pallas_call(
-        kernel_partial,
-        out_shape=(out_struct, final_struct),
-        grid=(NH,),
-        in_specs=(
-            pl.BlockSpec((1, T_pad, K_), lambda bid: (bid, 0, 0)),
-            pl.BlockSpec((1, T_pad, K_), lambda bid: (bid, 0, 0)),
-            pl.BlockSpec((1, T_pad, V_), lambda bid: (bid, 0, 0)),
-            pl.BlockSpec((1, T_pad), lambda bid: (bid, 0)),
-            pl.BlockSpec((1, T_pad), lambda bid: (bid, 0)),
-            pl.BlockSpec((1, K_, V_), lambda bid: (bid, 0, 0)),
-            pl.BlockSpec((1,), lambda bid: (bid,)),  # lengths
-        ),
-        out_specs=(
-            pl.BlockSpec((1, T_pad, V_), lambda bid: (bid, 0, 0)),
-            pl.BlockSpec((1, K_, V_), lambda bid: (bid, 0, 0)),
-        ),
-        interpret=_should_interpret_pallas(),
-    )(q_flat, k_flat, v_flat, g_flat, b_flat, init_flat, lengths)
-
-    out_trim = out_flat[:, :L_, :]
-    if not head_first:
-        out_bhLv = out_trim.reshape(B_, H_, L_, V_)
-        out_named = hax.named(out_bhLv, (Batch, Heads, Pos, Dv))
-        out_final = hax.rearrange(out_named, (Batch, Pos, Heads, Dv))
-        final = final_flat.reshape(B_, H_, K_, V_) if output_final_state else None
-        return out_final, final
-    else:
-        out_bHLv = out_trim.reshape(B_, H_, L_, V_)
-        out_named = hax.named(out_bHLv, (Batch, Heads, Pos, Dv))
-        final = final_flat.reshape(B_, H_, K_, V_) if output_final_state else None
-        return out_named, final
-
-
-@functools.partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10, 11))
-def _chunk_gdn_flash_array(
-    q_arr: jnp.ndarray,  # [B,L,H,K] or [B,H,L,K]
-    k_arr: jnp.ndarray,
-    v_arr: jnp.ndarray,
-    g_arr: jnp.ndarray,  # [B,L,H] or [B,H,L]
-    beta_arr: jnp.ndarray,  # [B,L,H] or [B,H,L]
-    initial_state: Optional[jnp.ndarray],  # [B,H,K,V]
-    chunk_size: int,
-    output_final_state: bool,
-    use_qk_l2norm_in_kernel: bool,
-    head_first: bool,
-    use_varlen: bool,
-    offsets: Optional[jnp.ndarray],
-):
-    if not head_first:
-        Batch = Axis("batch", q_arr.shape[0])
-        Pos = Axis("position", q_arr.shape[1])
-        Heads = Axis("heads", q_arr.shape[2])
-        Dk = Axis("k_head_dim", q_arr.shape[3])
-        Dv = Axis("v_head_dim", v_arr.shape[3])
-        q = hax.named(q_arr, (Batch, Pos, Heads, Dk))
-        k = hax.named(k_arr, (Batch, Pos, Heads, Dk))
-        v = hax.named(v_arr, (Batch, Pos, Heads, Dv))
-        gg = hax.named(g_arr, (Batch, Pos, Heads))
-        bb = hax.named(beta_arr, (Batch, Pos, Heads))
-    else:
-        Batch = Axis("batch", q_arr.shape[0])
-        Heads = Axis("heads", q_arr.shape[1])
-        Pos = Axis("position", q_arr.shape[2])
-        Dk = Axis("k_head_dim", q_arr.shape[3])
-        Dv = Axis("v_head_dim", v_arr.shape[3])
-        q = hax.named(q_arr, (Batch, Heads, Pos, Dk))
-        k = hax.named(k_arr, (Batch, Heads, Pos, Dk))
-        v = hax.named(v_arr, (Batch, Heads, Pos, Dv))
-        gg = hax.named(g_arr, (Batch, Heads, Pos))
-        bb = hax.named(beta_arr, (Batch, Heads, Pos))
-
-    out_named, final = _chunk_gated_delta_rule_flash_tiled(
-        q,
-        k,
-        v,
-        gg,
-        bb,
-        chunk_size=chunk_size,
-        initial_state=initial_state,
+        chunk_len=C,
+        initial_state=(None if initial_state is None else initial_state.reshape(NH, K, V)),
+        output_dtype=value.dtype,
         output_final_state=output_final_state,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        head_first=head_first,
-        offsets=offsets if use_varlen else None,
     )
-    return out_named.array, final
+
+    # Trim and reshape back to [B, Pos, H, V]
+    out_trim = out_flat[:, :L, :]
+    out_bHLv = out_trim.reshape(B, H, L, V)
+    out_named = out_bHLv if head_first else jnp.transpose(out_bHLv, (0, 2, 1, 3))
+    S_out = None if not output_final_state else S_final.reshape(B, H, K, V)
+    return out_named, S_out
 
 
-def _chunk_gdn_flash_array_fwd(
-    q_arr,
-    k_arr,
-    v_arr,
-    g_arr,
-    beta_arr,
-    initial_state,
-    chunk_size,
-    output_final_state,
-    use_qk_l2norm_in_kernel,
-    head_first,
-    use_varlen,
-    offsets,
-):
-    out_arr, final = _chunk_gdn_flash_array(
-        q_arr,
-        k_arr,
-        v_arr,
-        g_arr,
-        beta_arr,
-        initial_state,
-        chunk_size,
-        output_final_state,
-        use_qk_l2norm_in_kernel,
-        head_first,
-        use_varlen,
-        offsets,
-    )
-    residual = (
-        q_arr,
-        k_arr,
-        v_arr,
-        g_arr,
-        beta_arr,
-        initial_state,
-        chunk_size,
-        use_qk_l2norm_in_kernel,
-        head_first,
-        use_varlen,
-        offsets,
-    )
-    return (out_arr, final), residual
-
-
-def _chunk_gdn_flash_array_bwd(
-    chunk_size,
-    output_final_state,
-    use_qk_l2norm_in_kernel,
-    head_first,
-    use_varlen,
-    offsets,
-    residual,
-    tangents,
-):
-    (
-        q_arr,
-        k_arr,
-        v_arr,
-        g_arr,
-        beta_arr,
-        init_arr,
-        chunk_size_res,
-        use_norm_res,
-        head_first_res,
-        use_varlen_res,
-        offsets_res,
-    ) = residual
-    dout, dfinal = tangents
-
-    # Rematerialize via reference kernel for VJP (memory friendly and already parity-checked)
-    Batch = Axis("batch", q_arr.shape[0])
-    if not head_first_res:
-        Pos = Axis("position", q_arr.shape[1])
-        Heads = Axis("heads", q_arr.shape[2])
-        Dk = Axis("k_head_dim", q_arr.shape[3])
-        Dv = Axis("v_head_dim", v_arr.shape[3])
-        qn = hax.named(q_arr, (Batch, Pos, Heads, Dk))
-        kn = hax.named(k_arr, (Batch, Pos, Heads, Dk))
-        vn = hax.named(v_arr, (Batch, Pos, Heads, Dv))
-        gn = hax.named(g_arr, (Batch, Pos, Heads))
-        bn = hax.named(beta_arr, (Batch, Pos, Heads))
+def _wrap_chunk_out_as_named(out_arr, query, value, *, head_first: bool):
+    """Return the chunk output as NamedArray with the same axes as the reference path."""
+    if not head_first:
+        # out_arr is (B, L, H, V) and value.axes is (Batch, Position, Heads, VHeadDim)
+        return hax.named(out_arr, value.axes)
     else:
-        Heads = Axis("heads", q_arr.shape[1])
-        Pos = Axis("position", q_arr.shape[2])
-        Dk = Axis("k_head_dim", q_arr.shape[3])
-        Dv = Axis("v_head_dim", v_arr.shape[3])
-        qn = hax.named(q_arr, (Batch, Heads, Pos, Dk))
-        kn = hax.named(k_arr, (Batch, Heads, Pos, Dk))
-        vn = hax.named(v_arr, (Batch, Heads, Pos, Dv))
-        gn = hax.named(g_arr, (Batch, Heads, Pos))
-        bn = hax.named(beta_arr, (Batch, Heads, Pos))
-
-    def _ref_fun(q_in, k_in, v_in, g_in, beta_in, init_in):
-        out_ref, fin_ref = _chunk_gated_delta_rule_reference(
-            q_in,
-            k_in,
-            v_in,
-            g_in,
-            beta_in,
-            chunk_size=chunk_size_res,
-            initial_state=init_in,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=use_norm_res,
+        # out_arr is (B, H, L, V)
+        return hax.named(
+            out_arr,
+            (
+                query.resolve_axis("batch"),
+                query.resolve_axis("heads"),
+                query.resolve_axis("position"),
+                value.resolve_axis("v_head_dim"),
+            ),
         )
-        return out_ref.array, fin_ref
-
-    init_default = (
-        init_arr
-        if init_arr is not None
-        else jnp.zeros((q_arr.shape[0], q_arr.shape[2], q_arr.shape[3], v_arr.shape[3]), dtype=jnp.float32)
-    )
-    _, vjp_fun = jax.vjp(_ref_fun, qn, kn, vn, gn, bn, init_default)
-    dout_arr = dout if not isinstance(dout, NamedArray) else dout.array
-    dfinal_arr = jnp.zeros_like(init_default) if dfinal is None else dfinal
-    gq, gk, gv, gg, gb, ginit = vjp_fun((dout_arr, dfinal_arr))
-
-    return (
-        gq.array if isinstance(gq, NamedArray) else gq,
-        gk.array if isinstance(gk, NamedArray) else gk,
-        gv.array if isinstance(gv, NamedArray) else gv,
-        gg.array if isinstance(gg, NamedArray) else gg,
-        gb.array if isinstance(gb, NamedArray) else gb,
-        (None if init_arr is None else ginit),
-    )
-
-
-_chunk_gdn_flash_array.defvjp(_chunk_gdn_flash_array_fwd, _chunk_gdn_flash_array_bwd)
 
 
 def chunk_gated_delta_rule(
@@ -1712,33 +1633,19 @@ def chunk_gated_delta_rule(
     use_varlen: bool = False,
 ) -> tuple[NamedArray, Optional[jnp.ndarray]]:
     if use_flash:
-        out_arr, fin = _chunk_gdn_flash_array(
+        out_arr, fin = _chunk_gated_delta_rule_flash_split(
             query.array,
             key.array,
             value.array,
             g.array,
             beta.array,
-            initial_state,
-            chunk_size,
-            output_final_state,
-            use_qk_l2norm_in_kernel,
-            head_first,
-            use_varlen,
-            offsets,
+            chunk_size=chunk_size,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            head_first=head_first,
         )
-        out_named = hax.named(
-            out_arr,
-            (
-                value.axes
-                if not head_first
-                else (
-                    query.resolve_axis("batch"),
-                    query.resolve_axis("heads"),
-                    query.resolve_axis("position"),
-                    value.resolve_axis("v_head_dim"),
-                )
-            ),
-        )
+        out_named = _wrap_chunk_out_as_named(out_arr, query, value, head_first=head_first)
         return out_named, fin
 
     # reference fallback
