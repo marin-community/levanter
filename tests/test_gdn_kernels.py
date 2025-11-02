@@ -129,38 +129,74 @@ def test_recurrent_perfect_fit_on_current_key_when_alpha1_beta1_and_L2norm(use_f
         np.testing.assert_allclose(kv, v_arr, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parametrize("use_flash", [True, False])
 @pytest.mark.parametrize("chunk_size", [1, 2, 7, 16, 32, 64])
-def test_chunk_equals_recurrent_for_random_inputs(chunk_size):
+def test_chunk_equals_recurrent_for_random_inputs(chunk_size, use_flash):
     """Chunkwise kernel must match recurrent kernel for many chunk sizes (including 1)."""
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 2, 3, 57, 8, 8
     q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
 
     out_chunk, S_chunk = chunk_gated_delta_rule(
-        q, k, v, g, beta, chunk_size=chunk_size, output_final_state=True, use_qk_l2norm_in_kernel=True
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=chunk_size,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_flash=use_flash,
     )
     out_recur, S_recur = recurrent_gated_delta_rule(
-        q, k, v, g, beta, initial_state=None, output_final_state=True, use_qk_l2norm_in_kernel=True
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=None,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_flash=use_flash,
     )
 
     np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(S_chunk, S_recur, rtol=1e-4, atol=1e-4)
 
 
-def test_chunk_nondivisible_padding_matches_recurrent_jax_only():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_chunk_nondivisible_padding_matches_recurrent_jax_only(use_flash: bool):
     """When L % chunk_size != 0, padding path should still match the recurrent kernel (JAX-only)."""
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 2, 4, 61, 8, 16
     q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
 
     out_chunk, _ = chunk_gated_delta_rule(
-        q, k, v, g, beta, chunk_size=32, output_final_state=False, use_qk_l2norm_in_kernel=True
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=32,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+        use_flash=use_flash,
     )
-    out_recur, _ = recurrent_gated_delta_rule(q, k, v, g, beta, output_final_state=False, use_qk_l2norm_in_kernel=True)
+    out_recur, _ = recurrent_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+        use_flash=use_flash,
+    )
     np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-4, atol=1e-4)
 
 
-def test_chunk_continuation_two_pass_equals_one_pass():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_chunk_continuation_two_pass_equals_one_pass(use_flash: bool):
     """
     Run prefix → get S_mid → run suffix with initial_state, and match the one-pass result.
     Pure JAX: validates the initial_state continuation semantics of the chunk kernel.
@@ -172,7 +208,16 @@ def test_chunk_continuation_two_pass_equals_one_pass():
     q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
 
     # One pass over the full sequence
-    out_full, S_full = chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=chunk_size, output_final_state=True)
+    out_full, S_full = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=chunk_size,
+        output_final_state=True,
+        use_flash=use_flash,
+    )
 
     # Two-pass: prefix then suffix with initial_state
     q_pre, q_suf = q["position", hax.ds(0, split)], q["position", hax.ds(split, Axis("pos2", L - split))]
@@ -182,10 +227,25 @@ def test_chunk_continuation_two_pass_equals_one_pass():
     b_pre, b_suf = beta["position", hax.ds(0, split)], beta["position", hax.ds(split, Axis("pos2", L - split))]
 
     out_pre, S_mid = chunk_gated_delta_rule(
-        q_pre, k_pre, v_pre, g_pre, b_pre, chunk_size=chunk_size, output_final_state=True
+        q_pre,
+        k_pre,
+        v_pre,
+        g_pre,
+        b_pre,
+        chunk_size=chunk_size,
+        output_final_state=True,
+        use_flash=use_flash,
     )
     out_suf, S_end = chunk_gated_delta_rule(
-        q_suf, k_suf, v_suf, g_suf, b_suf, chunk_size=chunk_size, initial_state=S_mid, output_final_state=True
+        q_suf,
+        k_suf,
+        v_suf,
+        g_suf,
+        b_suf,
+        chunk_size=chunk_size,
+        initial_state=S_mid,
+        output_final_state=True,
+        use_flash=use_flash,
     )
 
     # Compare outputs on the suffix region and final states
@@ -194,21 +254,38 @@ def test_chunk_continuation_two_pass_equals_one_pass():
     np.testing.assert_allclose(S_end, S_full, rtol=1e-4, atol=1e-4)
 
 
-def test_chunk_size_one_degenerates_to_recurrent_without_l2norm():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_chunk_size_one_degenerates_to_recurrent_without_l2norm(use_flash: bool):
     """Degeneracy should also hold even when L2 norm is disabled."""
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 2, 2, 29, 8, 8
     q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
     out_chunk, _ = chunk_gated_delta_rule(
-        q, k, v, g, beta, chunk_size=1, output_final_state=False, use_qk_l2norm_in_kernel=False
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=1,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=False,
+        use_flash=use_flash,
     )
     out_recur, _ = recurrent_gated_delta_rule(
-        q, k, v, g, beta, output_final_state=False, use_qk_l2norm_in_kernel=False
+        q,
+        k,
+        v,
+        g,
+        beta,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=False,
+        use_flash=use_flash,
     )
     np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=3e-4, atol=1e-4)
 
 
-def test_extreme_gates_numerical_stability_jax_only():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_extreme_gates_numerical_stability_jax_only(use_flash: bool):
     """Outputs should be finite when α ≈ 0 (very negative g) and β near 0 or near 1."""
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 1, 2, 37, 16, 8
@@ -220,14 +297,32 @@ def test_extreme_gates_numerical_stability_jax_only():
     beta_big = hax.named(jnp.full((B, L, H), 1.0 - 1e-6, dtype=jnp.float32), ("batch", "position", "heads"))
 
     for beta in [beta_small, beta_big]:
-        out_chunk, _ = chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=32, output_final_state=False)
+        out_chunk, _ = chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            chunk_size=32,
+            output_final_state=False,
+            use_flash=use_flash,
+        )
         assert np.isfinite(np.array(out_chunk.array)).all()
 
-        out_recur, _ = recurrent_gated_delta_rule(q, k, v, g, beta, output_final_state=False)
+        out_recur, _ = recurrent_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            output_final_state=False,
+            use_flash=use_flash,
+        )
         assert np.isfinite(np.array(out_recur.array)).all()
 
 
-def test_gradients_exist_small_kernel_graph():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_gradients_exist_small_kernel_graph(use_flash: bool):
     """Smoke test: both kernels are differentiable w.r.t. inputs (no NaNs in grads)."""
     key = jax.random.PRNGKey(0)
     B, H, L, dk, dv = 1, 1, 7, 4, 4
@@ -236,17 +331,38 @@ def test_gradients_exist_small_kernel_graph():
     # grad wrt q only (keep the surface small)
     def loss_chunk(q_arr):
         qn = hax.named(q_arr, q.axes)
-        out, _ = chunk_gated_delta_rule(qn, k, v, g, beta, chunk_size=4, output_final_state=False)
+        out, _ = chunk_gated_delta_rule(
+            qn,
+            k,
+            v,
+            g,
+            beta,
+            chunk_size=4,
+            output_final_state=False,
+            use_flash=use_flash,
+        )
         return jnp.sum(out.array)
 
     def loss_recur(q_arr):
         qn = hax.named(q_arr, q.axes)
-        out, _ = recurrent_gated_delta_rule(qn, k, v, g, beta, output_final_state=False)
+        out, _ = recurrent_gated_delta_rule(
+            qn,
+            k,
+            v,
+            g,
+            beta,
+            output_final_state=False,
+            use_flash=use_flash,
+        )
         return jnp.sum(out.array)
 
     g1 = jax.grad(loss_chunk)(q.array)
-    g2 = jax.grad(loss_recur)(q.array)
     assert jnp.all(jnp.isfinite(g1))
+
+    if use_flash:
+        return
+
+    g2 = jax.grad(loss_recur)(q.array)
     assert jnp.all(jnp.isfinite(g2))
 
 
@@ -283,7 +399,8 @@ def test_recurrent_kernel_matches_hf(use_flash: bool):
 
 
 @skip_if_no_torch
-def test_chunk_kernel_matches_hf():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_chunk_kernel_matches_hf(use_flash: bool):
     import torch
 
     hf_chunk, hf_recur = _get_hf_kernels()
@@ -292,7 +409,16 @@ def test_chunk_kernel_matches_hf():
     B, H, L, dk, dv = 2, 4, 64, 8, 16
     q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
 
-    out_named, _ = chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=32, output_final_state=False)
+    out_named, _ = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=32,
+        output_final_state=False,
+        use_flash=use_flash,
+    )
 
     def to_t(arr: jnp.ndarray):
         return torch.from_numpy(np.array(arr))
@@ -314,7 +440,8 @@ def test_chunk_kernel_matches_hf():
 
 
 @skip_if_no_torch
-def test_chunk_kernel_matches_hf_non_divisible():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_chunk_kernel_matches_hf_non_divisible(use_flash: bool):
     """L not divisible by chunk_size should still match HF fallback (padding path)."""
     import torch
 
@@ -326,7 +453,16 @@ def test_chunk_kernel_matches_hf_non_divisible():
 
     q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
 
-    out_named, _ = chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=chunk_size, output_final_state=False)
+    out_named, _ = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=chunk_size,
+        output_final_state=False,
+        use_flash=use_flash,
+    )
 
     def to_t(arr: jnp.ndarray):
         return torch.from_numpy(np.array(arr))
@@ -348,7 +484,8 @@ def test_chunk_kernel_matches_hf_non_divisible():
 
 
 @skip_if_no_torch
-def test_chunk_size_one_matches_hf_recurrent():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_chunk_size_one_matches_hf_recurrent(use_flash: bool):
     """chunk_size=1 should degenerate to the recurrent rule."""
     import torch
 
@@ -358,8 +495,25 @@ def test_chunk_size_one_matches_hf_recurrent():
     B, H, L, dk, dv = 2, 2, 29, 8, 8
     q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
 
-    out_chunk, _ = chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=1, output_final_state=False)
-    out_recur, _ = recurrent_gated_delta_rule(q, k, v, g, beta, output_final_state=False)
+    out_chunk, _ = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=1,
+        output_final_state=False,
+        use_flash=use_flash,
+    )
+    out_recur, _ = recurrent_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        output_final_state=False,
+        use_flash=use_flash,
+    )
     np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-4, atol=1e-4)
 
     def to_t(arr: jnp.ndarray):
@@ -390,7 +544,8 @@ def test_chunk_size_one_matches_hf_recurrent():
 
 
 @skip_if_no_torch
-def test_chunk_kernel_with_initial_state_matches_recurrent_continuation():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_chunk_kernel_with_initial_state_matches_recurrent_continuation(use_flash: bool):
     """
     Provide an initial S0 and check chunk kernel == recurrent kernel on the same sequence.
     """
@@ -406,9 +561,26 @@ def test_chunk_kernel_with_initial_state_matches_recurrent_continuation():
     S0 = jax.random.normal(jax.random.PRNGKey(123), (B, H, dk, dv), dtype=jnp.float32) * 0.1
 
     out_chunk, _ = chunk_gated_delta_rule(
-        q, k, v, g, beta, chunk_size=chunk_size, initial_state=S0, output_final_state=False
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=chunk_size,
+        initial_state=S0,
+        output_final_state=False,
+        use_flash=use_flash,
     )
-    out_recur, _ = recurrent_gated_delta_rule(q, k, v, g, beta, initial_state=S0, output_final_state=False)
+    out_recur, _ = recurrent_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=S0,
+        output_final_state=False,
+        use_flash=use_flash,
+    )
     np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-4, atol=1e-4)
 
     def to_t(arr: jnp.ndarray):
@@ -440,7 +612,8 @@ def test_chunk_kernel_with_initial_state_matches_recurrent_continuation():
 
 
 @skip_if_no_torch
-def test_short_sequences_edge_cases():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_short_sequences_edge_cases(use_flash: bool):
     """Short L vs chunk_size and kernel-size behaviors."""
     import torch
 
@@ -452,7 +625,16 @@ def test_short_sequences_edge_cases():
         B, H, dk, dv = 2, 2, 8, 8
         q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
 
-        out_named, _ = chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=64, output_final_state=False)
+        out_named, _ = chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            chunk_size=64,
+            output_final_state=False,
+            use_flash=use_flash,
+        )
 
         def to_t(arr: jnp.ndarray):
             return torch.from_numpy(np.array(arr))
@@ -473,7 +655,8 @@ def test_short_sequences_edge_cases():
 
 
 @skip_if_no_torch
-def test_extreme_gates_no_nans_and_parity():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_extreme_gates_no_nans_and_parity(use_flash: bool):
     """Stress alpha = exp(g) close to 0 (very negative g) and beta near 0/1."""
     import torch
 
@@ -488,7 +671,16 @@ def test_extreme_gates_no_nans_and_parity():
     beta_big = hax.named(jnp.full((B, L, H), 1.0 - 1e-6, dtype=jnp.float32), ("batch", "position", "heads"))
 
     for beta in [beta_small, beta_big]:
-        out_named, _ = chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=32, output_final_state=False)
+        out_named, _ = chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            chunk_size=32,
+            output_final_state=False,
+            use_flash=use_flash,
+        )
 
         def to_t(arr: jnp.ndarray):
             return torch.from_numpy(np.array(arr))
@@ -509,7 +701,8 @@ def test_extreme_gates_no_nans_and_parity():
 
 
 @skip_if_no_torch
-def test_kernels_match_hf_without_l2norm():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_kernels_match_hf_without_l2norm(use_flash: bool):
     # TODO: fix edge case? although per original paper L2 norm is needed for stability
     pytest.skip("not matching HF implementation")
 
@@ -524,10 +717,25 @@ def test_kernels_match_hf_without_l2norm():
 
     # Haliax kernels with use_qk_l2norm_in_kernel=False
     out_chunk_j, _ = chunk_gated_delta_rule(
-        q, k, v, g, beta, chunk_size=32, output_final_state=False, use_qk_l2norm_in_kernel=False
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=32,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=False,
+        use_flash=use_flash,
     )
     out_recur_j, _ = recurrent_gated_delta_rule(
-        q, k, v, g, beta, output_final_state=False, use_qk_l2norm_in_kernel=False
+        q,
+        k,
+        v,
+        g,
+        beta,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=False,
+        use_flash=use_flash,
     )
 
     # HF fallback expects (B, L, H, dim) on input and transposes internally; don't move axes.
@@ -639,7 +847,8 @@ def test_recurrent_backward_matches_hf():
 
 
 @skip_if_no_torch
-def test_chunk_backward_matches_hf():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_chunk_backward_matches_hf(use_flash: bool):
     """
     JAX vs HF fallback gradient parity for the chunkwise kernel (two chunks).
     Includes gradients w.r.t. q, k, v, g, beta, and initial_state S0.
@@ -673,6 +882,7 @@ def test_chunk_backward_matches_hf():
             initial_state=S0_arr,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
+            use_flash=use_flash,
         )
         return jnp.sum(out.array)
 
