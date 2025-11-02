@@ -925,3 +925,308 @@ def test_chunk_backward_matches_hf(use_flash: bool):
     np.testing.assert_allclose(jg, tg, rtol=1e-4, atol=5e-6)
     np.testing.assert_allclose(jb, tb, rtol=1e-4, atol=5e-6)
     np.testing.assert_allclose(jS0, tS0, rtol=1e-4, atol=5e-6)
+
+
+# -------------------------------
+# Varlen / Flash-specific testing
+# -------------------------------
+
+
+@pytest.mark.parametrize("chunk_size", [1, 16, 32, 64])
+def test_chunk_varlen_lengths_matches_recurrent_prefix_and_state(chunk_size):
+    """Flash (varlen via lengths) == recurrent run up to each (b,h) length on the prefix."""
+    key = jax.random.PRNGKey(42)
+    B, H, L, dk, dv = 2, 3, 61, 8, 10  # dv=10 to exercise V-tiling/padding
+    q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
+
+    # Random ragged lengths in [0..L]; ensure we hit 0 and near-L
+    lengths_bh = jax.random.randint(key, (B, H), minval=0, maxval=L + 1)
+    lengths_bh = lengths_bh.at[0, 0].set(0).at[0, 1].set(L).astype(jnp.int32)
+
+    # Flash chunk with varlen lengths
+    out_chunk, S_chunk = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=chunk_size,
+        initial_state=None,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_flash=True,
+        use_varlen=True,
+        lengths=lengths_bh,
+    )
+    out_chunk_arr = np.array(out_chunk.array)
+    S_chunk_arr = np.array(S_chunk)
+
+    # Recurrent per sequence up to its length
+    out_ref = np.zeros((B, L, H, dv), dtype=np.float32)
+    S_ref = np.zeros((B, H, dk, dv), dtype=np.float32)
+    for b in range(B):
+        for h in range(H):
+            ell = int(lengths_bh[b, h])
+            if ell == 0:
+                # state zero and output zero (already initialized)
+                continue
+
+            # slice b,h,0:ell as NamedArrays (batch=1, heads=1)
+            q_i = q["batch", hax.ds(b, Axis("b", 1))]["heads", hax.ds(h, Axis("h", 1))][
+                "position", hax.ds(0, Axis("p", ell))
+            ]
+            k_i = k["batch", hax.ds(b, Axis("b", 1))]["heads", hax.ds(h, Axis("h", 1))][
+                "position", hax.ds(0, Axis("p", ell))
+            ]
+            v_i = v["batch", hax.ds(b, Axis("b", 1))]["heads", hax.ds(h, Axis("h", 1))][
+                "position", hax.ds(0, Axis("p", ell))
+            ]
+            g_i = g["batch", hax.ds(b, Axis("b", 1))]["heads", hax.ds(h, Axis("h", 1))][
+                "position", hax.ds(0, Axis("p", ell))
+            ]
+            b_i = beta["batch", hax.ds(b, Axis("b", 1))]["heads", hax.ds(h, Axis("h", 1))][
+                "position", hax.ds(0, Axis("p", ell))
+            ]
+
+            out_i, S_i = recurrent_gated_delta_rule(
+                q_i,
+                k_i,
+                v_i,
+                g_i,
+                b_i,
+                initial_state=None,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                use_flash=False,  # use reference for parity
+            )
+            out_ref[b, :ell, h, :] = np.array(out_i.array)[0, :ell, 0, :]
+            S_ref[b, h, :, :] = np.array(S_i)[0, 0, :, :]
+
+    # Compare only the valid prefixes
+    for b in range(B):
+        for h in range(H):
+            ell = int(lengths_bh[b, h])
+            np.testing.assert_allclose(out_chunk_arr[b, :ell, h, :], out_ref[b, :ell, h, :], rtol=1e-4, atol=1e-4)
+            np.testing.assert_allclose(S_chunk_arr[b, h], S_ref[b, h], rtol=1e-4, atol=1e-4)
+
+    # All outputs should be finite
+    assert np.isfinite(out_chunk_arr).all()
+
+
+def test_chunk_varlen_offsets_equivalence():
+    """lengths and offsets (NH and NH+1) must yield identical outputs/states."""
+    key = jax.random.PRNGKey(123)
+    B, H, L, dk, dv = 2, 2, 47, 8, 8
+    q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
+
+    lengths_bh = jax.random.randint(key, (B, H), minval=0, maxval=L + 1).astype(jnp.int32)
+    lengths_flat = lengths_bh.reshape(-1)
+    offsets_plus1 = jnp.concatenate(
+        [jnp.array([0], dtype=jnp.int32), jnp.cumsum(lengths_flat, dtype=jnp.int32)], axis=0
+    )
+
+    # via lengths
+    out_len, S_len = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=32,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_flash=True,
+        use_varlen=True,
+        lengths=lengths_bh,
+    )
+    # via offsets (NH+1)
+    out_off, S_off = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=32,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_flash=True,
+        use_varlen=True,
+        offsets=offsets_plus1,
+    )
+    np.testing.assert_allclose(np.array(out_len.array), np.array(out_off.array), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(S_len, S_off, rtol=1e-5, atol=1e-5)
+
+    # via offsets (NH == lengths)
+    out_off2, S_off2 = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=32,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_flash=True,
+        use_varlen=True,
+        offsets=lengths_flat,  # lengths form
+    )
+    np.testing.assert_allclose(np.array(out_len.array), np.array(out_off2.array), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(S_len, S_off2, rtol=1e-5, atol=1e-5)
+
+
+def test_chunk_varlen_zero_length_and_S0_unchanged():
+    """If a sequence has length 0, outputs are zero and S_final equals S0 for that (b,h)."""
+    key = jax.random.PRNGKey(7)
+    B, H, L, dk, dv = 2, 2, 33, 8, 8
+    q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
+
+    # Make one BH pair zero-length, others random
+    lengths_bh = jax.random.randint(key, (B, H), minval=1, maxval=L + 1).astype(jnp.int32)
+    lengths_bh = lengths_bh.at[0, 0].set(0)
+
+    # Random S0 to check "unchanged"
+    S0 = jax.random.normal(jax.random.PRNGKey(11), (B, H, dk, dv), dtype=jnp.float32)
+
+    out_chunk, S_fin = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=16,
+        initial_state=S0,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_flash=True,
+        use_varlen=True,
+        lengths=lengths_bh,
+    )
+    out = np.array(out_chunk.array)
+    assert np.allclose(out[0, :, 0, :], 0.0, atol=1e-7)  # all positions are invalid => zeros
+    np.testing.assert_allclose(S_fin[0, 0], np.array(S0[0, 0]), rtol=1e-6, atol=1e-6)
+
+
+def test_chunk_varlen_head_first_layout_equivalence():
+    """head_first=True path should match the standard layout for the valid prefixes."""
+    key = jax.random.PRNGKey(99)
+    B, H, L, dk, dv = 1, 3, 57, 16, 10
+    q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
+
+    lengths_bh = jax.random.randint(key, (B, H), minval=0, maxval=L + 1).astype(jnp.int32)
+
+    # Standard path
+    out_std, _ = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=32,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+        use_flash=True,
+        use_varlen=True,
+        lengths=lengths_bh,
+        head_first=False,
+    )
+    out_std_arr = np.array(out_std.array)  # (B, L, H, V)
+
+    # Head-first inputs (B, H, L, *)
+    q_hf = hax.rearrange(q, ("batch", "heads", "position", "k_head_dim"))
+    k_hf = hax.rearrange(k, ("batch", "heads", "position", "k_head_dim"))
+    v_hf = hax.rearrange(v, ("batch", "heads", "position", "v_head_dim"))
+    g_hf = hax.rearrange(g, ("batch", "heads", "position"))
+    b_hf = hax.rearrange(beta, ("batch", "heads", "position"))
+
+    out_hf, _ = chunk_gated_delta_rule(
+        q_hf,
+        k_hf,
+        v_hf,
+        g_hf,
+        b_hf,
+        chunk_size=32,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+        use_flash=True,
+        use_varlen=True,
+        lengths=lengths_bh,
+        head_first=True,
+    )
+    # Bring back to (B, L, H, V)
+    out_hf_std = hax.rearrange(out_hf, ("batch", "position", "heads", "v_head_dim"))
+    out_hf_arr = np.array(out_hf_std.array)
+
+    # Compare only the valid prefixes for each head
+    for h in range(H):
+        ell = int(lengths_bh[0, h])
+        np.testing.assert_allclose(out_std_arr[0, :ell, h, :], out_hf_arr[0, :ell, h, :], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("chunk_size", [17, 32])
+def test_chunk_varlen_nondivisible_and_parity_with_recurrent(chunk_size):
+    """Non-divisible chunk sizes with varlen should match recurrent on valid prefixes."""
+    key = jax.random.PRNGKey(314)
+    B, H, L, dk, dv = 2, 2, 59, 8, 8
+    q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
+
+    lengths_bh = jax.random.randint(key, (B, H), minval=0, maxval=L + 1).astype(jnp.int32)
+
+    out_chunk, S_chunk = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_size=chunk_size,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_flash=True,
+        use_varlen=True,
+        lengths=lengths_bh,
+    )
+    out_chunk_arr = np.array(out_chunk.array)
+    S_chunk_arr = np.array(S_chunk)
+
+    # Reference recurrent per (b,h)
+    out_ref = np.zeros((B, L, H, dv), dtype=np.float32)
+    S_ref = np.zeros((B, H, dk, dv), dtype=np.float32)
+    for b in range(B):
+        for h in range(H):
+            ell = int(lengths_bh[b, h])
+            if ell == 0:
+                continue
+            q_i = q["batch", hax.ds(b, Axis("b", 1))]["heads", hax.ds(h, Axis("h", 1))][
+                "position", hax.ds(0, Axis("p", ell))
+            ]
+            k_i = k["batch", hax.ds(b, Axis("b", 1))]["heads", hax.ds(h, Axis("h", 1))][
+                "position", hax.ds(0, Axis("p", ell))
+            ]
+            v_i = v["batch", hax.ds(b, Axis("b", 1))]["heads", hax.ds(h, Axis("h", 1))][
+                "position", hax.ds(0, Axis("p", ell))
+            ]
+            g_i = g["batch", hax.ds(b, Axis("b", 1))]["heads", hax.ds(h, Axis("h", 1))][
+                "position", hax.ds(0, Axis("p", ell))
+            ]
+            b_i = beta["batch", hax.ds(b, Axis("b", 1))]["heads", hax.ds(h, Axis("h", 1))][
+                "position", hax.ds(0, Axis("p", ell))
+            ]
+            out_i, S_i = recurrent_gated_delta_rule(
+                q_i,
+                k_i,
+                v_i,
+                g_i,
+                b_i,
+                initial_state=None,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                use_flash=False,
+            )
+            out_ref[b, :ell, h, :] = np.array(out_i.array)[0, :ell, 0, :]
+            S_ref[b, h, :, :] = np.array(S_i)[0, 0, :, :]
+
+    # Compare only valid prefixes and final states
+    for b in range(B):
+        for h in range(H):
+            ell = int(lengths_bh[b, h])
+            np.testing.assert_allclose(out_chunk_arr[b, :ell, h, :], out_ref[b, :ell, h, :], rtol=1e-4, atol=1e-4)
+            np.testing.assert_allclose(S_chunk_arr[b, h, :, :], S_ref[b, h, :, :], rtol=1e-4, atol=1e-4)
