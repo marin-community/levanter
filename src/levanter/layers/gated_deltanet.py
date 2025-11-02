@@ -4,6 +4,7 @@
 # based on:
 # - https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_next/modular_qwen3_next.py
 # - the JAX implementation by Yu Sun and Leo Lee
+# - Flash Linear Attention's Triton implementation: https://github.com/fla-org/flash-linear-attention
 
 """
 This module implements the Gated DeltaNet: https://arxiv.org/abs/2412.06464.
@@ -476,6 +477,287 @@ def _recurrent_gated_delta_rule_reference(
         return out_final, None
 
 
+def _pick_bk_tile_for_decode(dk: int) -> int:
+    # Simple heuristic; autotune later if desired.
+    if dk >= 256:
+        return 64
+    elif dk >= 128:
+        return 64
+    else:
+        return 32
+
+
+def _pick_bv_tile_for_decode(dv: int) -> int:
+    if dv >= 512:
+        return 128
+    elif dv >= 256:
+        return 64
+    else:
+        return 32
+
+
+def _pad_last_axis(arr: jnp.ndarray, new_width: int) -> jnp.ndarray:
+    """Right-pad the *last* axis to new_width."""
+    cur = arr.shape[-1]
+    if cur == new_width:
+        return arr
+    pad = new_width - cur
+    assert pad >= 0
+    pad_spec = [(0, 0)] * arr.ndim
+    pad_spec[-1] = (0, pad)
+    return jnp.pad(arr, tuple(pad_spec))
+
+
+def _pad_k_for_decode(
+    q_like_TK: jnp.ndarray,  # [..., T, K]
+    k_like_TK: jnp.ndarray,  # [..., T, K]
+    init_KV: jnp.ndarray,  # [..., K, V]
+    K_pad: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    q_pad = _pad_last_axis(q_like_TK, K_pad)
+    k_pad = _pad_last_axis(k_like_TK, K_pad)
+    pad_K = K_pad - init_KV.shape[-2]
+    if pad_K > 0:
+        init_pad = jnp.pad(init_KV, ((0, 0),) * (init_KV.ndim - 2) + ((0, pad_K), (0, 0)))
+    else:
+        init_pad = init_KV
+    return q_pad, k_pad, init_pad
+
+
+def _nh_to_bh(nh_i32: jnp.int32, H: int) -> tuple[jnp.int32, jnp.int32]:
+    """Map flattened nh ∈ [0, B·H) → (b, h)."""
+    b = nh_i32 // jnp.int32(H)
+    h = nh_i32 - b * jnp.int32(H)
+    return b, h
+
+
+def _in_specs_head_first(B, H, T, K_pad, BV, is_beta_headwise):
+    # Inputs (HEAD_FIRST):
+    #   q,k:  [B,H,T,K_pad]
+    #   v:    [B,H,T,V_pad]
+    #   g:    [B,H,T]
+    #   β:    [B,H,T] or [B,H,T,V_pad]
+    # State:
+    #   init, final: [B,H,K_pad,V_pad]
+    def _bh(nh, vb):
+        return _nh_to_bh(nh, H)
+
+    in_specs = (
+        pl.BlockSpec((1, 1, T, K_pad), lambda nh, vb: (*_bh(nh, vb), 0, 0)),  # q
+        pl.BlockSpec((1, 1, T, K_pad), lambda nh, vb: (*_bh(nh, vb), 0, 0)),  # k
+        pl.BlockSpec((1, 1, T, BV), lambda nh, vb: (*_bh(nh, vb), 0, vb * BV)),  # v
+        pl.BlockSpec((1, 1, T), lambda nh, vb: (*_bh(nh, vb), 0)),  # g
+        (
+            pl.BlockSpec((1, 1, T), lambda nh, vb: (*_bh(nh, vb), 0))  # β headwise
+            if is_beta_headwise
+            else pl.BlockSpec((1, 1, T, BV), lambda nh, vb: (*_bh(nh, vb), 0, vb * BV))
+        ),  # β per‑V
+        pl.BlockSpec((1, 1, K_pad, BV), lambda nh, vb: (*_bh(nh, vb), 0, vb * BV)),  # init
+        pl.BlockSpec((1,), lambda nh, vb: (nh,)),  # lengths [NH]
+    )
+    # Outputs:
+    #   out:   [NH, T, V_pad]   (3‑D)
+    #   final: [B,H,K_pad,V_pad]
+    out_specs = (
+        pl.BlockSpec((1, T, BV), lambda nh, vb: (nh, 0, vb * BV)),  # out (NH-major)
+        pl.BlockSpec((1, 1, K_pad, BV), lambda nh, vb: (*_bh(nh, vb), 0, vb * BV)),  # final
+    )
+    return in_specs, out_specs
+
+
+def _in_specs_bth(B, H, T, K_pad, BV, is_beta_headwise):
+    # Inputs (BTH):
+    #   q,k:  [B, T, H, K_pad]
+    #   v:    [B, T, H, V_pad]
+    #   g:    [B, T, H]
+    #   β:    [B, T, H] (headwise) or [B, T, H, V_pad] (per-V)
+    # State:
+    #   init, final: [B, H, K_pad, V_pad]
+
+    def _bth(nh, vb):
+        b, h = _nh_to_bh(nh, H)
+        return (b, 0, h)  # (B, T_start, H)
+
+    in_specs = (
+        # q, k: 4-D tiles (1, T, 1, K_pad)
+        pl.BlockSpec((1, T, 1, K_pad), lambda nh, vb: (*_bth(nh, vb), 0)),
+        pl.BlockSpec((1, T, 1, K_pad), lambda nh, vb: (*_bth(nh, vb), 0)),
+        # v: 4-D tile (1, T, 1, BV)
+        pl.BlockSpec((1, T, 1, BV), lambda nh, vb: (*_bth(nh, vb), vb * BV)),
+        # g: 3-D tile (1, T, 1)  → must return exactly 3 indices (b, 0, h)
+        pl.BlockSpec((1, T, 1), lambda nh, vb: _bth(nh, vb)),
+        # β: headwise uses 3-D (1, T, 1); per-V uses 4-D (1, T, 1, BV)
+        (
+            pl.BlockSpec((1, T, 1), lambda nh, vb: _bth(nh, vb))  # headwise β
+            if is_beta_headwise
+            else pl.BlockSpec((1, T, 1, BV), lambda nh, vb: (*_bth(nh, vb), vb * BV))
+        ),  # per-V β
+        # init state: 4-D (1, 1, K_pad, BV) into [B,H,K_pad,V_pad]
+        pl.BlockSpec((1, 1, K_pad, BV), lambda nh, vb: (_nh_to_bh(nh, H)[0], _nh_to_bh(nh, H)[1], 0, vb * BV)),
+        # lengths: 1-D (1,) over NH
+        pl.BlockSpec((1,), lambda nh, vb: (nh,)),
+    )
+
+    out_specs = (
+        # out: NH-major 3-D (1, T, BV)
+        pl.BlockSpec((1, T, BV), lambda nh, vb: (nh, 0, vb * BV)),
+        # final state: 4-D (1, 1, K_pad, BV) into [B,H,K_pad,V_pad]
+        pl.BlockSpec((1, 1, K_pad, BV), lambda nh, vb: (_nh_to_bh(nh, H)[0], _nh_to_bh(nh, H)[1], 0, vb * BV)),
+    )
+    return in_specs, out_specs
+
+
+def _gdn_recurrent_fwd_kernel_tiled_2d(
+    q_ref,
+    k_ref,
+    v_ref,
+    g_ref,
+    beta_ref,
+    init_ref,
+    lengths_ref,
+    out_ref,
+    final_ref,
+    *,
+    T,
+    K_pad,
+    BK,
+    BV,
+    use_qk_l2norm,
+    has_initial_state,
+    is_beta_headwise,
+    scale,
+    head_first_layout: bool,  # NEW: tells us how to squeeze 4-D tiles
+):
+    # ---- Local (tile) views; squeeze the 1-sized dims to get 2-D/1-D arrays ----
+    if head_first_layout:
+        # q,k: [1,1,T,K] → (T,K); v: [1,1,T,BV] → (T,BV); g: [1,1,T] → (T,)
+        q_view = q_ref[dslice(0, 1), dslice(0, 1), dslice(0, T), dslice(0, K_pad)][0, 0]
+        k_view = k_ref[dslice(0, 1), dslice(0, 1), dslice(0, T), dslice(0, K_pad)][0, 0]
+        v_view = v_ref[dslice(0, 1), dslice(0, 1), dslice(0, T), dslice(0, BV)][0, 0]
+        g_view = g_ref[dslice(0, 1), dslice(0, 1), dslice(0, T)][0, 0]
+        if is_beta_headwise:
+            beta_h = beta_ref[dslice(0, 1), dslice(0, 1), dslice(0, T)][0, 0]  # (T,)
+        else:
+            beta_h = beta_ref[dslice(0, 1), dslice(0, 1), dslice(0, T), dslice(0, BV)][0, 0]  # (T,BV)
+
+        # State tiles: [1,1,K,BV] → (K,BV)
+        def _read_state(k0, n):
+            return final_ref[dslice(0, 1), dslice(0, 1), dslice(k0, n), dslice(0, BV)][0, 0]
+
+        def _write_state(k0, block):
+            final_ref[dslice(0, 1), dslice(0, 1), dslice(k0, block.shape[0]), dslice(0, BV)] = block[None, None, :, :]
+
+        def _read_init(k0, n):
+            return init_ref[dslice(0, 1), dslice(0, 1), dslice(k0, n), dslice(0, BV)][0, 0]
+
+    else:
+        # q,k: [1,T,1,K] → (T,K); v: [1,T,1,BV] → (T,BV); g: [1,T,1] → (T,)
+        q_view = q_ref[dslice(0, 1), dslice(0, T), dslice(0, 1), dslice(0, K_pad)][0, :, 0, :]
+        k_view = k_ref[dslice(0, 1), dslice(0, T), dslice(0, 1), dslice(0, K_pad)][0, :, 0, :]
+        v_view = v_ref[dslice(0, 1), dslice(0, T), dslice(0, 1), dslice(0, BV)][0, :, 0, :]
+        g_view = g_ref[dslice(0, 1), dslice(0, T), dslice(0, 1)][0, :, 0]
+        if is_beta_headwise:
+            beta_h = beta_ref[dslice(0, 1), dslice(0, T), dslice(0, 1)][0, :, 0]  # (T,)
+        else:
+            beta_h = beta_ref[dslice(0, 1), dslice(0, T), dslice(0, 1), dslice(0, BV)][0, :, 0, :]  # (T,BV)
+
+        # State tiles: [1,1,K,BV] → (K,BV)
+        def _read_state(k0, n):
+            return final_ref[dslice(0, 1), dslice(0, 1), dslice(k0, n), dslice(0, BV)][0, 0]
+
+        def _write_state(k0, block):
+            final_ref[dslice(0, 1), dslice(0, 1), dslice(k0, block.shape[0]), dslice(0, BV)] = block[None, None, :, :]
+
+        def _read_init(k0, n):
+            return init_ref[dslice(0, 1), dslice(0, 1), dslice(k0, n), dslice(0, BV)][0, 0]
+
+    # ---- Initialize per-tile state buffer from init_ref once ----
+    n_ktiles = K_pad // BK
+
+    def _copy_body(kb, _):
+        k0 = kb * BK
+        S_blk = _read_init(k0, BK).astype(jnp.float32) if has_initial_state else jnp.zeros((BK, BV), dtype=jnp.float32)
+        _write_state(k0, S_blk.astype(final_ref.dtype))
+        return ()
+
+    _ = lax.fori_loop(0, n_ktiles, _copy_body, ())
+
+    L_i32 = lengths_ref[dslice(0, 1)][0].astype(jnp.int32)
+    T_i32 = jnp.int32(T)
+    scale32 = jnp.asarray(scale, dtype=jnp.float32)
+
+    out_tile = jnp.zeros((T, BV), dtype=out_ref.dtype)
+
+    def time_step(t, out_cur):
+        do_step = t < L_i32
+
+        q_t = q_view[t].astype(jnp.float32)  # (K_pad,)
+        k_t = k_view[t].astype(jnp.float32)  # (K_pad,)
+        v_t = v_view[t].astype(jnp.float32)  # (BV,)
+        g_t = g_view[t].astype(jnp.float32)
+        alpha = jnp.exp(g_t)
+
+        if use_qk_l2norm:
+            q_norm = jnp.sqrt(jnp.sum(q_t * q_t) + 1e-6)
+            k_norm = jnp.sqrt(jnp.sum(k_t * k_t) + 1e-6)
+            q_t = q_t / jnp.where(q_norm > 0.0, q_norm, 1.0)
+            k_t = k_t / jnp.where(k_norm > 0.0, k_norm, 1.0)
+        q_t = q_t * scale32
+
+        def _do_step(_):
+            # ---- Pass 1: accumulate kv, y_alpha, kq (no writes) ----
+            kv = jnp.zeros((BV,), dtype=jnp.float32)
+            y_alpha = jnp.zeros((BV,), dtype=jnp.float32)
+            kq = jnp.array(0.0, dtype=jnp.float32)
+
+            def pass1_body(kb, acc):
+                kv_acc, yA_acc, kq_acc = acc
+                k0 = kb * BK
+                k_chunk = lax.dynamic_slice_in_dim(k_t, start_index=k0, slice_size=BK, axis=0)
+                q_chunk = lax.dynamic_slice_in_dim(q_t, start_index=k0, slice_size=BK, axis=0)
+                S_blk = _read_state(k0, BK).astype(jnp.float32)
+
+                kv_acc = kv_acc + jnp.sum(S_blk * (alpha * k_chunk)[:, None], axis=0)
+                yA_acc = yA_acc + jnp.sum(S_blk * (alpha * q_chunk)[:, None], axis=0)
+                kq_acc = kq_acc + jnp.sum(k_chunk * q_chunk)
+                return (kv_acc, yA_acc, kq_acc)
+
+            kv, y_alpha, kq = lax.fori_loop(0, n_ktiles, pass1_body, (kv, y_alpha, kq))
+
+            # δ = (v - kv) * β
+            if is_beta_headwise:
+                delta = (v_t - kv) * beta_h[t].astype(jnp.float32)
+            else:
+                delta = (v_t - kv) * beta_h[t].astype(jnp.float32)
+
+            # y = y_alpha + δ * (k^T q)
+            y_t = (y_alpha + delta * kq).astype(out_ref.dtype)
+
+            # ---- Pass 2: S_new = α S_blk + k⊗δ (single write) ----
+            def pass2_body(kb, _):
+                k0 = kb * BK
+                k_chunk = lax.dynamic_slice_in_dim(k_t, start_index=k0, slice_size=BK, axis=0)
+                S_blk = _read_state(k0, BK).astype(jnp.float32)
+                S_new = S_blk * alpha + k_chunk[:, None] * delta[None, :]
+                _write_state(k0, S_new.astype(final_ref.dtype))
+                return ()
+
+            _ = lax.fori_loop(0, n_ktiles, pass2_body, ())
+            return y_t
+
+        def _skip_step(_):
+            return jnp.zeros((BV,), dtype=out_ref.dtype)
+
+        y_t = lax.cond(do_step, _do_step, _skip_step, operand=None)
+        out_next = out_cur.at[t].set(y_t)
+        return out_next
+
+    out_tile = lax.fori_loop(0, T_i32, time_step, out_tile)
+
+    # Local writes (out is NH-major 3‑D)
+    out_ref[dslice(0, 1), dslice(0, T), dslice(0, BV)] = out_tile[None, :, :]
+
+
 def _recurrent_gated_delta_rule_flash(
     query: NamedArray,
     key: NamedArray,
@@ -483,9 +765,11 @@ def _recurrent_gated_delta_rule_flash(
     g: NamedArray,
     beta: NamedArray,
     *,
-    initial_state: Optional[jnp.ndarray] = None,
+    initial_state: Optional[jnp.ndarray] = None,  # [B,H,dk,dv]
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = True,
+    head_first: bool = False,  # True: inputs are [B,H,T,*]; False: [B,T,H,*]
+    lengths: Optional[jnp.ndarray] = None,  # [B*H] or [B,H]
 ) -> Tuple[NamedArray, Optional[jnp.ndarray]]:
     Batch = query.resolve_axis("batch")
     Pos = query.resolve_axis("position")
@@ -493,157 +777,148 @@ def _recurrent_gated_delta_rule_flash(
     Dk = query.resolve_axis("k_head_dim")
     Dv = value.resolve_axis("v_head_dim")
 
-    q = query.astype(jnp.float32)
-    k = key.astype(jnp.float32)
-    v = value.astype(jnp.float32)
-    gg = g.astype(jnp.float32)
-    b = beta.astype(jnp.float32)
-
-    q_arr = hax.rearrange(q, (Batch, Heads, Pos, Dk)).array
-    k_arr = hax.rearrange(k, (Batch, Heads, Pos, Dk)).array
-    v_arr = hax.rearrange(v, (Batch, Heads, Pos, Dv)).array
-    g_arr = hax.rearrange(gg, (Batch, Heads, Pos)).array
-
-    beta_axis_names = tuple(ax.name for ax in beta.axes)
-    if Dv.name in beta_axis_names:
-        beta_arr = hax.rearrange(b, (Batch, Heads, Pos, Dv)).array
-        is_beta_headwise = False
-    else:
-        beta_arr = hax.rearrange(b, (Batch, Heads, Pos)).array
-        is_beta_headwise = True
-
-    B_, H_, T_, K_ = q_arr.shape
-    V_ = v_arr.shape[-1]
+    B_, T_, H_, K_ = Batch.size, Pos.size, Heads.size, Dk.size
+    V_ = Dv.size
     NH = B_ * H_
 
-    q_flat = q_arr.reshape(NH, T_, K_)
-    k_flat = k_arr.reshape(NH, T_, K_)
-    v_flat = v_arr.reshape(NH, T_, V_)
-    g_flat = g_arr.reshape(NH, T_)
-    if is_beta_headwise:
-        beta_flat = beta_arr.reshape(NH, T_)
-    else:
-        beta_flat = beta_arr.reshape(NH, T_, V_)
+    # Ensure arrays match the declared layout (no-op if already matching)
+    def _ensure_layout(x_named: NamedArray, layout: tuple[str, ...]) -> jnp.ndarray:
+        have = tuple(ax.name for ax in x_named.axes)
+        if have == layout:
+            return x_named.array
+        return hax.rearrange(x_named, layout).array
 
-    if initial_state is None:
-        init_state = jnp.zeros((NH, K_, V_), dtype=jnp.float32)
-    else:
-        init_state = initial_state.astype(jnp.float32).reshape(NH, K_, V_)
-
-    def kernel(
-        q_ref,
-        k_ref,
-        v_ref,
-        g_ref,
-        beta_ref,
-        init_ref,
-        out_ref,
-        final_ref,
-        *,
-        T,
-        K,
-        V,
-        use_qk_l2norm,
-        store_final_state,
-        has_initial_state,
-        is_beta_headwise,
-        scale,
-    ):
-        head = pl.program_id(0)
-        q_view = q_ref[dslice(head, 1), dslice(0, T), dslice(0, K)][0]
-        k_view = k_ref[dslice(head, 1), dslice(0, T), dslice(0, K)][0]
-        v_view = v_ref[dslice(head, 1), dslice(0, T), dslice(0, V)][0]
-        g_view = g_ref[dslice(head, 1), dslice(0, T)][0]
-        beta_view = (
-            beta_ref[dslice(head, 1), dslice(0, T)][0]
-            if is_beta_headwise
-            else beta_ref[dslice(head, 1), dslice(0, T), dslice(0, V)][0]
-        )
-        if has_initial_state:
-            state = init_ref[dslice(head, 1), dslice(0, K), dslice(0, V)][0].astype(jnp.float32)
+    if head_first:
+        q_arr = _ensure_layout(query.astype(jnp.float32), (Batch.name, Heads.name, Pos.name, Dk.name))  # [B,H,T,K]
+        k_arr = _ensure_layout(key.astype(jnp.float32), (Batch.name, Heads.name, Pos.name, Dk.name))
+        v_arr = _ensure_layout(value.astype(jnp.float32), (Batch.name, Heads.name, Pos.name, Dv.name))
+        g_arr = _ensure_layout(g.astype(jnp.float32), (Batch.name, Heads.name, Pos.name))
+        beta_axis_names = tuple(ax.name for ax in beta.axes)
+        is_beta_headwise = Dv.name not in beta_axis_names
+        if is_beta_headwise:
+            beta_arr = _ensure_layout(beta.astype(jnp.float32), (Batch.name, Heads.name, Pos.name))  # [B,H,T]
         else:
-            state = jnp.zeros((K, V), dtype=jnp.float32)
+            beta_arr = _ensure_layout(
+                beta.astype(jnp.float32), (Batch.name, Heads.name, Pos.name, Dv.name)
+            )  # [B,H,T,V]
+    else:
+        q_arr = _ensure_layout(query.astype(jnp.float32), (Batch.name, Pos.name, Heads.name, Dk.name))  # [B,T,H,K]
+        k_arr = _ensure_layout(key.astype(jnp.float32), (Batch.name, Pos.name, Heads.name, Dk.name))
+        v_arr = _ensure_layout(value.astype(jnp.float32), (Batch.name, Pos.name, Heads.name, Dv.name))
+        g_arr = _ensure_layout(g.astype(jnp.float32), (Batch.name, Pos.name, Heads.name))
+        beta_axis_names = tuple(ax.name for ax in beta.axes)
+        is_beta_headwise = Dv.name not in beta_axis_names
+        if is_beta_headwise:
+            beta_arr = _ensure_layout(beta.astype(jnp.float32), (Batch.name, Pos.name, Heads.name))  # [B,T,H]
+        else:
+            beta_arr = _ensure_layout(
+                beta.astype(jnp.float32), (Batch.name, Pos.name, Heads.name, Dv.name)
+            )  # [B,T,H,V]
 
-        scale32 = jnp.asarray(scale, dtype=jnp.float32)
+    # Initial state: [B,H,K,V]
+    if initial_state is None:
+        init_arr = jnp.zeros((B_, H_, K_, V_), dtype=jnp.float32)
+        has_initial = False
+    else:
+        init_in = initial_state.astype(jnp.float32)
+        if init_in.shape == (B_, H_, K_, V_):
+            init_arr = init_in
+        elif init_in.ndim == 3 and init_in.shape[0] == NH:
+            init_arr = init_in.reshape(B_, H_, K_, V_)
+        else:
+            init_arr = hax.rearrange(
+                hax.named(init_in, (Batch, Heads, Dk, Dv)),
+                (Batch.name, Heads.name, Dk.name, Dv.name),
+            ).array
+        has_initial = True
 
-        out_tile = jnp.zeros((T, V), dtype=out_ref.dtype)
-        for t in range(T):
-            q_t = q_view[t].astype(jnp.float32)
-            k_t = k_view[t].astype(jnp.float32)
-            if use_qk_l2norm:
-                q_t = q_t / jnp.sqrt(jnp.sum(q_t * q_t) + 1e-6)
-                k_t = k_t / jnp.sqrt(jnp.sum(k_t * k_t) + 1e-6)
-            q_t = q_t * scale32
-            v_t = v_view[t].astype(jnp.float32)
-            g_t = g_view[t].astype(jnp.float32)
-            state = state * jnp.exp(g_t)
+    # Varlen
+    if lengths is None:
+        lengths_flat = jnp.full((NH,), T_, dtype=jnp.int32)
+    else:
+        lf = lengths
+        if lf.ndim == 2 and lf.shape == (B_, H_):
+            lf = lf.reshape(NH)
+        lengths_flat = lf.astype(jnp.int32)
 
-            kv = jnp.sum(state * k_t[:, None], axis=0)
-            if is_beta_headwise:
-                beta_t = beta_view[t].astype(jnp.float32)
-                delta = (v_t - kv) * beta_t
-            else:
-                beta_t = beta_view[t].astype(jnp.float32)
-                delta = (v_t - kv) * beta_t
-            state = state + k_t[:, None] * delta[None, :]
+    # 2D tiling & padding
+    BK = _pick_bk_tile_for_decode(Dk.size)
+    BV = _pick_bv_tile_for_decode(Dv.size)
+    K_pad = int(((K_ + BK - 1) // BK) * BK)
+    V_pad = int(((V_ + BV - 1) // BV) * BV)
 
-            out_tile = out_tile.at[t].set(jnp.sum(state * q_t[:, None], axis=0).astype(out_ref.dtype))
+    if head_first:
+        # Pad K with BH→NH reshape and back; pad V in place
+        q_pad, k_pad, init_kpad = _pad_k_for_decode(
+            q_arr.reshape(B_ * H_, T_, K_),
+            k_arr.reshape(B_ * H_, T_, K_),
+            init_arr.reshape(B_ * H_, K_, V_),
+            K_pad,
+        )
+        q_pad = q_pad.reshape(B_, H_, T_, K_pad)
+        k_pad = k_pad.reshape(B_, H_, T_, K_pad)
+        init_kpad = init_kpad.reshape(B_, H_, K_pad, V_)
+        v_pad = _pad_last_axis(v_arr, V_pad)  # [B,H,T,V_pad]
+        beta_pad = beta_arr if is_beta_headwise else _pad_last_axis(beta_arr, V_pad)
+    else:
+        q_pad, k_pad, init_kpad = _pad_k_for_decode(
+            q_arr.reshape(B_ * H_, T_, K_),
+            k_arr.reshape(B_ * H_, T_, K_),
+            init_arr.reshape(B_ * H_, K_, V_),
+            K_pad,
+        )
+        q_pad = q_pad.reshape(B_, T_, H_, K_pad)
+        k_pad = k_pad.reshape(B_, T_, H_, K_pad)
+        init_kpad = init_kpad.reshape(B_, H_, K_pad, V_)
+        v_pad = _pad_last_axis(v_arr, V_pad)  # [B,T,H,V_pad]
+        beta_pad = beta_arr if is_beta_headwise else _pad_last_axis(beta_arr, V_pad)
 
-        out_ref[dslice(head, 1), dslice(0, T), dslice(0, V)] = out_tile[None, :, :]
-
-        if store_final_state:
-            final_ref[dslice(head, 1), dslice(0, K), dslice(0, V)] = state.astype(final_ref.dtype)[None, :, :]
-
-    out_struct = jax.ShapeDtypeStruct((NH, T_, V_), v_flat.dtype)
-    final_struct = jax.ShapeDtypeStruct((NH, K_, V_), jnp.float32)
+    # Pallas shapes
+    out_struct = jax.ShapeDtypeStruct((NH, T_, V_pad), value.dtype)  # NH-major for output
+    final_struct = jax.ShapeDtypeStruct((B_, H_, K_pad, V_pad), jnp.float32)
 
     kernel_partial = functools.partial(
-        kernel,
+        _gdn_recurrent_fwd_kernel_tiled_2d,
         T=T_,
-        K=K_,
-        V=V_,
+        K_pad=K_pad,
+        BK=int(BK),
+        BV=int(BV),
         use_qk_l2norm=use_qk_l2norm_in_kernel,
-        store_final_state=output_final_state,
-        has_initial_state=initial_state is not None,
+        has_initial_state=has_initial,
         is_beta_headwise=is_beta_headwise,
         scale=Dk.size**-0.5,
+        head_first_layout=head_first,  # pass layout flag to kernel
     )
 
-    beta_spec: pl.BlockSpec
-    if is_beta_headwise:
-        beta_spec = pl.BlockSpec((1, T_), lambda bid_nh: (bid_nh, 0))
-    else:
-        beta_spec = pl.BlockSpec((1, T_, V_), lambda bid_nh: (bid_nh, 0, 0))
+    n_vtiles = V_pad // BV
+    grid = (NH, n_vtiles)
 
-    result = pl.pallas_call(
+    in_specs, out_specs = (
+        _in_specs_head_first(B_, H_, T_, K_pad, BV, is_beta_headwise)
+        if head_first
+        else _in_specs_bth(B_, H_, T_, K_pad, BV, is_beta_headwise)
+    )
+
+    out_pad, final_pad = pl.pallas_call(
         kernel_partial,
         out_shape=(out_struct, final_struct),
-        grid=(NH,),
-        in_specs=(
-            pl.BlockSpec((1, T_, K_), lambda bid_nh: (bid_nh, 0, 0)),
-            pl.BlockSpec((1, T_, K_), lambda bid_nh: (bid_nh, 0, 0)),
-            pl.BlockSpec((1, T_, V_), lambda bid_nh: (bid_nh, 0, 0)),
-            pl.BlockSpec((1, T_), lambda bid_nh: (bid_nh, 0)),
-            beta_spec,
-            pl.BlockSpec((1, K_, V_), lambda bid_nh: (bid_nh, 0, 0)),
-        ),
-        out_specs=(
-            pl.BlockSpec((1, T_, V_), lambda bid_nh: (bid_nh, 0, 0)),
-            pl.BlockSpec((1, K_, V_), lambda bid_nh: (bid_nh, 0, 0)),
-        ),
+        grid=grid,
+        in_specs=in_specs,
+        out_specs=out_specs,
         interpret=_should_interpret_pallas(),
-    )(q_flat, k_flat, v_flat, g_flat, beta_flat, init_state)
+    )(q_pad, k_pad, v_pad, g_arr, beta_pad, init_kpad, lengths_flat)
 
-    out_flat, final_flat = result
-    out_arr = out_flat.reshape(B_, H_, T_, V_)
-    out_named = hax.named(out_arr, (Batch, Heads, Pos, Dv))
-    out_final = hax.rearrange(out_named, (Batch, Pos, Heads, Dv))
-
+    # Trim and wrap
+    out_trim = out_pad[:, :, :V_]
     if output_final_state:
-        final_arr = final_flat.reshape(B_, H_, K_, V_)
-        return out_final, final_arr
-    else:
-        return out_final, None
+        final_trim = final_pad[:, :, :K_, :V_]  # [B,H,K,V]
+
+    out_bhTv = out_trim.reshape(B_, H_, T_, V_)
+    out_named = hax.named(out_bhTv, (Batch, Heads, Pos, Dv))
+    out_final_named = hax.rearrange(out_named, (Batch, Pos, Heads, Dv))
+
+    final_ret = None if not output_final_state else final_trim.reshape(B_, H_, Dk.size, Dv.size)
+    return out_final_named, final_ret
 
 
 def recurrent_gated_delta_rule(
@@ -669,6 +944,9 @@ def recurrent_gated_delta_rule(
                 initial_state=initial_state,
                 output_final_state=output_final_state,
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                # optional toggles:
+                head_first=False,
+                lengths=None,
             )
         except Exception:
             if use_flash:
