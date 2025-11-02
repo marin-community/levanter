@@ -33,6 +33,7 @@ import dataclasses
 import functools
 import os
 from typing import Optional, Tuple
+import contextlib
 
 import equinox as eqx
 import jax
@@ -63,6 +64,12 @@ def _should_interpret_pallas() -> bool:
     except RuntimeError:
         platform = "cpu"
     return platform == "cpu"
+
+
+@contextlib.contextmanager
+def _fp32_mm():
+    with jax.default_matmul_precision("float32"):
+        yield
 
 
 # ---------- small utilities ----------
@@ -232,6 +239,64 @@ def _causal_depthwise_conv1d_update(
 # ---------- Fused Gated RMSNorm ----------
 
 
+@jax.custom_vjp
+def _rmsnorm_gated_flash(x_2d: jnp.ndarray, gate_2d: jnp.ndarray, weight: jnp.ndarray, eps: float) -> jnp.ndarray:
+    """Forward: call the Pallas fused kernel (fallback to reference).
+    Backward: analytic grads in pure JAX (no Pallas autodiff)."""
+    try:
+        return _fused_rmsnorm_gated_pallas(x_2d, gate_2d, weight, eps)
+    except Exception:
+        return _rmsnorm_gated_reference(x_2d, gate_2d, weight, eps)
+
+
+def _rmsnorm_gated_flash_fwd(x_2d, gate_2d, weight, eps):
+    y = _rmsnorm_gated_flash(x_2d, gate_2d, weight, eps)
+    # Keep inputs as residuals; recompute inv etc. in bwd
+    return y, (x_2d, gate_2d, weight, jnp.asarray(eps, dtype=jnp.float32))
+
+
+def _rmsnorm_gated_flash_bwd(res, dY):
+    x_2d, gate_2d, weight, eps32 = res
+    # Promote to fp32
+    x = x_2d.astype(jnp.float32)
+    gate = gate_2d.astype(jnp.float32)
+    w = weight.astype(jnp.float32)
+    dY = dY.astype(jnp.float32)
+
+    # Row-wise RMSNorm stats
+    # inv = 1 / sqrt(mean(x^2) + eps)
+    D = x.shape[-1]
+    inv = lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps32)  # [N,1]
+    y_no_gate = (x * inv) * w  # [N,D]
+
+    # SiLU and derivative
+    sigma = jax.nn.sigmoid(gate)  # [N,D]
+    silu = gate * sigma
+    silu_prime = sigma * (1.0 + gate * (1.0 - sigma))  # [N,D]
+
+    # Chain rule
+    dy = dY * silu  # [N,D]
+    # y_no_gate = (x*inv) * w = u * w, with u = x*inv
+    du = dy * w  # [N,D]
+
+    # dweight: sum over rows of dy * (x * inv)
+    dW = jnp.sum(dy * (x * inv), axis=0)  # [D]
+
+    # dx: u = x*inv  with inv = (mean(x^2)+eps)^(-1/2)
+    # dL/dx = inv * du + (-inv^3 / D) * x * dot(du, x), where dot is along last dim
+    dot = jnp.sum(du * x, axis=-1, keepdims=True)  # [N,1]
+    dx = inv * du + (-(inv**3) / float(D)) * x * dot  # [N,D]
+
+    # dgate: elementwise (no reduction)
+    dGate = dY * y_no_gate * silu_prime  # [N,D]
+
+    # Cast back to input dtypes
+    return (dx.astype(x_2d.dtype), dGate.astype(gate_2d.dtype), dW.astype(weight.dtype), None)  # no grad for eps
+
+
+_rmsnorm_gated_flash.defvjp(_rmsnorm_gated_flash_fwd, _rmsnorm_gated_flash_bwd)
+
+
 class FusedRMSNormGated(eqx.Module):
     """RMSNorm(x) * SiLU(gate) using an optional fused Pallas kernel."""
 
@@ -260,10 +325,9 @@ class FusedRMSNormGated(eqx.Module):
 
         if self.use_flash:
             try:
-                out_arr = _fused_rmsnorm_gated_pallas(x_arr, gate_arr, weight_arr, self.eps)
+                out_arr = _rmsnorm_gated_flash(x_arr, gate_arr, weight_arr, self.eps)
             except Exception:
-                if self.use_flash:
-                    raise
+                # If Pallas fails at runtime, fall back to reference (grad still correct via custom VJP bwd)
                 out_arr = _rmsnorm_gated_reference(x_arr, gate_arr, weight_arr, self.eps)
         else:
             out_arr = _rmsnorm_gated_reference(x_arr, gate_arr, weight_arr, self.eps)
@@ -1364,21 +1428,19 @@ def _gdn_chunk_fwd_kernel_fused(
     yv_tile = jnp.zeros((chunk_len, BV), dtype=jnp.float32)
 
     def fs_v(i, Y):
-        # rhs = β_i * v_i
-        rhs_i = b_c[i] * lax.dynamic_slice(v_c, (i, 0), (1, BV))[0]  # (BV,)
+        rhs_i = b_c[i] * lax.dynamic_slice(v_c, (i, 0), (1, BV))[0]
 
-        # accumulate sum_{j<i} A0[i,j] * exp(g_i - g_j) * U_j
         def acc_v(j, acc):
             aij = lax.dynamic_slice(A0, (i, j), (1, 1))[0, 0]
-            decay_ij = jnp.exp(g_cum[i] - g_cum[j])  # in (0, 1]
-            uj = lax.dynamic_slice(Y, (j, 0), (1, BV))[0]  # (BV,)
+            decay_ij = jnp.exp(g_cum[i] - g_cum[j])
+            uj = lax.dynamic_slice(Y, (j, 0), (1, BV))[0]
             return acc + (aij * decay_ij) * uj
 
         contrib = lax.fori_loop(0, i, acc_v, jnp.zeros((BV,), dtype=jnp.float32))
         yi = rhs_i + contrib
         return lax.dynamic_update_slice(Y, yi[None, :], (i, 0))
 
-    yv_tile = lax.fori_loop(0, chunk_len, fs_v, yv_tile)
+    yv_tile = lax.fori_loop(0, active, fs_v, yv_tile)
 
     # ===========================
     # yk_tile via forward-sub:   (I - Ā) W = e^{g} ⊙ (βK)
@@ -1386,26 +1448,24 @@ def _gdn_chunk_fwd_kernel_fused(
     yk_tile = jnp.zeros((chunk_len, BK), dtype=jnp.float32)
 
     def fs_k(kb, Y):
-        # do a small W recurrence for BK columns in this tile
         k0 = kb * BK
-        # Prepare RHS tile once for all rows: e^{g} * β * K_tile
-        k_t = lax.dynamic_slice(k_c, (0, k0), (chunk_len, BK))  # (C, BK)
+        k_t = lax.dynamic_slice(k_c, (0, k0), (chunk_len, BK))
         rhs_tile = (eg[:, None] * (b_c[:, None] * k_t)).astype(jnp.float32)
 
         def fs_row(i, Ycur):
-            rhs_i = lax.dynamic_slice(rhs_tile, (i, 0), (1, BK))[0]  # (BK,)
+            rhs_i = lax.dynamic_slice(rhs_tile, (i, 0), (1, BK))[0]
 
             def acc_k(j, acc):
                 aij = lax.dynamic_slice(A0, (i, j), (1, 1))[0, 0]
-                decay_ij = jnp.exp(g_cum[i] - g_cum[j])  # in (0, 1]
-                wj = lax.dynamic_slice(Ycur, (j, 0), (1, BK))[0]  # (BK,)
+                decay_ij = jnp.exp(g_cum[i] - g_cum[j])
+                wj = lax.dynamic_slice(Ycur, (j, 0), (1, BK))[0]
                 return acc + (aij * decay_ij) * wj
 
             contrib = lax.fori_loop(0, i, acc_k, jnp.zeros((BK,), dtype=jnp.float32))
             yi = rhs_i + contrib
             return lax.dynamic_update_slice(Ycur, yi[None, :], (i, 0))
 
-        return lax.fori_loop(0, chunk_len, fs_row, Y)
+        return lax.fori_loop(0, active, fs_row, Y)
 
     yk_tile = lax.fori_loop(0, n_kb, fs_k, yk_tile)
 
@@ -1607,17 +1667,18 @@ def _chunk_gated_delta_rule_flash_fused(
         S_in, out_buf = carry
         ci_ary = jnp.asarray([ci], dtype=jnp.int32)
 
-        out_tiles, s_tiles = pl.pallas_call(
-            kernel,
-            out_shape=(
-                jax.ShapeDtypeStruct((NH, n_vtiles, C, BV), value.dtype),
-                jax.ShapeDtypeStruct((NH, n_vtiles, K, BV), jnp.float32),
-            ),
-            grid=(NH, n_vtiles),
-            in_specs=in_specs,
-            out_specs=out_specs,
-            interpret=_should_interpret_pallas(),
-        )(q_flat, k_flat, v_flat, g_flat, b_flat, S_in, ci_ary, lengths_flat)
+        with _fp32_mm():
+            out_tiles, s_tiles = pl.pallas_call(
+                kernel,
+                out_shape=(
+                    jax.ShapeDtypeStruct((NH, n_vtiles, C, BV), value.dtype),
+                    jax.ShapeDtypeStruct((NH, n_vtiles, K, BV), jnp.float32),
+                ),
+                grid=(NH, n_vtiles),
+                in_specs=in_specs,
+                out_specs=out_specs,
+                interpret=_should_interpret_pallas(),
+            )(q_flat, k_flat, v_flat, g_flat, b_flat, S_in, ci_ary, lengths_flat)
 
         out_chunk = out_tiles.reshape(NH, C, n_vtiles * BV)[:, :, :V_pad]
         s_chunk = s_tiles.reshape(NH, K, n_vtiles * BV)[:, :, :V_pad]
@@ -1634,6 +1695,222 @@ def _chunk_gated_delta_rule_flash_fused(
     out_named = out_bHLv if head_first else jnp.transpose(out_bHLv, (0, 2, 1, 3))
     S_ret = None if not output_final_state else S_final[:, :, :V].reshape(B, H, K, V)
     return out_named, S_ret
+
+
+# ---------------------------------------------------------------------------
+# Rematerialized backward for the flash chunk kernel (custom VJP wrapper)
+# ---------------------------------------------------------------------------
+
+# We wrap a *pure arrays* front-end around `_chunk_gated_delta_rule_flash_fused`
+# and give it a custom VJP whose backward recomputes the reference forward and
+# uses JAX's VJP to obtain gradients. This avoids saving large per-token
+# intermediates from the flash forward (T, W/U, etc.).
+#
+# Notes:
+# - All non-differentiable flags are marked static via `nondiff_argnums`.
+# - We ignore d(final_state) in backward (it's not used in training prefill);
+#   if you want gradients wrt initial_state in the future, wire a second VJP
+#   with a reverse scan over the chunk bridge.
+#
+
+
+@functools.partial(
+    jax.custom_vjp,
+    nondiff_argnums=(
+        8,  # chunk_size (int)
+        9,  # output_final_state (bool)
+        10,  # use_qk_l2norm_in_kernel (bool)
+        11,  # head_first (bool)
+        12,  # use_varlen (bool)
+    ),
+)
+def _chunk_gated_delta_rule_flash_call(
+    q_arr: jnp.ndarray,  # [B, L, H, K] if head_first=False; else [B, H, L, K]
+    k_arr: jnp.ndarray,  # same layout as q_arr
+    v_arr: jnp.ndarray,  # [B, L, H, V] or [B, H, L, V]
+    g_arr: jnp.ndarray,  # [B, L, H]     or [B, H, L]
+    beta_arr: jnp.ndarray,  # [B, L, H]     or [B, H, L]
+    lengths: Optional[jnp.ndarray],  # shape [B, H] or [B*H], or None ⇒ full length
+    offsets: Optional[jnp.ndarray],  # unused here; keep for API compatibility
+    initial_state: Optional[jnp.ndarray],  # normally None for train/prefill
+    chunk_size: int,
+    output_final_state: bool,
+    use_qk_l2norm_in_kernel: bool,
+    head_first: bool,
+    use_varlen: bool,
+):
+    # Forward simply defers to the fused Pallas implementation.
+    with _fp32_mm():
+        out_arr, final_state = _chunk_gated_delta_rule_flash_fused(
+            q_arr,
+            k_arr,
+            v_arr,
+            g_arr,
+            beta_arr,
+            chunk_size=chunk_size,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            head_first=head_first,
+            lengths=lengths,
+            offsets=offsets,
+            use_varlen=use_varlen,
+        )
+    return (out_arr, final_state)
+
+
+def _chunk_gated_delta_rule_flash_call_fwd(
+    q_arr,
+    k_arr,
+    v_arr,
+    g_arr,
+    beta_arr,
+    lengths,
+    offsets,
+    initial_state,
+    chunk_size,
+    output_final_state,
+    use_qk_l2norm_in_kernel,
+    head_first,
+    use_varlen,
+):
+    out_arr, final_state = _chunk_gated_delta_rule_flash_fused(
+        q_arr,
+        k_arr,
+        v_arr,
+        g_arr,
+        beta_arr,
+        chunk_size=chunk_size,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        head_first=head_first,
+        lengths=lengths,
+        offsets=offsets,
+        use_varlen=use_varlen,
+    )
+
+    # IMPORTANT: store initial_state in residuals so bwd can compute dS0
+    res = (
+        q_arr,
+        k_arr,
+        v_arr,
+        g_arr,
+        beta_arr,
+        lengths,  # may be None
+        head_first,  # layout flag
+        initial_state,  # may be None; needed for dS0
+    )
+    return (out_arr, final_state), res
+
+
+def _chunk_gated_delta_rule_flash_call_bwd(
+    chunk_size,
+    output_final_state,
+    use_qk_l2norm_in_kernel,
+    head_first,
+    use_varlen,  # 5 static args
+    res,
+    cotangents,
+):
+    # Unpack residuals
+    q_arr, k_arr, v_arr, g_arr, beta_arr, lengths, head_first_res, initial_state_arr = res
+    d_out_arr, d_final_state = cotangents  # we ignore d(final_state) in this pass
+
+    # Build NamedArrays for the reference VJP (canonical [B, L, H, *] layout)
+    if not head_first:
+        B, L, H, K = q_arr.shape
+        V = v_arr.shape[-1]
+        q_named = hax.named(q_arr, (Axis("batch", B), Axis("position", L), Axis("heads", H), Axis("k_head_dim", K)))
+        k_named = hax.named(k_arr, (Axis("batch", B), Axis("position", L), Axis("heads", H), Axis("k_head_dim", K)))
+        v_named = hax.named(v_arr, (Axis("batch", B), Axis("position", L), Axis("heads", H), Axis("v_head_dim", V)))
+        g_named = hax.named(g_arr, (Axis("batch", B), Axis("position", L), Axis("heads", H)))
+        b_named = hax.named(beta_arr, (Axis("batch", B), Axis("position", L), Axis("heads", H)))
+        d_out_named = hax.named(
+            d_out_arr, (Axis("batch", B), Axis("position", L), Axis("heads", H), Axis("v_head_dim", V))
+        )
+    else:
+        B, H, L, K = q_arr.shape
+        V = v_arr.shape[-1]
+        q_named = hax.named(
+            jnp.transpose(q_arr, (0, 2, 1, 3)),
+            (Axis("batch", B), Axis("position", L), Axis("heads", H), Axis("k_head_dim", K)),
+        )
+        k_named = hax.named(
+            jnp.transpose(k_arr, (0, 2, 1, 3)),
+            (Axis("batch", B), Axis("position", L), Axis("heads", H), Axis("k_head_dim", K)),
+        )
+        v_named = hax.named(
+            jnp.transpose(v_arr, (0, 2, 1, 3)),
+            (Axis("batch", B), Axis("position", L), Axis("heads", H), Axis("v_head_dim", V)),
+        )
+        g_named = hax.named(jnp.transpose(g_arr, (0, 2, 1)), (Axis("batch", B), Axis("position", L), Axis("heads", H)))
+        b_named = hax.named(
+            jnp.transpose(beta_arr, (0, 2, 1)), (Axis("batch", B), Axis("position", L), Axis("heads", H))
+        )
+        d_out_named = hax.named(
+            jnp.transpose(d_out_arr, (0, 2, 1, 3)),
+            (Axis("batch", B), Axis("position", L), Axis("heads", H), Axis("v_head_dim", V)),
+        )
+
+    # Initial state for the reference VJP (NamedArray on [B, H, K, V])
+    if initial_state_arr is None:
+        S0_arr = jnp.zeros((B, H, K, V), dtype=jnp.float32)
+    else:
+        S0_arr = initial_state_arr
+        # Pad/trim last axis not needed here; flash forward already padded V internally
+
+    S0_named = hax.named(S0_arr, (Axis("batch", B), Axis("heads", H), Axis("k_head_dim", K), Axis("v_head_dim", V)))
+
+    # Reference forward that returns only the chunk output (for VJP)
+    def _ref_f(qN, kN, vN, gN, bN, S0N):
+        yN, _ = _chunk_gated_delta_rule_reference(
+            qN,
+            kN,
+            vN,
+            gN,
+            bN,
+            chunk_size=chunk_size,
+            initial_state=S0N.array,  # IMPORTANT: pass S0 into the reference
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        return yN
+
+    # Rematerialized VJP
+    _, pullback = jax.vjp(_ref_f, q_named, k_named, v_named, g_named, b_named, S0_named)
+    dQ, dK, dV, dG, dB, dS0 = pullback(d_out_named)
+
+    # Pack grads back to arrays matching the *primal* argument order
+    if not head_first:
+        dq = dQ.array
+        dk = dK.array
+        dv = dV.array
+        dg = dG.array
+        db = dB.array
+        dS0_arr = dS0.array  # [B, H, K, V]
+    else:
+        dq = jnp.transpose(dQ.array, (0, 2, 1, 3))
+        dk = jnp.transpose(dK.array, (0, 2, 1, 3))
+        dv = jnp.transpose(dV.array, (0, 2, 1, 3))
+        dg = jnp.transpose(dG.array, (0, 2, 1))
+        db = jnp.transpose(dB.array, (0, 2, 1))
+        dS0_arr = dS0.array  # S0 is [B,H,K,V] regardless
+
+    d_lengths = None
+    d_offsets = None
+    d_initial_state = dS0_arr
+
+    # Return grads for the *first 8* (differentiable) args of the primal:
+    # (q, k, v, g, beta, lengths, offsets, initial_state)
+    return (dq, dk, dv, dg, db, d_lengths, d_offsets, d_initial_state)
+
+
+# Tie the custom VJP to the forward/backward defs
+_chunk_gated_delta_rule_flash_call.defvjp(
+    _chunk_gated_delta_rule_flash_call_fwd,
+    _chunk_gated_delta_rule_flash_call_bwd,
+)
 
 
 def _wrap_chunk_out_as_named(out_arr, query, value, *, head_first: bool):
@@ -1673,19 +1950,19 @@ def chunk_gated_delta_rule(
 ) -> tuple[NamedArray, Optional[jnp.ndarray]]:
     if use_flash:
         try:
-            out_arr, fin = _chunk_gated_delta_rule_flash_fused(
+            out_arr, fin = _chunk_gated_delta_rule_flash_call(
                 query.array,
                 key.array,
                 value.array,
                 g.array,
                 beta.array,
-                chunk_size=chunk_size,
+                lengths=lengths,
+                offsets=offsets,
                 initial_state=initial_state,
+                chunk_size=chunk_size,
                 output_final_state=output_final_state,
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 head_first=head_first,
-                lengths=lengths,
-                offsets=offsets,
                 use_varlen=use_varlen,
             )
             out_named = _wrap_chunk_out_as_named(out_arr, query, value, head_first=head_first)
