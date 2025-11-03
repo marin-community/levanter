@@ -30,6 +30,7 @@ from test_utils import (
     check_load_config,
     check_model_works_with_seqlen,
     parameterize_with_configs,
+    skip_if_hf_model_not_accessible,
     skip_if_no_torch,
     use_test_mesh,
 )
@@ -38,6 +39,7 @@ from test_utils import (
 # N.B. Gemma uses LLamaAttention directly so we skip tests for attention and rotary embeddings.
 
 
+@skip_if_hf_model_not_accessible("google/gemma-2b")
 @skip_if_no_torch
 def test_gemma_config():
     # load HF config and convert to levanter config
@@ -312,6 +314,7 @@ def test_gemma2_mlp():
     chex.assert_trees_all_close(hf_out.detach().cpu().numpy(), out.array, rtol=1e-5, atol=1e-5)
 
 
+@skip_if_hf_model_not_accessible("google/gemma-2-2b")
 @skip_if_no_torch
 def test_gemma2_roundtrip():
     import torch
@@ -499,6 +502,7 @@ def test_gemma3_decoder_layer(num_kv_heads):
     chex.assert_trees_all_close(hf_out[0].detach().cpu().numpy(), lev_out.array, rtol=1e-4, atol=1e-4)
 
 
+@skip_if_hf_model_not_accessible("google/gemma-3-1b-pt")
 @skip_if_no_torch
 def test_gemma3_roundtrip():
     import torch

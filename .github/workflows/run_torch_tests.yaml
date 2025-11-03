@@ -19,7 +19,7 @@ jobs:
       - name: Set up Python
         run: uv python install
       - name: Install dependencies
-        run: uv sync --dev --extra torch_test
+        run: uv sync --dev
       - name: Install PyTorch CPU wheels
         run: uv pip install --index-url https://download.pytorch.org/whl/cpu torch
       - name: Run PyTorch-marked tests

@@ -28,7 +28,7 @@ from levanter.lora import (
     save_merged_hf_model,
     save_peft_pretrained,
 )
-from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
+from levanter.models.gpt2 import Gpt2Config, Gpt2LMHeadModel
 from levanter.trainer_state import TrainerState
 from levanter.utils.tree_utils import inference_mode
 from test_utils import skip_if_module_missing, skip_if_no_torch, use_test_mesh
@@ -154,11 +154,11 @@ def test_merge_lora():
 def test_lora_load_in_peft():
     import torch
 
-    converter: HFCheckpointConverter = LlamaConfig().hf_checkpoint_converter()
-    config = LlamaConfig(seq_len=128, intermediate_dim=512, num_layers=2, num_heads=2, num_kv_heads=2)
+    converter: HFCheckpointConverter = Gpt2Config().hf_checkpoint_converter()
+    config = Gpt2Config(seq_len=128, hidden_dim=128, num_layers=2, num_heads=2)
     Vocab = converter.Vocab
 
-    model = LlamaLMHeadModel.init(Vocab, config=config, key=jax.random.PRNGKey(0))
+    model = Gpt2LMHeadModel.init(Vocab, config=config, key=jax.random.PRNGKey(0))
     model = inference_mode(model, True)
 
     input = hax.random.randint(jax.random.PRNGKey(0), config.Pos, 0, Vocab.size)
@@ -204,11 +204,11 @@ def test_lora_load_in_peft():
 def test_lora_merged_load_in_hf():
     import torch
 
-    converter: HFCheckpointConverter = LlamaConfig().hf_checkpoint_converter()
-    config = LlamaConfig(seq_len=128, intermediate_dim=512, num_layers=2, num_heads=2, num_kv_heads=2)
+    converter: HFCheckpointConverter = Gpt2Config().hf_checkpoint_converter()
+    config = Gpt2Config(seq_len=128, hidden_dim=128, num_layers=2, num_heads=2)
     Vocab = converter.Vocab
 
-    model = LlamaLMHeadModel.init(Vocab, config=config, key=jax.random.PRNGKey(0))
+    model = Gpt2LMHeadModel.init(Vocab, config=config, key=jax.random.PRNGKey(0))
     model = inference_mode(model, True)
 
     input = hax.random.randint(jax.random.PRNGKey(0), config.Pos, 0, Vocab.size)
