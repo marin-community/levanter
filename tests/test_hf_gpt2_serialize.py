@@ -102,7 +102,9 @@ def _roundtrip_compare_gpt2_checkpoint(model_id, revision, config: Optional[Gpt2
             torch_out2 = torch_out2.logits[0].detach().cpu().numpy()
             torch_out2 = jax.nn.softmax(torch_out2, axis=-1)
 
-            assert onp.isclose(torch_out2, onp.array(jax_out), rtol=1e-2, atol=1e-2).all(), f"{torch_out2} != {jax_out}"
+            assert onp.isclose(
+                torch_out2, onp.array(jax_out), rtol=1e-2, atol=1e-2
+            ).all(), f"{torch_out2} != {jax_out}"
 
 
 # Gradient tests
