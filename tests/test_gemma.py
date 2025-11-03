@@ -26,7 +26,13 @@ from levanter.models.gemma import (
 )
 from levanter.models.llama import LlamaMlp
 from levanter.utils.jax_utils import parameter_count
-from test_utils import check_load_config, check_model_works_with_seqlen, parameterize_with_configs, skip_if_no_torch
+from test_utils import (
+    check_load_config,
+    check_model_works_with_seqlen,
+    parameterize_with_configs,
+    skip_if_no_torch,
+    use_test_mesh,
+)
 
 
 # N.B. Gemma uses LLamaAttention directly so we skip tests for attention and rotary embeddings.
@@ -341,7 +347,7 @@ def test_gemma2_roundtrip():
     torch_out = torch_out.logits[0].detach().cpu().numpy()
     torch_out = jax.nn.softmax(torch_out, axis=-1)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory() as tmpdir, use_test_mesh():
         torch_model.save_pretrained(f"{tmpdir}/torch_model")
 
         model = converter.load_pretrained(
@@ -529,7 +535,7 @@ def test_gemma3_roundtrip():
     torch_out = torch_out.logits[0].detach().cpu().numpy()
     torch_out = jax.nn.softmax(torch_out, axis=-1)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory() as tmpdir, use_test_mesh():
         torch_model.save_pretrained(f"{tmpdir}/torch_model")
 
         model = converter.load_pretrained(

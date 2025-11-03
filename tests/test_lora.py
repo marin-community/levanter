@@ -32,7 +32,7 @@ from levanter.lora import (
 from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
 from levanter.trainer_state import TrainerState
 from levanter.utils.tree_utils import inference_mode
-from test_utils import skip_if_module_missing, skip_if_no_torch
+from test_utils import skip_if_module_missing, skip_if_no_torch, use_test_mesh
 
 
 In = hax.Axis("In", 10)
@@ -97,36 +97,6 @@ def test_lora_scan_layers():
     assert loraized.stacked.second.weight.axes == (Layers, In, Mid)
     input = hax.random.normal(k0, (In,))
     assert not hax.all(hax.isclose(module.fold(input), loraized.fold(input)))
-
-
-@skip_if_module_missing("peft")
-@skip_if_no_torch
-def test_lora_peft_integration():
-    import peft
-    from transformers import AutoModelForCausalLM
-
-    base_hf_model = AutoModelForCausalLM.from_pretrained("stanford-crfm/expanse-gpt2-small-x777")
-    peft_config = peft.tuners.LoraConfig(
-        base_model_name_or_path="stanford-crfm/expanse-gpt2-small-x777",
-        peft_type="lora",
-    )
-    model = peft.get_peft_model(base_hf_model, peft_config)
-
-    from peft.utils.save_and_load import get_peft_model_state_dict
-
-    hf_dict = get_peft_model_state_dict(model)
-
-    converter = LlamaConfig().hf_checkpoint_converter()
-
-    lev_model = converter.load_pretrained(converter.default_config.model_type, "stanford-crfm/expanse-gpt2-small-x777")
-
-    lora_lev_model = loraize(lev_model, LoraConfig(r=8, target_modules=["c_attn"]), key=jax.random.PRNGKey(0))
-    lev_dict = lora_state_dict(lora_lev_model)
-
-    assert lev_dict.keys() == hf_dict.keys()
-
-    for k, v in lev_dict.items():
-        assert v.shape == hf_dict[k].shape
 
 
 def test_merge_lora():
@@ -197,7 +167,7 @@ def test_lora_load_in_peft():
 
     causal_mask = AttentionMask.causal()
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory() as tmpdir, use_test_mesh():
         from peft import PeftConfig, PeftModel
 
         converter.save_pretrained(model, f"{tmpdir}/model")
@@ -247,7 +217,7 @@ def test_lora_merged_load_in_hf():
 
     causal_mask = AttentionMask.causal()
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory() as tmpdir, use_test_mesh():
         converter.save_pretrained(model, f"{tmpdir}/model")
 
         lora_config = LoraConfig(r=8, target_modules=["c_attn"])

@@ -11,7 +11,7 @@ import haliax as hax
 
 from levanter.layers.attention import AttentionMask
 from levanter.models.qwen import QwenConfig, QwenLMHeadModel
-from test_utils import skip_if_no_torch
+from test_utils import skip_if_no_torch, use_test_mesh
 
 
 def get_config(vocab_size=1000):
@@ -90,7 +90,7 @@ def test_qwen_roundtrip():
     torch_out = torch_out.logits[0].detach().cpu().numpy()
     # torch_out = jax.nn.softmax(torch_out, axis=-1)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory() as tmpdir, use_test_mesh():
         torch_model.save_pretrained(f"{tmpdir}/torch_model")
 
         model = converter.load_pretrained(
