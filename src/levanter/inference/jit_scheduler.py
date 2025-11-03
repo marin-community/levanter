@@ -583,6 +583,15 @@ class DecodeState(eqx.Module):
     # Cached finished flags per sequence (updated when tokens are enqueued)
     finished: ht.bool_[NamedArray, "seq"]
 
+    def reset(self):
+        return DecodeState.init(
+            page_table=self.page_table.reset(),
+            pad_token_id=self.tokens.array[0, 0],
+            max_stop_seqs=self.stop_tokens.shape["stop_seq"] if self.stop_tokens is not None else 0,
+            max_stop_tokens=self.stop_tokens.shape["position"] if self.stop_tokens is not None else 0,
+            max_queued_tokens=self.tqueue.max_queued_tokens,
+        )
+
     @staticmethod
     def init(
         page_table: PageTable,
