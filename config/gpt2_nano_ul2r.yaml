@@ -26,7 +26,7 @@ trainer:
 
 data:
   id: dlwh/wikitext_103_detokenized
-  cache_dir: /teamspace/studios/this_studio/marin_cache
+  cache_dir: /workspace/marin_cache
   tokenizer: ./gpt2_ul2r_DEV
   format:
     type: ul2r

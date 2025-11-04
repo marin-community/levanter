@@ -483,6 +483,8 @@ class Trainer:
             loss = result.loss.item()
 
             if self.config.crash_on_nan and jnp.isnan(loss):
+                jnp.set_printoptions(threshold=sys.maxsize, linewidth=sys.maxsize)
+                print(f"batch={batch}")
                 raise RuntimeError("Loss is NaN")
 
             if self.config.crash_on_inf and jnp.isinf(loss):
