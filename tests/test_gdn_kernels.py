@@ -837,7 +837,6 @@ def test_recurrent_backward_matches_hf():
 
     tq, tk, tv, tg, tb, tS0 = [x.grad.detach().cpu().numpy() for x in (q_t, k_t, v_t, g_t, b_t, S0_t)]
 
-    # Compare
     np.testing.assert_allclose(jq, tq, rtol=1e-4, atol=5e-6)
     np.testing.assert_allclose(jk, tk, rtol=1e-4, atol=5e-6)
     np.testing.assert_allclose(jv, tv, rtol=1e-4, atol=5e-6)
@@ -918,7 +917,6 @@ def test_chunk_backward_matches_hf(use_flash: bool):
 
     tq, tk, tv, tg, tb, tS0 = [x.grad.detach().cpu().numpy() for x in (q_t, k_t, v_t, g_t, b_t, S0_t)]
 
-    # Compare
     np.testing.assert_allclose(jq, tq, rtol=1e-4, atol=5e-6)
     np.testing.assert_allclose(jk, tk, rtol=1e-4, atol=5e-6)
     np.testing.assert_allclose(jv, tv, rtol=1e-4, atol=5e-6)

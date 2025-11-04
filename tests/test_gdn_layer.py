@@ -227,6 +227,56 @@ def test_layer_gradients_exist():
 
 
 @skip_if_no_torch
+def test_gdn_layer_backward_matches_hf():
+    import torch
+
+    # Small configuration for a reasonably fast backward parity check
+    hidden_size, nk, nv, dk, dv, ksz = 96, 2, 2, 8, 8, 4
+    hf_cfg, hf_layer = _init_small_hf_layer(hidden_size, nk, nv, dk, dv, ksz)
+
+    # Initialize an equivalent Levanter layer from HF weights
+    lev_cfg = GatedDeltaNetConfig(
+        Embed=Axis("embed", hidden_size),
+        num_k_heads=nk,
+        num_v_heads=nv,
+        head_k_dim=dk,
+        head_v_dim=dv,
+        conv_kernel_size=ksz,
+        rms_norm_eps=1e-6,
+    )
+    lev_state = _lev_state_from_hf_layer(lev_cfg, hf_layer)
+    lev_layer = GatedDeltaNet.from_state_dict(lev_cfg, lev_state, key=jax.random.PRNGKey(0))
+
+    # Random input
+    B, L = 1, 16
+    x_j = jax.random.normal(jax.random.PRNGKey(0), (B, L, hidden_size), dtype=jnp.float32)
+    x_named = hax.named(x_j, (Axis("batch", B), Axis("position", L), Axis("embed", hidden_size)))
+
+    # JAX gradient wrt inputs
+    def loss_fn(x_arr):
+        x = hax.named(x_arr, x_named.axes)
+        y, _ = lev_layer(x, inference=False, chunk_size=8)
+        return jnp.sum(y.array)
+
+    g_jax = jax.grad(loss_fn)(x_named.array)
+
+    # HF (Torch) gradient wrt inputs
+    x_t = torch.from_numpy(np.array(x_j))
+    x_t.requires_grad_(True)
+    out_t = hf_layer(
+        hidden_states=x_t,
+        cache_params=None,
+        cache_position=None,
+        attention_mask=None,
+    )
+    loss_t = out_t.sum()
+    loss_t.backward()
+    g_torch = x_t.grad.detach().cpu().numpy()
+
+    np.testing.assert_allclose(np.array(g_jax), g_torch, rtol=1e-4, atol=1e-5)
+
+
+@skip_if_no_torch
 def test_gdn_layer_matches_hf_prefill():
     import torch  # local import for environments without torch
 

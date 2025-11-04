@@ -1694,6 +1694,8 @@ def _gdn_chunk_bwd_kernel_fused(
     g_c = g_chunk_ref[dslice(nh, 1), dslice(0, C)][0].astype(jnp.float32)  # [C]
     b_c = beta_chunk_ref[dslice(nh, 1), dslice(0, C)][0].astype(jnp.float32)  # [C]
     A0 = a0_chunk_ref[dslice(nh, 1), dslice(0, C), dslice(0, C)][0].astype(jnp.float32)  # [C, C]
+    # Ensure A0 is finite to prevent propagation of NaNs from any undefined tiles
+    A0 = jnp.nan_to_num(A0)
     S_prev = s_prev_tile_ref[dslice(nh, 1), dslice(0, K), dslice(0, BV)][0].astype(jnp.float32)  # [K, BV]
     dY = dout_tile_ref[dslice(nh, 1), dslice(0, C), dslice(0, BV)][0].astype(jnp.float32)  # [C, BV]
     dS_in = dS_in_tile_ref[dslice(nh, 1), dslice(0, K), dslice(0, BV)][0].astype(jnp.float32)  # [K, BV]
@@ -1967,6 +1969,19 @@ def _gdn_chunk_bwd_kernel_fused(
 
     # S_prev: local (inter + v_new path) + carry α_tail
     dS_out = (dS_prev_local + alpha_tail * dS_in).astype(jnp.float32)
+
+    # Final numerical safety: replace any NaNs/infs with zeros to ensure finite grads
+    dQ_attn = jnp.nan_to_num(dQ_attn)
+    dQ_inter = jnp.nan_to_num(dQ_inter)
+    dK_attn = jnp.nan_to_num(dK_attn)
+    dK_rhs = jnp.nan_to_num(dK_rhs)
+    dK_from_A0 = jnp.nan_to_num(dK_from_A0)
+    dK_add = jnp.nan_to_num(dK_add)
+    dK_tile = jnp.nan_to_num(dK_tile)
+    dV_tile = jnp.nan_to_num(dV_tile)
+    dG_tile = jnp.nan_to_num(dG_tile)
+    dB_tile = jnp.nan_to_num(dB_tile)
+    dS_out = jnp.nan_to_num(dS_out)
 
     # dV tile already masked above; ensure dtype matches out ref
     dV_tile = dV_tile * m[:, None]
