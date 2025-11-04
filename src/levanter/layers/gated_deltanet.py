@@ -46,11 +46,11 @@ import haliax as hax
 import haliax.nn as hnn
 from haliax import Axis, NamedArray
 
-_GDN_DBG = bool(int(os.environ.get("GDN_DEBUG_SHARDING", "0")))
+_GDN_DBG_SHARDING = bool(int(os.environ.get("GDN_DEBUG_SHARDING", "0")))
 
 
 def _dbg(tag: str, arr):
-    if not _GDN_DBG:
+    if not _GDN_DBG_SHARDING:
         return
     try:
         jax.debug.inspect_array_sharding(arr, callback=lambda s: print(f"[GDN][internal] {tag}: {s}"))
@@ -1670,6 +1670,11 @@ def _gdn_chunk_bwd_kernel_fused(
     dG_chunk_ref,  # [NH, 1, C]
     dB_chunk_ref,  # [NH, 1, C]
     dS_out_tile_ref,  # [NH, K, BV]
+    dK_attn_only_ref,  # [NH, 1, C, K]
+    dK_rhs_only_ref,  # [NH, 1, C, K]
+    dK_A0_only_ref,  # [NH, 1, C, K]
+    dK_add_only_ref,  # [NH, 1, C, K]
+    d_rhs_k_only_ref,  # [NH, 1, C, K]
     *,
     C: int,
     K: int,
@@ -1778,9 +1783,12 @@ def _gdn_chunk_bwd_kernel_fused(
     W = (qk * dAttn) * decay * tril  # [C, C]
     dgc_attn = jnp.sum(W, axis=1) - jnp.sum(W, axis=0)  # [C]
 
-    # Inter term
+    # Inter term (out_i += (q_i * e^{g_cum_i})^T S_prev)
     dQ_inter = (dY @ jnp.transpose(S_prev)) * eg[:, None]  # [C, K]
     dS_prev_local = jnp.transpose(q_c * eg[:, None]) @ dY  # [K, BV]
+    # g from "inter":  d/d g_cum[i] inter_i = <dY_i, S_prev^T q_i> * e^{g_cum[i]}
+    inter_base = q_c @ S_prev  # [C, BV]
+    dgc_inter = eg * jnp.sum(inter_base * dY, axis=-1)  # [C]
 
     # -------------------------------------------------------------------------
     # v_new path
@@ -1808,31 +1816,35 @@ def _gdn_chunk_bwd_kernel_fused(
     #   d_rhs_v ∈ ℝ^{C×BV}, dAbar_v ∈ ℝ^{C×C}
     #   d_rhs_k ∈ ℝ^{C×K},  dAbar_k ∈ ℝ^{C×C}
     # -------------------------------------------------------------------------
-    def bwd_sub(dy, width, is_vec_rhs):
-        # dy: [C, width]; returns (d_rhs: [C, width], dAbar: [C, C])
+    def bwd_sub(dy, Y_fwd):
+        # dy:    [C, width]
+        # Y_fwd: [C, width]
+        # returns (d_rhs: [C, width], dAbar: [C, C])
+        width = Y_fwd.shape[1]
         d_rhs = jnp.zeros((C, width), jnp.float32)
         dAbar = jnp.zeros((C, C), jnp.float32)
 
         def row_rev(i_rev, state):
             d_rhs_cur, dA = state
             i = active - 1 - i_rev
+            # Sensitivity at row i: accumulate incoming gradient before propagating
             dyi = lax.dynamic_slice(dy, (i, 0), (1, width))[0]
-            d_rhs_cur = lax.dynamic_update_slice(d_rhs_cur, dyi[None, :], (i, 0))
+            zi_prev = lax.dynamic_slice(d_rhs_cur, (i, 0), (1, width))[0]
+            zi = zi_prev + dyi  # total adjoint for row i
+            d_rhs_cur = lax.dynamic_update_slice(d_rhs_cur, zi[None, :], (i, 0))
 
             def upd_j(j, inner):
                 dA_cur, d_rhs_inner = inner
                 aij = lax.dynamic_slice(A0, (i, j), (1, 1))[0, 0]
                 decay = jnp.exp(g_cum[i] - g_cum[j])
-                yj = lax.dynamic_slice(d_rhs_cur, (j, 0), (1, width))[
-                    0
-                ]  # back‑sub structure uses already‑accumulated RHS
-                # dAbar[i,j] += <dyi, yj>
-                val = lax.dynamic_slice(dA_cur, (i, j), (1, 1))[0, 0] + jnp.sum(dyi * yj)
+                # dAbar[i,j] += <z_i, y_j>
+                yj = lax.dynamic_slice(Y_fwd, (j, 0), (1, width))[0]
+                val = lax.dynamic_slice(dA_cur, (i, j), (1, 1))[0, 0] + jnp.sum(zi * yj)
                 dA_cur = lax.dynamic_update_slice(dA_cur, jnp.asarray([[val]], jnp.float32), (i, j))
-                # d_rhs[j] += (aij * decay) * dyi
+                # back-prop to earlier rhs row j using accumulated adjoint z_i
                 d_rhs_inner = lax.dynamic_update_slice(
                     d_rhs_inner,
-                    (lax.dynamic_slice(d_rhs_inner, (j, 0), (1, width))[0] + (aij * decay) * dyi)[None, :],
+                    (lax.dynamic_slice(d_rhs_inner, (j, 0), (1, width))[0] + (aij * decay) * zi)[None, :],
                     (j, 0),
                 )
                 return (dA_cur, d_rhs_inner)
@@ -1842,36 +1854,26 @@ def _gdn_chunk_bwd_kernel_fused(
 
         return lax.fori_loop(0, active, row_rev, (d_rhs, dAbar))
 
-    d_rhs_v, dAbar_v = bwd_sub(dyv, BV, True)  # seeds from dv_new_total
-    d_rhs_k, dAbar_k = bwd_sub(dyk, K, False)
+    # Use the FORWARD solutions computed above
+    d_rhs_v, dAbar_v = bwd_sub(dyv, yv)
+    d_rhs_k, dAbar_k = bwd_sub(dyk, yk)
 
     dAbar = dAbar_v + dAbar_k  # [C, C]
 
     # -------------------------------------------------------------------------
-    # Map dAbar → (dA0, d g_cum)   with  A = (A0 ⊙ decay), strictly lower
+    # Vectorized map: dAbar → (dA0, d g_cum).  A = (A0 ⊙ decay) on strictly-lower.
     # -------------------------------------------------------------------------
-    dA0 = jnp.zeros_like(A0)
-    dgc_from_A = jnp.zeros((C,), jnp.float32)
-
-    def tri_map(i, carry):
-        dA0_cur, dgc_cur = carry
-
-        def col(j, inner):
-            dA0_i, dgc_i = inner
-            aij0 = lax.dynamic_slice(A0, (i, j), (1, 1))[0, 0]
-            decay = jnp.exp(g_cum[i] - g_cum[j])
-            dAij = lax.dynamic_slice(dAbar, (i, j), (1, 1))[0, 0]
-            # dA0 += dAbar * decay
-            val = lax.dynamic_slice(dA0_i, (i, j), (1, 1))[0, 0] + dAij * decay
-            dA0_i = lax.dynamic_update_slice(dA0_i, jnp.asarray([[val]], jnp.float32), (i, j))
-            # d g_cum: + on i, − on j
-            dgc_i = dgc_i.at[i].add(dAij * aij0 * decay)
-            dgc_i = dgc_i.at[j].add(-dAij * aij0 * decay)
-            return (dA0_i, dgc_i)
-
-        return lax.fori_loop(1, i + 1, col, (dA0_cur, dgc_cur))  # j ∈ [0, i-1]
-
-    dA0, dgc_from_A = lax.fori_loop(1, active, tri_map, (dA0, dgc_from_A))
+    # full decay matrix and strict-lower mask
+    decay_full = jnp.exp(g_cum[:, None] - g_cum[None, :])  # [C, C]
+    lower_mask = jnp.tril(jnp.ones((C, C), jnp.float32), k=-1)  # [C, C]
+    # active mask to clip rows/cols beyond 'active'
+    act_mask = (lax.iota(jnp.int32, C) < active).astype(jnp.float32)
+    tri_mask = lower_mask * act_mask[:, None] * act_mask[None, :]  # [C, C]
+    dAbar_full = dAbar * tri_mask  # keep strictly-lower, active only
+    dA0 = dAbar_full * decay_full  # [C, C], strictly-lower (no sign here; handled in Gram mapping)
+    # d g_cum:  + on row i, − on col j, scaled by A0[i,j] * decay[i,j]
+    contrib = dAbar_full * (A0 * decay_full)  # [C, C]
+    dgc_from_A = jnp.sum(contrib, axis=1) - jnp.sum(contrib, axis=0)  # [C]
 
     # -------------------------------------------------------------------------
     # RHS contributions
@@ -1883,28 +1885,29 @@ def _gdn_chunk_bwd_kernel_fused(
     dgc_from_k = eg * jnp.sum((b_c[:, None] * k_c) * d_rhs_k, axis=-1)  # [C]
 
     # -------------------------------------------------------------------------
-    # From A0:  A0[i,j] = -β_i <k_i, k_j>    (i > j)
+    # From A0:  A0[i,j] = sign * β_i <k_i, k_j> with sign = -1 (i > j)
+    # Use explicit i,j accumulation to mirror reference helper exactly
     # -------------------------------------------------------------------------
     dK_from_A0 = jnp.zeros_like(k_c)
     dB_from_A0 = jnp.zeros((C,), jnp.float32)
 
-    def gram_bwd(i, state):
+    def body_i(i, state):
         dK_acc, dB_acc = state
         ki = lax.dynamic_slice(k_c, (i, 0), (1, K))[0]
 
-        def body(j, carry):
-            dK_a, dB_a = carry
+        def body_j(j, inner):
+            dK_a, dB_a = inner
             kj = lax.dynamic_slice(k_c, (j, 0), (1, K))[0]
             dAij = lax.dynamic_slice(dA0, (i, j), (1, 1))[0, 0]
-            coeff = -(dAij * b_c[i])  # - dA0[i,j] * β_i
-            dK_a = dK_a.at[i, :].add(coeff * kj)  # ∂/∂k_i
-            dK_a = dK_a.at[j, :].add(coeff * ki)  # ∂/∂k_j
-            dB_a = dB_a + (-dAij) * jnp.sum(ki * kj)
+            coeff = -(dAij * b_c[i])  # sign = -1
+            dK_a = dK_a.at[i, :].add(coeff * kj)
+            dK_a = dK_a.at[j, :].add(coeff * ki)
+            dB_a = dB_a.at[i].add(-(dAij * jnp.sum(ki * kj)))
             return (dK_a, dB_a)
 
-        return lax.fori_loop(0, i, body, (dK_acc, dB_acc))
+        return lax.fori_loop(0, i, body_j, (dK_acc, dB_acc))
 
-    dK_from_A0, dB_from_A0 = lax.fori_loop(1, active, gram_bwd, (dK_from_A0, dB_from_A0))
+    dK_from_A0, dB_from_A0 = lax.fori_loop(1, active, body_i, (dK_from_A0, dB_from_A0))
 
     # -------------------------------------------------------------------------
     # Carry‑direct gradient wrt k:  dK_add (no triangular involvement)
@@ -1918,11 +1921,15 @@ def _gdn_chunk_bwd_kernel_fused(
     dQ_attn = dQ_attn * m[:, None]
     dQ_inter = dQ_inter * m[:, None]
 
-    dK_tile = (dK_attn + dK_rhs + dK_from_A0 + dK_add) * m[:, None]
+    dK_attn = dK_attn * m[:, None]
+    dK_rhs = dK_rhs * m[:, None]
+    dK_from_A0 = dK_from_A0 * m[:, None]
+    dK_add = dK_add * m[:, None]
+    dK_tile = dK_attn + dK_rhs + dK_from_A0 + dK_add
     dB_tile = (dB_from_v + dB_from_k + dB_from_A0) * m
 
-    # d g: combine all sources on g_cum then reverse‑cumsum to get d g
-    dgc_total = (dgc_attn + dgc_from_A + dgc_from_k) * m
+    # d g on g_cum (include inter), then reverse‑cumsum to get d g
+    dgc_total = (dgc_attn + dgc_from_A + dgc_from_k + dgc_inter) * m
 
     # carry contributions on g and S_prev:
     #   S_out = α_tail S_prev + Σ_i w_i k_i v_new_i^T
@@ -1975,6 +1982,13 @@ def _gdn_chunk_bwd_kernel_fused(
     dB_chunk_ref[dslice(nh, 1), dslice(0, 1)] = dB_tile[None, None, :]
     dS_out_tile_ref[dslice(nh, 1), dslice(0, K), dslice(0, BV)] = dS_out[None, :, :]
 
+    # component-wise debug writes
+    dK_attn_only_ref[dslice(nh, 1), dslice(0, 1), dslice(0, C), dslice(0, K)] = dK_attn[None, None, :, :]
+    dK_rhs_only_ref[dslice(nh, 1), dslice(0, 1), dslice(0, C), dslice(0, K)] = dK_rhs[None, None, :, :]
+    dK_A0_only_ref[dslice(nh, 1), dslice(0, 1), dslice(0, C), dslice(0, K)] = dK_from_A0[None, None, :, :]
+    dK_add_only_ref[dslice(nh, 1), dslice(0, 1), dslice(0, C), dslice(0, K)] = dK_add[None, None, :, :]
+    d_rhs_k_only_ref[dslice(nh, 1), dslice(0, 1), dslice(0, C), dslice(0, K)] = d_rhs_k[None, None, :, :]
+
 
 # ---------- fused backward (chunk) launcher ----------
 # NOTE: does the L2-norm backward *separately* for (dQ_attn, dQ_inter), then sums.
@@ -1994,16 +2008,32 @@ def _chunk_gated_delta_rule_flash_bwd_fused(
     initial_state_was_none: bool,
     use_qk_l2norm_in_kernel: bool,
 ):
-    """Backward wrapper for the flash chunk kernel.
+    """Backward wrapper for the flash chunk kernel (fused), with heavy instrumentation.
 
-    Instrumented: emits per-chunk diffs for dQ_attn/inter (already good),
-    and for dK per-term (attn, RHS(yk), A0/Gram, and add/carry), using
-    both OUT-only seeds and TOTAL seeds, masked for ragged rows.
+    Debug prints (enable with `GDN_DEBUG_CHUNK_BWD=1`) include:
+      - dQ_attn / dQ_inter parity
+      - Per-term incremental diffs for dK: attn → +rhs(yk) → +A0(Gram) → +add(carry)
+      - dK_A0 checks: total vs ref, sign-flip residual, and "missing-col0" regression test
+      - dB TOTAL vs REF (v + rhs(yk) + A0)
+      - L2 bwd(K) closed-form vs VJP spot check
+
+    Notes:
+      * This function works in the "kernel space" (normalized q/k if requested) and
+        converts back to raw-space at the very end via the L2 backward mapping.
+      * The debug reference math re-solves the forward/back-sub per chunk to build
+        ground-truth comparisons; it is JIT-safe and masked for ragged rows.
     """
+    import os
+    import functools
+    import jax
+    from jax import lax
+    import jax.numpy as jnp
+    import jax.experimental.pallas as pl
 
-    _DBG = bool(int(os.environ.get("GDN_DEBUG_CHUNK_BWD", "0")))
+    # ---- settings / toggles -------------------------------------------------
+    _GDN_DBG_CHUNK_BWD = bool(int(os.environ.get("GDN_DEBUG_CHUNK_BWD", "0")))
 
-    # ---- unpack aux / static sizes from forward ----
+    # ---- unpack aux / static sizes from forward -----------------------------
     A0_buf = aux["A0_buf"]  # [NH, Nc, C, C]
     S_prev_buf = aux["S_prev_buf"]  # [NH, Nc, K, V_pad]
     T_pad = int(aux["T_pad"])
@@ -2030,6 +2060,15 @@ def _chunk_gated_delta_rule_flash_bwd_fused(
         inv = lax.rsqrt(jnp.sum(X_raw * X_raw, axis=-1, keepdims=True) + eps)
         dot = jnp.sum(dY_norm * X_raw, axis=-1, keepdims=True)
         return scale * (inv * dY_norm - (inv**3) * X_raw * dot)
+
+    # Make a **shape-agnostic row mask** (fixes broadcast error in jnp.where)
+    def _mask_like(x, lengths_chunk):
+        # base mask: [NH, C]
+        base = lax.iota(jnp.int32, C)[None, :] < lengths_chunk[:, None]
+        # expand dims to match x.rank
+        while base.ndim < x.ndim:
+            base = base[..., None]
+        return base.astype(x.dtype)
 
     # ---------- normalize layout to NH-major (RAW views) ----------
     if head_first:
@@ -2173,11 +2212,11 @@ def _chunk_gated_delta_rule_flash_bwd_fused(
 
         return lax.fori_loop(0, active, row_rev, (d_rhs, dAbar))
 
-    def _gram_bwd_k(dA0, beta_c, k_chunk, active):
-        """Map dA0 (lower-tri) back to k via A0[i,j] = -β_i <k_i, k_j>"""
+    def _gram_bwd_k_db(dA0, beta_c, k_chunk, active, sign=-1.0):
+        """Map dA0 (lower-tri) → (dK, dB) for A0[i,j] = sign * β_i <k_i, k_j>, i>j."""
         NH_, C_, K_ = k_chunk.shape
         dK = jnp.zeros((NH_, C_, K_), jnp.float32)
-        dB = jnp.zeros((NH_, C_), jnp.float32)  # not printed here
+        dB = jnp.zeros((NH_, C_), jnp.float32)
 
         def row_i(i, state):
             dK_acc, dB_acc = state
@@ -2186,18 +2225,19 @@ def _chunk_gated_delta_rule_flash_bwd_fused(
             def col_j(j, inner):
                 dK_a, dB_a = inner
                 kj = k_chunk[:, j, :]
-                coeff = -(lax.dynamic_slice(dA0, (0, i, j), (NH_, 1, 1))[:, 0, 0] * beta_c[:, i])  # [NH]
+                dAij = lax.dynamic_slice(dA0, (0, i, j), (NH_, 1, 1))[:, 0, 0]  # [NH]
+                coeff = -(dAij * beta_c[:, i]) * (1.0 if sign < 0 else -1.0)  # handle sign flip compactly
                 dK_a = dK_a.at[:, i, :].add(coeff[:, None] * kj)
                 dK_a = dK_a.at[:, j, :].add(coeff[:, None] * ki)
-                dB_a = dB_a.at[:, i].add(
-                    -(lax.dynamic_slice(dA0, (0, i, j), (NH_, 1, 1))[:, 0, 0]) * jnp.sum(ki * kj, axis=-1)
-                )
+                # dB[i] += -dAij * <ki, kj> * (sign)  (because ∂A0/∂β_i = sign * <ki,kj>)
+                dB_a = dB_a.at[:, i].add((-dAij * jnp.sum(ki * kj, axis=-1)) * (1.0 if sign < 0 else -1.0))
                 return (dK_a, dB_a)
 
             return lax.fori_loop(0, i, col_j, (dK_acc, dB_acc))
 
-        return lax.fori_loop(1, active, row_i, (dK, dB))[0]  # return dK only
+        return lax.fori_loop(1, active, row_i, (dK, dB))
 
+    # === kernel to call per (chunk × V-tile) ===
     kernel = functools.partial(_gdn_chunk_bwd_kernel_fused, C=int(C), K=int(K), BV=int(BV))
 
     # ---------- reverse over chunks ----------
@@ -2206,7 +2246,7 @@ def _chunk_gated_delta_rule_flash_bwd_fused(
         ci = jnp.int32(Nc - 1 - i)
         c0 = ci * C
         lengths_chunk = jnp.clip(lengths_flat - jnp.int32(c0), 0, jnp.int32(C))  # [NH]
-        active = jnp.min(lengths_chunk)  # all batches in test are full; we still mask below
+        active = jnp.min(lengths_chunk)
 
         # slice per-chunk tensors (outside the kernel; static sizes inside)
         q_chunk_fwd = lax.dynamic_slice(q_flat_fwd, (0, c0, 0), (NH, C, K))
@@ -2224,17 +2264,48 @@ def _chunk_gated_delta_rule_flash_bwd_fused(
         dV_c = jnp.zeros((NH, C, V_pad), jnp.float32)
         dG_c = jnp.zeros((NH, C), jnp.float32)
         dB_c = jnp.zeros((NH, C), jnp.float32)
+        # component accumulators for debugging
+        dK_attn_comp = jnp.zeros((NH, C, K), jnp.float32)
+        dK_rhs_comp = jnp.zeros((NH, C, K), jnp.float32)
+        dK_A0_comp = jnp.zeros((NH, C, K), jnp.float32)
+        dK_add_comp = jnp.zeros((NH, C, K), jnp.float32)
+        d_rhs_k_comp = jnp.zeros((NH, C, K), jnp.float32)
 
         # ---- per-VT loop (kernel call) ----
         def one_vt(vt, acc):
-            dQ_acc_t, dK_acc_t, dV_acc_t, dG_acc_t, dB_acc_t, dS_in_prev = acc
+            (
+                dQ_acc_t,
+                dK_acc_t,
+                dV_acc_t,
+                dG_acc_t,
+                dB_acc_t,
+                dS_in_prev,
+                dK_attn_acc,
+                dK_rhs_acc,
+                dK_A0_acc,
+                dK_add_acc,
+                d_rhs_k_acc,
+            ) = acc
 
             v_tile = lax.dynamic_slice(v_chunk, (0, 0, vt * BV), (NH, C, BV))
             dY_tile = lax.dynamic_slice(dY_chunk, (0, 0, vt * BV), (NH, C, BV))
             S_prev_t = lax.dynamic_slice(S_prev_chunk, (0, 0, vt * BV), (NH, K, BV))
             dS_in_t = lax.dynamic_slice(dS_in, (0, 0, vt * BV), (NH, K, BV))
 
-            dQ_attn_t, dQ_inter_t, dK_t, dV_t, dG_t, dB_t, dS_out_t = pl.pallas_call(
+            (
+                dQ_attn_t,
+                dQ_inter_t,
+                dK_t,
+                dV_t,
+                dG_t,
+                dB_t,
+                dS_out_t,
+                dK_attn_only_t,
+                dK_rhs_only_t,
+                dK_A0_only_t,
+                dK_add_only_t,
+                d_rhs_k_only_t,
+            ) = pl.pallas_call(
                 kernel,
                 out_shape=(
                     jax.ShapeDtypeStruct((NH, 1, C, K), jnp.float32),  # dQ_attn (normalized space)
@@ -2244,6 +2315,11 @@ def _chunk_gated_delta_rule_flash_bwd_fused(
                     jax.ShapeDtypeStruct((NH, 1, C), jnp.float32),  # dG
                     jax.ShapeDtypeStruct((NH, 1, C), jnp.float32),  # dB
                     jax.ShapeDtypeStruct((NH, K, BV), jnp.float32),  # dS_out
+                    jax.ShapeDtypeStruct((NH, 1, C, K), jnp.float32),  # dK_attn_only
+                    jax.ShapeDtypeStruct((NH, 1, C, K), jnp.float32),  # dK_rhs_only
+                    jax.ShapeDtypeStruct((NH, 1, C, K), jnp.float32),  # dK_A0_only
+                    jax.ShapeDtypeStruct((NH, 1, C, K), jnp.float32),  # dK_add_only
+                    jax.ShapeDtypeStruct((NH, 1, C, K), jnp.float32),  # d_rhs_k_only
                 ),
                 grid=(NH,),
                 in_specs=(
@@ -2266,6 +2342,11 @@ def _chunk_gated_delta_rule_flash_bwd_fused(
                     pl.BlockSpec((1, 1, C), lambda nh: (nh, 0, 0)),
                     pl.BlockSpec((1, 1, C), lambda nh: (nh, 0, 0)),
                     pl.BlockSpec((1, K, BV), lambda nh: (nh, 0, 0)),
+                    pl.BlockSpec((1, 1, C, K), lambda nh: (nh, 0, 0, 0)),
+                    pl.BlockSpec((1, 1, C, K), lambda nh: (nh, 0, 0, 0)),
+                    pl.BlockSpec((1, 1, C, K), lambda nh: (nh, 0, 0, 0)),
+                    pl.BlockSpec((1, 1, C, K), lambda nh: (nh, 0, 0, 0)),
+                    pl.BlockSpec((1, 1, C, K), lambda nh: (nh, 0, 0, 0)),
                 ),
                 interpret=_should_interpret_pallas(),
             )(
@@ -2285,6 +2366,12 @@ def _chunk_gated_delta_rule_flash_bwd_fused(
             dQ_acc_t = dQ_acc_t + dQ_attn_t[:, 0, :, :]
             # K/V/G/B accumulate as usual
             dK_acc_t = dK_acc_t + dK_t[:, 0, :, :]
+            dK_attn_acc = dK_attn_acc + dK_attn_only_t[:, 0, :, :]
+            dK_rhs_acc = dK_rhs_acc + dK_rhs_only_t[:, 0, :, :]
+            dK_A0_acc = dK_A0_acc + dK_A0_only_t[:, 0, :, :]
+            dK_add_acc = dK_add_acc + dK_add_only_t[:, 0, :, :]
+            # accumulate d_rhs_k across V-tiles
+            d_rhs_k_acc = d_rhs_k_acc + d_rhs_k_only_t[:, 0, :, :]
             # tile-scatter for V
             start = vt * jnp.int32(BV)
             dv_old = lax.dynamic_slice(dV_acc_t, (0, 0, start), (NH, C, BV))
@@ -2295,10 +2382,49 @@ def _chunk_gated_delta_rule_flash_bwd_fused(
             dB_acc_t = dB_acc_t + dB_t[:, 0, :]
             # pass dS_out along V-tiles
             dS_in_prev = lax.dynamic_update_slice(dS_in_prev, dS_out_t, (0, 0, start))
-            return (dQ_acc_t, dK_acc_t, dV_acc_t, dG_acc_t, dB_acc_t, dS_in_prev)
+            return (
+                dQ_acc_t,
+                dK_acc_t,
+                dV_acc_t,
+                dG_acc_t,
+                dB_acc_t,
+                dS_in_prev,
+                dK_attn_acc,
+                dK_rhs_acc,
+                dK_A0_acc,
+                dK_add_acc,
+                d_rhs_k_acc,
+            )
 
-        dQ_c_norm, dK_c_norm, dV_c, dG_c, dB_c, dS_out = lax.fori_loop(
-            0, n_vtiles, one_vt, (dQ_c_norm, dK_c_norm, dV_c, dG_c, dB_c, jnp.zeros_like(dS_in))
+        (
+            dQ_c_norm,
+            dK_c_norm,
+            dV_c,
+            dG_c,
+            dB_c,
+            dS_out,
+            dK_attn_comp,
+            dK_rhs_comp,
+            dK_A0_comp,
+            dK_add_comp,
+            d_rhs_k_comp,
+        ) = lax.fori_loop(
+            0,
+            n_vtiles,
+            one_vt,
+            (
+                dQ_c_norm,
+                dK_c_norm,
+                dV_c,
+                dG_c,
+                dB_c,
+                jnp.zeros_like(dS_in),
+                dK_attn_comp,
+                dK_rhs_comp,
+                dK_A0_comp,
+                dK_add_comp,
+                d_rhs_k_comp,
+            ),
         )
 
         # === add dQ_inter once (full-V) ===
@@ -2308,102 +2434,81 @@ def _chunk_gated_delta_rule_flash_bwd_fused(
         dQ_c_norm = dQ_c_norm + dQ_inter_chunk
 
         # ---------- DEBUG: dQ paths (should be ~0 diffs already) ----------
-        if _DBG:
+        if _GDN_DBG_CHUNK_BWD:
             # inter
             diff_inter = dQ_inter_chunk - ((dY_chunk @ jnp.transpose(S_prev_chunk, (0, 2, 1))) * eg_full[:, :, None])
-            max_abs = jnp.max(jnp.abs(diff_inter))
-            nh0_max = jnp.max(jnp.abs(diff_inter[0]))
             jax.debug.print(
                 "[GDN dbg] chunk={ci} NH={NH} C={C} K={K}  dQ_inter  max|Δ|={ma:.3e}  NH0 max|Δ|={m0:.3e}",
                 ci=ci,
                 NH=jnp.array(NH),
                 C=jnp.array(C),
                 K=jnp.array(K),
-                ma=max_abs,
-                m0=nh0_max,
+                ma=jnp.max(jnp.abs(diff_inter)),
+                m0=jnp.max(jnp.abs(diff_inter[0])),
             )
             # attn (recompute ref)
             g_cum = jnp.cumsum(g_chunk, axis=1)
-            eg = jnp.exp(g_cum)
             yv_ref = _fs_yv_ref(A0_chunk, g_cum, b_chunk, v_chunk, active)
             yk_ref = _fs_yk_ref(A0_chunk, g_cum, b_chunk, k_chunk_fwd, active)
             v_new_ref = yv_ref - jnp.einsum("nck,nkv->ncv", yk_ref, S_prev_chunk)
-            # qk_raw = jnp.einsum("nck,ndk->ncd", q_chunk_fwd, k_chunk_fwd)
             decay = jnp.exp(g_cum[:, :, None] - g_cum[:, None, :])
             tril = jnp.tril(jnp.ones((C, C), jnp.float32))[None, :, :]
             M_full = decay * tril
             dAttn_ref = jnp.einsum("ncv,nwv->ncw", dY_chunk, v_new_ref)
             dQ_attn_ref = jnp.einsum("ncw,nwk->nck", M_full * dAttn_ref, k_chunk_fwd)
-            diff_attn = (jnp.where(jnp.arange(C)[None, :] < lengths_chunk[:, None], 1.0, 0.0)[:, :, None]) * (
-                dQ_attn_only - dQ_attn_ref
-            )
+            # mask robustly
+            mask_q = _mask_like(dQ_attn_ref, lengths_chunk)
             jax.debug.print(
                 "[GDN dbg] chunk={ci} NH={NH} C={C} K={K}  dQ_attn  max|Δ|={m:.3e}",
                 ci=ci,
                 NH=jnp.array(NH),
                 C=jnp.array(C),
                 K=jnp.array(K),
-                m=jnp.max(jnp.abs(diff_attn)),
+                m=jnp.max(jnp.abs((dQ_attn_only - dQ_attn_ref) * mask_q)),
             )
 
-        # ---------- DEBUG: K per-term reference and diffs ----------
-        if _DBG:
-            # Shapes
-            # q_chunk_fwd:  [NH, C, K]
-            # k_chunk_fwd:  [NH, C, K]
-            # v_chunk:      [NH, C, V_pad]
-            # g_chunk:      [NH, C]
-            # b_chunk:      [NH, C]
-            # A0_chunk:     [NH, C, C]
-            # S_prev_chunk: [NH, K, V_pad]
-            # dY_chunk:     [NH, C, V_pad]
-            # dS_in:        [NH, K, V_pad]  (incoming carry to this chunk)
+            # ---------- DEBUG: K per-term reference and diffs ----------
             g_cum = jnp.cumsum(g_chunk, axis=1)  # [NH, C]
             eg = jnp.exp(g_cum)  # [NH, C]
-            tril = jnp.tril(jnp.ones((C, C), jnp.float32))[None, :, :]  # [1, C, C]
+            tril = jnp.tril(jnp.ones((C, C), jnp.float32))[None]
             decay = jnp.exp(g_cum[:, :, None] - g_cum[:, None, :])  # [NH, C, C]
-            M_full = decay * tril  # [NH, C, C]
+            M_full = decay * tril
 
-            # Re-solve the forward substitution (reference)
             yv_ref = _fs_yv_ref(A0_chunk, g_cum, b_chunk, v_chunk, active)  # [NH, C, V_pad]
             yk_ref = _fs_yk_ref(A0_chunk, g_cum, b_chunk, k_chunk_fwd, active)  # [NH, C, K]
-            v_new_ref = yv_ref - jnp.einsum("nck,nkv->ncv", yk_ref, S_prev_chunk)  # [NH, C, V_pad]
+            v_new_ref = yv_ref - jnp.einsum("nck,nkv->ncv", yk_ref, S_prev_chunk)
 
             # Seeds from the output path: dv_new_out = attn^T @ dY
-            # attn(i,j) = M(i,j) * <q_i, k_j>
             qk = jnp.einsum("nck,njk->ncj", q_chunk_fwd, k_chunk_fwd)  # [NH, C, C] (i,j)
-            attn = M_full * qk  # [NH, C, C] (i,j)
-            dv_new_out = jnp.einsum("nij,niv->njv", attn, dY_chunk)  # [NH, C, V_pad] = attn^T @ dY
-
-            # Carry path: dv_new_carry = (k @ dS_in) * w
-            # NOTE: JIT-safe broadcasting: [:, None] to match [NH, C]
+            attn = M_full * qk
+            dv_new_out = jnp.einsum("nij,niv->njv", attn, dY_chunk)  # [NH, C, V_pad]
+            # Carry path
             w = jnp.exp(g_cum[:, -1][:, None] - g_cum)  # [NH, C]
             kv_dS = jnp.einsum("nck,nkv->ncv", k_chunk_fwd, dS_in)  # [NH, C, V_pad]
-            dv_new_tot = dv_new_out + kv_dS * w[:, :, None]  # [NH, C, V_pad]
+            dv_new_tot = dv_new_out + kv_dS * w[:, :, None]
 
-            # Backward-sub seeds for the triangular solves
+            # Backward-sub seeds
             S_prev_T = jnp.transpose(S_prev_chunk, (0, 2, 1))  # [NH, V_pad, K]
             dyk_out = -jnp.einsum("ncv,nvk->nck", dv_new_out, S_prev_T)  # [NH, C, K]
-            dyv_out = dv_new_out  # [NH, C, V_pad]
+            dyv_out = dv_new_out
             dyk_tot = -jnp.einsum("ncv,nvk->nck", dv_new_tot, S_prev_T)  # [NH, C, K]
-            dyv_tot = dv_new_tot  # [NH, C, V_pad]
+            dyv_tot = dv_new_tot
 
-            # Backward-substitution (reference) to RHS and dAbar
+            # Backward-substitution (reference)
             d_rhs_v_out, dAbar_v_out = _bwd_sub_ref(dyv_out, A0_chunk, g_cum, yv_ref, active)
             d_rhs_k_out, dAbar_k_out = _bwd_sub_ref(dyk_out, A0_chunk, g_cum, yk_ref, active)
             d_rhs_v_tot, dAbar_v_tot = _bwd_sub_ref(dyv_tot, A0_chunk, g_cum, yv_ref, active)
             d_rhs_k_tot, dAbar_k_tot = _bwd_sub_ref(dyk_tot, A0_chunk, g_cum, yk_ref, active)
 
             # Map RHS(yk) → dK_rhs
-            scale = eg[:, :, None] * b_chunk[:, :, None]  # [NH, C, 1]
-            # dK_rhs_out = scale * d_rhs_k_out  # [NH, C, K]
-            dK_rhs_tot = scale * d_rhs_k_tot  # [NH, C, K]
+            scale_rhs = eg[:, :, None] * b_chunk[:, :, None]  # [NH, C, 1]
+            dK_rhs_tot = scale_rhs * d_rhs_k_tot
 
             # Map dAbar → dA0 (via decay) → dK_A0 (Gram route)
-            # dA0_out = (dAbar_v_out + dAbar_k_out) * decay  # [NH, C, C]
-            dA0_tot = (dAbar_v_tot + dAbar_k_tot) * decay  # [NH, C, C]
-            # dK_A0_out = _gram_bwd_k(dA0_out, b_chunk, k_chunk_fwd, active)  # [NH, C, K]
-            dK_A0_tot = _gram_bwd_k(dA0_tot, b_chunk, k_chunk_fwd, active)  # [NH, C, K]
+            lower = jnp.tril(jnp.ones((C, C), jnp.float32), k=-1)[None]
+            dAbar_tot = dAbar_v_tot + dAbar_k_tot
+            dA0_tot = (dAbar_tot * decay) * lower
+            dK_A0_tot, dB_A0_tot = _gram_bwd_k_db(dA0_tot, b_chunk, k_chunk_fwd, active, sign=-1.0)
 
             # dK_add (carry S_out term)
             dK_add_ref = jnp.einsum("nkv,ncv->nkc", dS_in, v_new_ref).transpose(0, 2, 1) * w[:, :, None]
@@ -2412,32 +2517,208 @@ def _chunk_gated_delta_rule_flash_bwd_fused(
             dAttn_ref = jnp.einsum("ncv,nwv->ncw", dY_chunk, v_new_ref)  # [NH, C, C]
             dK_attn_ref = jnp.einsum("nij,nik->njk", M_full * dAttn_ref, q_chunk_fwd)  # [NH, C, K]
 
-            # Mask ragged rows
-            row_ids = lax.iota(jnp.int32, C)[None, :]  # [1, C]
-            mask_rows = (row_ids < lengths_chunk[:, None])[:, :, None]  # [NH, C, 1]
-            m3 = lambda x: jnp.where(mask_rows, x, 0.0)
+            # Compose references with robust row masking
+            mK = _mask_like(dK_attn_ref, lengths_chunk)  # [NH,C,1] broadcasted to [NH,C,K]
+            dK_ref_tot = (dK_attn_ref + dK_rhs_tot + dK_A0_tot + dK_add_ref) * mK
+            dK_cur_m = dK_c_norm * mK
 
-            # Compose references
-            dK_ref_tot = m3(dK_attn_ref + dK_rhs_tot + dK_A0_tot + dK_add_ref)
-            dK_cur_m = m3(dK_c_norm)
+            # Direct component parity (from kernel component outputs)
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dK_attn(comp) vs REF  max|Δ|={m:.3e}",
+                ci=ci,
+                m=jnp.max(jnp.abs((dK_attn_comp - dK_attn_ref) * mK)),
+            )
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dK_rhs(comp) vs REF  max|Δ|={m:.3e}",
+                ci=ci,
+                m=jnp.max(jnp.abs((dK_rhs_comp - dK_rhs_tot) * mK)),
+            )
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dK_A0(comp) vs REF  max|Δ|={m:.3e}",
+                ci=ci,
+                m=jnp.max(jnp.abs((dK_A0_comp - dK_A0_tot) * mK)),
+            )
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dK_add(comp) vs REF  max|Δ|={m:.3e}",
+                ci=ci,
+                m=jnp.max(jnp.abs((dK_add_comp - dK_add_ref) * mK)),
+            )
+
+            # Drill into d_rhs_k via inversion of scaling
+            scale_rhs_ref = eg[:, :, None] * b_chunk[:, :, None]
+            eps = jnp.asarray(1e-12, jnp.float32)
+            valid = (mK > 0) & (jnp.abs(scale_rhs_ref) > eps)
+            d_rhs_k_est = jnp.where(valid, dK_rhs_comp / (scale_rhs_ref + eps), 0.0)
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} d_rhs_k(comp) vs REF  max|Δ|={m:.3e}",
+                ci=ci,
+                m=jnp.max(jnp.abs((d_rhs_k_est - d_rhs_k_tot) * mK)),
+            )
+            # Direct kernel d_rhs_k vs REF
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} d_rhs_k(direct) vs REF  max|Δ|={m:.3e}",
+                ci=ci,
+                m=jnp.max(jnp.abs((d_rhs_k_comp - d_rhs_k_tot) * mK)),
+            )
+
+            # ----- dG parity (total) -----
+            # attn part
+            W = (qk * dAttn_ref) * decay * tril  # [NH,C,C]
+            dgc_attn_ref = jnp.sum(W, axis=2) - jnp.sum(W, axis=1)  # [NH,C]
+            # from A
+            contrib = dAbar_tot * (A0_chunk * decay)  # [NH,C,C]
+            dgc_from_A_ref = jnp.sum(contrib, axis=2) - jnp.sum(contrib, axis=1)
+            # from k
+            dgc_from_k_ref = eg * jnp.sum((b_chunk[:, :, None] * k_chunk_fwd) * d_rhs_k_tot, axis=-1)
+            # inter term:  <dY_i, S_prev^T q_i> * e^{g_cum[i]}
+            inter_base_ref = jnp.einsum("nck,nkv->ncv", q_chunk_fwd, S_prev_chunk)  # [NH,C,V_pad]
+            dgc_inter_ref = eg * jnp.sum(inter_base_ref * dY_chunk, axis=-1)  # [NH,C]
+            # carry terms
+            s_i = jnp.sum(kv_dS * v_new_ref, axis=-1)
+            dgt_from_w_ref = jnp.sum(w * s_i, axis=1)
+            dgc_from_w_ref = -w * s_i
+            dgt_from_alpha_ref = jnp.exp(g_cum[:, -1]) * jnp.sum(S_prev_chunk * dS_in, axis=(1, 2))
+            base = dgc_from_w_ref
+            idx_last = jnp.minimum(lengths_chunk, jnp.int32(C)) - jnp.int32(1)
+
+            def _add_tail_row(nh_i, base_row):
+                idx = idx_last[nh_i]
+                upd = base_row.at[idx].add(dgt_from_alpha_ref[nh_i] + dgt_from_w_ref[nh_i])
+                return upd
+
+            dgc_carry_ref = jax.vmap(_add_tail_row, in_axes=(0, 0))(jnp.arange(NH), base)
+            dG_ref = (dgc_attn_ref + dgc_from_A_ref + dgc_from_k_ref + dgc_inter_ref) + dgc_carry_ref
+            mG = _mask_like(dG_ref, lengths_chunk)
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dG TOTAL vs REF  max|Δ|={m:.3e}", ci=ci, m=jnp.max(jnp.abs((dG_c - dG_ref) * mG))
+            )
+            # (debug only) report parity; do not override outputs here
 
             # Incremental diffs (TOTAL seeds)
             jax.debug.print(
                 "[GDN dbg] chunk={ci} dK incr diffs (TOTAL): "
                 "after attn={d1:.3e}  after +rhs={d2:.3e}  after +A0={d3:.3e}  after +add={d4:.3e}",
                 ci=ci,
-                d1=jnp.max(jnp.abs(dK_cur_m - m3(dK_attn_ref))),
-                d2=jnp.max(jnp.abs(dK_cur_m - m3(dK_attn_ref + dK_rhs_tot))),
-                d3=jnp.max(jnp.abs(dK_cur_m - m3(dK_attn_ref + dK_rhs_tot + dK_A0_tot))),
+                d1=jnp.max(jnp.abs(dK_cur_m - (dK_attn_ref * mK))),
+                d2=jnp.max(jnp.abs(dK_cur_m - ((dK_attn_ref + dK_rhs_tot) * mK))),
+                d3=jnp.max(jnp.abs(dK_cur_m - ((dK_attn_ref + dK_rhs_tot + dK_A0_tot) * mK))),
                 d4=jnp.max(jnp.abs(dK_cur_m - dK_ref_tot)),
             )
-
-            # Final per-term residual checks (TOTAL seeds)
             jax.debug.print(
                 "[GDN dbg] chunk={ci} dK TOTAL vs REF  max|Δ|={mt:.3e}",
                 ci=ci,
                 mt=jnp.max(jnp.abs(dK_cur_m - dK_ref_tot)),
             )
+
+            # Pinpoint the worst index and print scalar breakdown
+            diff = jnp.abs(dK_cur_m - dK_ref_tot)
+            flat_idx = jnp.argmax(diff.reshape(-1))
+            nh_idx = flat_idx // (C * K)
+            rem = flat_idx % (C * K)
+            i_idx = rem // K
+            k_idx = rem % K
+
+            def _at(x):
+                return x[nh_idx, i_idx, k_idx]
+
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} worst @ (nh={nh}, i={i}, k={k}) | kernel={kc:.6e} ref={rc:.6e} | attn={a:.6e} rhs={r:.6e} A0={aa:.6e} add={ad:.6e}",
+                ci=ci,
+                nh=nh_idx,
+                i=i_idx,
+                k=k_idx,
+                kc=_at(dK_cur_m),
+                rc=_at(dK_ref_tot),
+                a=_at(dK_attn_ref),
+                r=_at(dK_rhs_tot),
+                aa=_at(dK_A0_tot),
+                ad=_at(dK_add_ref),
+            )
+            # (ratio check removed to avoid ordering issues)
+
+            # Isolate A0 contribution produced by kernel (estimate)
+            dK_A0_est = dK_c_norm - (dK_attn_ref + dK_rhs_tot + dK_add_ref) * mK
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dK_A0  max|Δ|={m:.3e}", ci=ci, m=jnp.max(jnp.abs(dK_A0_est - (dK_A0_tot * mK)))
+            )
+
+            # Sign-flip residual check (compare to A0 with +sign)
+            dK_A0_pos, _ = _gram_bwd_k_db(dA0_tot, b_chunk, k_chunk_fwd, active, sign=+1.0)
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dK_A0 sign-flip residual  max|Δ|={m:.3e}",
+                ci=ci,
+                m=jnp.max(jnp.abs(dK_A0_est - (dK_A0_pos * mK))),
+            )
+
+            # "missing col0" regression test: zero the j=0 column in dA0 and compare
+            j_idx = jnp.arange(C)[None, None, :]  # [1,1,C]
+            mask_wrong = lower * (j_idx >= 1).astype(jnp.float32)  # drop col 0
+            dA0_wrong = dAbar_tot * decay * mask_wrong
+            dK_A0_wrong, _ = _gram_bwd_k_db(dA0_wrong, b_chunk, k_chunk_fwd, active, sign=-1.0)
+            dK_A0_resid = dK_A0_wrong - dK_A0_tot
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dK_A0 missing-col0 check  max|Δ|={m:.3e}",
+                ci=ci,
+                m=jnp.max(jnp.abs(dK_A0_resid * mK)),
+            )
+
+            # Additional isolation: rhs-only diff
+            dK_rhs_est = dK_c_norm - ((dK_attn_ref + dK_A0_tot + dK_add_ref) * mK)
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dK_rhs  max|Δ|={m:.3e}",
+                ci=ci,
+                m=jnp.max(jnp.abs(dK_rhs_est - (dK_rhs_tot * mK))),
+            )
+            dK_add_est = dK_c_norm - ((dK_attn_ref + dK_rhs_tot + dK_A0_tot) * mK)
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dK_add  max|Δ|={m:.3e}",
+                ci=ci,
+                m=jnp.max(jnp.abs(dK_add_est - (dK_add_ref * mK))),
+            )
+            dK_attn_est = dK_c_norm - ((dK_rhs_tot + dK_A0_tot + dK_add_ref) * mK)
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dK_attn  max|Δ|={m:.3e}",
+                ci=ci,
+                m=jnp.max(jnp.abs(dK_attn_est - (dK_attn_ref * mK))),
+            )
+
+            # dAbar parity (trivial since both paths are re-computed here)
+            Abar_tot_ref = dAbar_v_tot + dAbar_k_tot
+            Abar_tot_cur = dAbar_tot
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dAbar  max|Δ|={m:.3e}", ci=ci, m=jnp.max(jnp.abs(Abar_tot_cur - Abar_tot_ref))
+            )
+
+            # ---------------- dB TOTAL vs REF (v + rhs(yk) + A0) ----------------
+            # v-path:
+            dB_from_v_ref = jnp.sum(v_chunk * d_rhs_v_tot, axis=-1)  # [NH,C]
+            # rhs(yk)-path:
+            dB_from_k_ref = jnp.sum((eg[:, :, None] * k_chunk_fwd) * d_rhs_k_tot, axis=-1)  # [NH,C]
+            # A0(Gram)-path:
+            _, dB_A0_ref = _gram_bwd_k_db(dA0_tot, b_chunk, k_chunk_fwd, active, sign=-1.0)  # [NH,C]
+            dB_ref_total = dB_from_v_ref + dB_from_k_ref + dB_A0_ref
+            mB = _mask_like(dB_ref_total, lengths_chunk)  # [NH,C] shaped
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dB TOTAL vs REF  max|Δ|={m:.3e}",
+                ci=ci,
+                m=jnp.max(jnp.abs((dB_c - dB_ref_total) * mB)),
+            )
+
+            # Break down dB components
+            dB_A0_est = dB_c - (dB_from_v_ref + dB_from_k_ref)
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dB_A0  max|Δ|={m:.3e}", ci=ci, m=jnp.max(jnp.abs(dB_A0_est - dB_A0_ref))
+            )
+            dB_v_est = dB_c - (dB_from_k_ref + dB_A0_ref)
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dB_v  max|Δ|={m:.3e}", ci=ci, m=jnp.max(jnp.abs(dB_v_est - dB_from_v_ref))
+            )
+            dB_k_est = dB_c - (dB_from_v_ref + dB_A0_ref)
+            jax.debug.print(
+                "[GDN dbg] chunk={ci} dB_rhs(yk)  max|Δ|={m:.3e}", ci=ci, m=jnp.max(jnp.abs(dB_k_est - dB_from_k_ref))
+            )
+
+            # (debug only) report parity; do not override outputs here
 
         # Scatter per-chunk grads into carried accumulators (kernel space)
         old = lax.dynamic_slice(dQ_acc, (0, c0, 0), (NH, C, K))
@@ -2470,7 +2751,7 @@ def _chunk_gated_delta_rule_flash_bwd_fused(
         dK_flat_raw = dK_flat_norm
 
     # tiny self-check of the per-row VJP mapping for K (optional)
-    if _DBG:
+    if _GDN_DBG_CHUNK_BWD:
 
         def norm_k_row(x):  # y = x / ||x||
             inv = lax.rsqrt(jnp.sum(x * x) + jnp.asarray(1e-6, x.dtype))
