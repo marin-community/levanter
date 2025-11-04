@@ -37,13 +37,13 @@ data:
         mask_prob: 0.15
         mean_span_length: 3.0
         random_roll: true
-        task_token_id: 50155
+        task_token_id: 50257
       x1:
         type: rx
         mask_prob: 0.15
         mean_span_length: 32.0
         random_roll: true
-        task_token_id: 50155
+        task_token_id: 50258
       x2:
         type: rx
         mask_prob: 0.5
@@ -52,14 +52,12 @@ data:
         task_token_id: 50155
       s:
         type: s
-        task_token_id: 50156
+        task_token_id: 50259
     task_probs:
       r: 0.5
       x1: 0.125
       x2: 0.125
       s: 0.25
     rng_seed: 42
-    # GPT2 vocab_size = 50257
-    # eos/bos = 50256
-    sentinel_token_id_start: 50157
-    sentinel_token_id_count: 99
+    sentinel_token_id_start: 50260
+    sentinel_token_id_count: 100
