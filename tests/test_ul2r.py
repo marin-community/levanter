@@ -463,9 +463,9 @@ def test_create_ul2r_example():
     max_segments_per_example = 8
 
     task_configs = [
-        RXDenoisingConfig(RX_TASK_KIND, R_TASK_TOKEN_ID, 0.15, 3.0, False),
-        RXDenoisingConfig(RX_TASK_KIND, X_TASK_TOKEN_ID, 0.5, 3.0, False),
-        SDenoisingConfig(S_TASK_KIND, S_TASK_TOKEN_ID),
+        RXDenoisingConfig(R_TASK_TOKEN_ID, 0.15, 3.0, False),
+        RXDenoisingConfig(X_TASK_TOKEN_ID, 0.5, 3.0, False),
+        SDenoisingConfig(S_TASK_TOKEN_ID),
     ]
     task_params = jnp.array([cfg.to_task_params() for cfg in task_configs])
     task_indices = jnp.array([0, 1, 2])

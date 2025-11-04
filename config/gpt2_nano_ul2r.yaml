@@ -25,7 +25,8 @@ trainer:
   batch_axis: "batch"
 
 data:
-  id: dlwh/wikitext_103_detokenized
+  #id: dlwh/wikitext_103_detokenized
+  id: roneneldan/TinyStories
   cache_dir: /workspace/marin_cache
   tokenizer: ./gpt2_ul2r_DEV
   format:

@@ -341,8 +341,8 @@ def noise_span_to_unique_sentinel(
         is_first_noise_token = first_noise_tokens[read_pos]
         is_subsequent_noise_token = subsequent_noise_tokens[read_pos]
 
-        should_write_sentinel = jax.lax.select(read_pos == -1, force_initial_sentinel, is_first_noise_token)
-        should_write = jax.lax.select(read_pos == -1, should_write_sentinel, ~is_subsequent_noise_token)
+        should_write_sentinel = (read_pos == -1) | is_first_noise_token
+        should_write = (read_pos == -1) | ~is_subsequent_noise_token
         token_to_write = jax.lax.select(should_write_sentinel, sentinel_id, tokens[read_pos])
         sentinel_count = jax.lax.select(should_write_sentinel, sentinel_count + 1, sentinel_count)
 
@@ -355,7 +355,8 @@ def noise_span_to_unique_sentinel(
         return out, write_pos, sentinel_count
 
     result = jnp.zeros_like(tokens)
-    result, _, _ = jax.lax.fori_loop(-1, length, loop_body, (result, 0, 0))
+    i0 = jax.lax.select(force_initial_sentinel & ~first_noise_tokens[0], -1, 0)
+    result, _, _ = jax.lax.fori_loop(i0, length, loop_body, (result, 0, 0))
 
     return result
 
