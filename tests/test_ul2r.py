@@ -18,8 +18,6 @@ from levanter.data.text import (
     preprocessor_for_format,
 )
 from levanter.data.ul2r import (
-    RX_TASK_KIND,
-    S_TASK_KIND,
     TokenizedDict,
     compute_denoising_length,
     noise_span_to_unique_sentinel,
@@ -606,9 +604,9 @@ def test_ul2r_dataset_build(dummy_text_data, hf_tokenizer):
         QPos = hax.Axis("QPos", 128)
         KPos = hax.Axis("KPos", 128)
         task_configs = {
-            "r": RXDenoisingConfig(RX_TASK_KIND, R_TASK_TOKEN_ID, 0.15, 3.0, False),
-            "x": RXDenoisingConfig(RX_TASK_KIND, X_TASK_TOKEN_ID, 0.5, 3.0, False),
-            "s": SDenoisingConfig(S_TASK_KIND, S_TASK_TOKEN_ID),
+            "r": RXDenoisingConfig(R_TASK_TOKEN_ID, 0.15, 3.0, False),
+            "x": RXDenoisingConfig(X_TASK_TOKEN_ID, 0.5, 3.0, False),
+            "s": SDenoisingConfig(S_TASK_TOKEN_ID),
         }
 
         dataset = Ul2rDataset(
