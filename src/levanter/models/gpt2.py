@@ -401,6 +401,8 @@ class Gpt2LMHeadModel(LmWithHfSerializationMixin[Gpt2Config]):
         k_t, k_embeddings = jrandom.split(key, 2)
         transformer = Gpt2Transformer.init(config, key=k_t)
         embeddings = Gpt2Embeddings.init(Vocab, config, key=k_embeddings)
+        jax.debug.print(f"embeddings Vocab.size={Vocab.size}")
+        jax.debug.print(f"embeddings token_embeddings.weight.shape={embeddings.token_embeddings.weight.shape}")
 
         return Gpt2LMHeadModel(transformer, embeddings)
 
