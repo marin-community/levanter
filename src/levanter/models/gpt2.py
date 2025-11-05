@@ -347,6 +347,9 @@ class Gpt2Embeddings(ModuleWithStateDictSerialization, eqx.Module):
 
     @named_call
     def embed(self, input_ids, *, key, pos_ids: NamedArray):
+        jax.debug.print("input_ids: has_nan={nan}", nan=input_ids.has_nan)
+        jax.debug.print("token_embeddings.weight: has_nan={nan}", nan=self.token_embeddings.weight.array.has_nan)
+
         input_embeds = self.token_embeddings(input_ids)
         input_embeds_norm = jnp.linalg.norm(input_embeds.array)
         input_embeds_has_nan = jnp.any(jnp.isnan(input_embeds.array))
