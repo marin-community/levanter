@@ -21,7 +21,14 @@ from levanter.inference.page_table import PageBatchInfo, PageTableSpec
 from levanter.layers.attention import Attention, AttentionConfig, AttentionMask
 from levanter.layers.kv_cache import KvPageCache, ListCache
 from levanter.layers.rotary import RotaryEmbeddingsConfig
-from levanter.models.llama import LlamaConfig, LlamaEmbedding, LlamaLMHeadModel, LlamaMlp, LlamaTransformer
+from levanter.models.llama import (
+    LlamaConfig,
+    LlamaDecoderLayer,
+    LlamaEmbedding,
+    LlamaLMHeadModel,
+    LlamaMlp,
+    LlamaTransformer,
+)
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.utils.activation import ActivationFunctionEnum
 from levanter.utils.flop_utils import lm_flops_per_token
@@ -143,12 +150,8 @@ class QwenConfig(LlamaConfig):
 
 
 # Modified decoder layer for Qwen
-class QwenDecoderLayer(eqx.Module):
+class QwenDecoderLayer(LlamaDecoderLayer):
     config: QwenConfig = eqx.field(static=True)
-    self_attn: Attention
-    mlp: LlamaMlp  # Can reuse Llama MLP as structure is similar
-    input_layernorm: hnn.RmsNorm
-    post_attention_layernorm: hnn.RmsNorm
 
     @staticmethod
     def init(config: QwenConfig, *, key) -> "QwenDecoderLayer":
@@ -165,61 +168,22 @@ class QwenDecoderLayer(eqx.Module):
         ln_1 = config.mk_LayerNorm(config.Embed)
         ln_2 = config.mk_LayerNorm(config.Embed)
 
-        return QwenDecoderLayer(config, attn, mlp, ln_1, ln_2)
+        return QwenDecoderLayer(config, attn, mlp, ln_1, ln_2, None, None)
 
     @named_call
     def __call__(
         self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None, pos_ids: NamedArray | None = None
     ) -> NamedArray:
-        k_attn, k_mlp = maybe_rng_split(key, 2)
-
         # Apply sliding window attention if configured and past max_window_layers
         if (self.config.use_sliding_window and self.config.sliding_window is not None) and x.resolve_axis(
             "position"
         ) > self.config.sliding_window:
             raise NotImplementedError("Sliding window attention is not implemented in Qwen yet.")
 
-        residual = x
-        x = self.input_layernorm(x)
-        attn_output = self.self_attn(x=x, mask=mask, key=k_attn, pos_ids=pos_ids)
-        x = residual + attn_output
+        # Reuse the parent implementation for the rest
+        return super().__call__(x, mask, key=key, pos_ids=pos_ids)
 
-        residual = x
-        x = self.post_attention_layernorm(x)
-        mlp_output = self.mlp(x, key=k_mlp)
-        output = residual + mlp_output
-        return output
-
-    @named_call
-    def decode(
-        self,
-        x: NamedArray,
-        kv_cache: KvPageCache,
-        batch_info: PageBatchInfo,
-        pos_ids: NamedArray,
-        *,
-        key=None,
-    ) -> tuple[NamedArray, KvPageCache]:
-        k_attn, k_mlp = maybe_rng_split(key, 2)
-        # self attention and skip connection
-        residual = x
-        x = self.input_layernorm(x)
-        attn_output, kv_cache = self.self_attn.paged_decode(x, kv_cache, batch_info, pos_ids=pos_ids, key=k_attn)
-        x = residual + attn_output
-
-        # MLP and skip connection
-        residual = x
-        x = self.post_attention_layernorm(x)
-        mlp_output = self.mlp(x, key=k_mlp)
-        output = residual + mlp_output
-        return output, kv_cache
-
-    def initial_cache(self, spec: PageTableSpec, *, dtype) -> KvPageCache:
-        """
-        Creates an empty page cache for this layer. Note that in order to create a decoder state, you
-        need to couple the KvPageCache to the PageTable's state with a BatchInfo object.
-        """
-        return self.self_attn.empty_page_cache(spec, dtype=dtype)
+    # decode and initial_cache are inherited from LlamaDecoderLayer
 
 
 # Modified transformer for Qwen
