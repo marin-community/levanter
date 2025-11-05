@@ -168,7 +168,7 @@ class QwenDecoderLayer(LlamaDecoderLayer):
         ln_1 = config.mk_LayerNorm(config.Embed)
         ln_2 = config.mk_LayerNorm(config.Embed)
 
-        return QwenDecoderLayer(config, attn, mlp, ln_1, ln_2, None, None)
+        return QwenDecoderLayer(config, attn, mlp, ln_1, ln_2, post_attn_layernorm=None, post_mlp_layernorm=None)
 
     @named_call
     def __call__(
@@ -182,8 +182,6 @@ class QwenDecoderLayer(LlamaDecoderLayer):
 
         # Reuse the parent implementation for the rest
         return super().__call__(x, mask, key=key, pos_ids=pos_ids)
-
-    # decode and initial_cache are inherited from LlamaDecoderLayer
 
 
 # Modified transformer for Qwen
