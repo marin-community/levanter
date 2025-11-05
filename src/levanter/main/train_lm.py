@@ -203,7 +203,12 @@ def main(config: TrainLmConfig):
         if int(state.step) == 0 and config.initialize_from_checkpoint_path is not None:
             state = load_checkpoint(state, config.initialize_from_checkpoint_path)
 
+        print(f"int(state.step)={int(state.step)}")
+
+        print(f"int(state.step)={int(state.step)}")
+
         if int(state.step) == 0:
+            print("true")
             # TODO: I don't love that we init the model twice, but it's not a big deal i think?
             if config.initialize_from_hf:
                 # initialize from an hf pretrained model
@@ -214,6 +219,7 @@ def main(config: TrainLmConfig):
                 # this is a bit gross, but we want to free up the memory from the model we just built
                 state = dataclasses.replace(state, model=None)
                 gc.collect()
+                print("load_pretrained")
                 model = converter.load_pretrained(
                     config.model.model_type,
                     config=config.model if not config.use_hf_model_config else None,
@@ -225,6 +231,7 @@ def main(config: TrainLmConfig):
             else:
                 logger.info("No checkpoint found. Starting from scratch.")
 
+        print("after check")
         levanter.tracker.log_summary({"parameter_count": parameter_count(state.model)})
 
         max_eval_examples_per_ds = config.trainer.max_eval_batches

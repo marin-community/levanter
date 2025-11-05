@@ -154,6 +154,8 @@ def dot_product_attention(
 
     attention_out = None
 
+    jax.debug.print("attn_backend={}", attn_backend)
+
     match attn_backend:
         case AttentionBackend.NVTE:
             attention_out = _try_te_attention(
@@ -279,6 +281,7 @@ def dot_product_attention(
     else:
         # local import to avoid circular imports
         from levanter.models.flash_attention import flash_attention
+        jax.debug.print("flash_attention")
 
         return flash_attention(
             QPos,
@@ -379,6 +382,7 @@ def simple_attention_with_dropout(
     QPos = query.resolve_axis(QPos)
     KPos = key.resolve_axis(KPos)
     m = materialize_mask(mask, QPos, KPos)
+    jax.debug.print("mask={} QPos={} KPos={}", mask, QPos, KPos)
     orig_dtype = query.dtype
 
     if scaling_factor is None:
@@ -917,7 +921,8 @@ class AttentionMask(eqx.Module):
             input_attn_mask = self.input_mask.rename({QPos.name: KPos.name})
             input_attn_mask = input_attn_mask[KPos, k_slice].broadcast_axis(QPos)
             input_attn_mask_sliced = input_attn_mask[QPos, q_slice]
-            prefix_mask = segment_mask & input_attn_mask_sliced
+            prefix_mask = combine_masks_and(segment_mask, input_attn_mask_sliced)
+            # prefix_mask = segment_mask & input_attn_mask_sliced
             mask = combine_masks_or(mask, prefix_mask)
 
         return mask

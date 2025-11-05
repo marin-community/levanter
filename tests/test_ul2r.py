@@ -115,15 +115,154 @@ def test_random_spans_noise_mask():
         np.testing.assert_array_equal(mask, mask2, "Function should be deterministic with same key")
 
         # Test that different keys produce different results
-        key2 = jax.random.PRNGKey(43)
+        keyb = jax.random.PRNGKey(38)
         mask3 = random_spans_noise_mask(
             length,
             noise_density,
-            key2,
+            keyb,
             mean_span_length,
             random_roll,
             padded_length,
         )
+
+        # DEBUG START ONE
+
+        num_noise_tokens, num_noise_spans, num_nonnoise_tokens = num_noise_spans_tokens_and_spans(
+            length, noise_density, mean_span_length
+        )
+
+        keyu, keyv, keyw = jax.random.split(key, 3)
+
+        noise_span_lengths4 = random_segmentation(num_noise_tokens, num_noise_spans, keyu, padded_length)
+        nonnoise_span_lengths4 = random_segmentation(num_nonnoise_tokens, num_noise_spans, keyv, padded_length)
+
+        print(f"noise_span_lengths4 {noise_span_lengths4}")
+        print(f"nonnoise_span_lengths4 {nonnoise_span_lengths4}")
+
+        # Interleave using reshape
+        interleaved_span_lengths = jnp.reshape(
+            jnp.stack([nonnoise_span_lengths4, noise_span_lengths4], axis=1),
+            [padded_length * 2],
+        )[:padded_length]
+
+        # Create span_start_indicator using bincount
+        span_starts = jnp.cumsum(interleaved_span_lengths)
+        span_start_indicator = jnp.bincount(span_starts, length=padded_length)
+
+        print(f"span_starts4 {span_starts}")
+        print(f"span_start_indicator4 {span_start_indicator}")
+
+        span_num = jnp.cumsum(span_start_indicator)
+        # Only odd spans less than 2*num_noise_spans are noise
+        is_noise = ((span_num % 2) == 1) & (span_num < 2 * num_noise_spans)
+        is_noise = is_noise.astype(jnp.bool_)
+
+        print(f"span_num4 {span_num}")
+        print(f"is_noise4 {is_noise}")
+
+        # Zero everything at length and after
+        indices = jnp.arange(padded_length)
+        is_noise = jnp.where(indices < length, is_noise, False)
+        is_noise = typing.cast(jnp.ndarray, is_noise)
+
+        print(f"length4={length}")
+        print("is_noise4")
+        print(is_noise)
+
+        offset = jax.random.randint(keyw, (), 0, length, dtype=jnp.int32)
+        print(f"keyw={keyw} offset={offset}")
+        # Roll the mask
+        rolled = jnp.roll(is_noise, offset)
+        # We want to roll within [0, length) so we need to overwrite values that
+        # came from the end
+        rolled = jnp.where(
+            indices < offset,
+            jnp.roll(is_noise, offset - length),
+            rolled,
+        )
+        rolled = typing.cast(jnp.ndarray, rolled)
+        mask_debug4 = jnp.where(indices < length, rolled, False)
+
+        print("mask4 rolled")
+        print(mask_debug4)
+
+        # DEBUG START
+
+        num_noise_tokens, num_noise_spans, num_nonnoise_tokens = num_noise_spans_tokens_and_spans(
+            length, noise_density, mean_span_length
+        )
+
+        key1, key2, key3 = jax.random.split(keyb, 3)
+
+        noise_span_lengths = random_segmentation(num_noise_tokens, num_noise_spans, key1, padded_length)
+        nonnoise_span_lengths = random_segmentation(num_nonnoise_tokens, num_noise_spans, key2, padded_length)
+
+        print(f"noise_span_lengths {noise_span_lengths}")
+        print(f"nonnoise_span_lengths {nonnoise_span_lengths}")
+
+        keyx, keyy, keyz = jax.random.split(key, 3)
+
+        noise_span_lengths2 = random_segmentation(num_noise_tokens, num_noise_spans, keyx, padded_length)
+        nonnoise_span_lengths2 = random_segmentation(num_nonnoise_tokens, num_noise_spans, keyy, padded_length)
+
+        print(f"noise_span_lengths2 {noise_span_lengths2}")
+        print(f"nonnoise_span_lengths2 {nonnoise_span_lengths2}")
+
+        # Interleave using reshape
+        interleaved_span_lengths = jnp.reshape(
+            jnp.stack([nonnoise_span_lengths, noise_span_lengths], axis=1),
+            [padded_length * 2],
+        )[:padded_length]
+
+        # Create span_start_indicator using bincount
+        span_starts = jnp.cumsum(interleaved_span_lengths)
+        span_start_indicator = jnp.bincount(span_starts, length=padded_length)
+
+        print(f"span_starts {span_starts}")
+        print(f"span_start_indicator {span_start_indicator}")
+
+        span_num = jnp.cumsum(span_start_indicator)
+        # Only odd spans less than 2*num_noise_spans are noise
+        is_noise = ((span_num % 2) == 1) & (span_num < 2 * num_noise_spans)
+        is_noise = is_noise.astype(jnp.bool_)
+
+        print(f"span_num {span_num}")
+        print(f"is_noise {is_noise}")
+
+        # Zero everything at length and after
+        indices = jnp.arange(padded_length)
+        is_noise = jnp.where(indices < length, is_noise, False)
+        is_noise = typing.cast(jnp.ndarray, is_noise)
+
+        print(f"length={length}")
+        print("is_noise")
+        print(is_noise)
+
+        offset = jax.random.randint(key3, (), 0, length, dtype=jnp.int32)
+        print(f"key3={key3} offset={offset}")
+        # Roll the mask
+        rolled = jnp.roll(is_noise, offset)
+        # We want to roll within [0, length) so we need to overwrite values that
+        # came from the end
+        rolled = jnp.where(
+            indices < offset,
+            jnp.roll(is_noise, offset - length),
+            rolled,
+        )
+        rolled = typing.cast(jnp.ndarray, rolled)
+        mask_debug = jnp.where(indices < length, rolled, False)
+
+        print("mask rolled")
+        print(mask_debug)
+        print("mask")
+        print(mask)
+        print("mask3")
+        print(mask3)
+
+        # DEBUG END
+
+        # NOTE This test could fail spuriously because of randomness. Inspect
+        # the results.
         assert not jnp.array_equal(mask, mask3), "Different keys should produce different masks"
 
 
@@ -213,7 +352,76 @@ def test_to_ul2r_rx_tokens():
     tokens = jnp.pad(tokens, (0, max_length - tokens.shape[0]), constant_values=pad_token_id)
     length = 10
 
-    key = jax.random.PRNGKey(42)
+    key = jax.random.PRNGKey(38)
+
+    # DEBUG
+
+    padded_length = tokens.shape[0]
+    noise_mask = random_spans_noise_mask(
+        length,
+        0.3,
+        key,
+        3.0,
+        True,
+        padded_length,
+    )
+
+    print(noise_mask)
+    print(noise_mask[:length])
+
+    num_noise_tokens, num_noise_spans, num_nonnoise_tokens = num_noise_spans_tokens_and_spans(length, 0.3, 3.0)
+
+    key1, key2, key3 = jax.random.split(key, 3)
+
+    print(num_noise_tokens)
+    print(num_nonnoise_tokens)
+    print(num_noise_spans)
+
+    noise_span_lengths = random_segmentation(num_noise_tokens, num_noise_spans, key1, padded_length)
+    nonnoise_span_lengths = random_segmentation(num_nonnoise_tokens, num_noise_spans, key2, padded_length)
+
+    print(noise_span_lengths)
+    print(nonnoise_span_lengths)
+
+    # Interleave using reshape
+    interleaved_span_lengths = jnp.reshape(
+        jnp.stack([nonnoise_span_lengths, noise_span_lengths], axis=1),
+        [2 * padded_length],
+    )[:padded_length]
+
+    # Create span_start_indicator using bincount
+    span_starts = jnp.cumsum(interleaved_span_lengths)
+    span_start_indicator = jnp.bincount(span_starts, length=padded_length)
+
+    span_num = jnp.cumsum(span_start_indicator)
+    # Only odd spans less than 2*num_noise_spans are noise
+    is_noise = ((span_num % 2) == 1) & (span_num < 2 * num_noise_spans)
+    is_noise = is_noise.astype(jnp.bool_)
+
+    # Zero everything at length and after
+    indices = jnp.arange(padded_length)
+    is_noise = jnp.where(indices < length, is_noise, False)
+    is_noise = typing.cast(jnp.ndarray, is_noise)
+
+    inputs = noise_span_to_unique_sentinel(
+        tokens,
+        noise_mask,
+        sentinel_tokens,
+        length,
+        force_initial_sentinel=False,
+    )
+    targets = noise_span_to_unique_sentinel(
+        tokens,
+        ~noise_mask,
+        sentinel_tokens,
+        length,
+        force_initial_sentinel=True,
+    )
+
+    print(inputs)
+    print(targets)
+
+    # END DEBUG
 
     input_length, result = to_ul2r_rx_tokens(
         key,
@@ -297,6 +505,10 @@ def test_to_ul2r_rx_tokens_roll():
             sentinel_token_ids=sentinel_ids,
             max_length=max_length,
         )
+
+        print(tokens)
+        print(result)
+
         assert result.shape == (max_length,)
 
         assert input_length.shape == ()
@@ -311,6 +523,8 @@ def test_to_ul2r_rx_tokens_roll():
         # random_roll) would produce a target noise mask of 101, which would create
         # 2 sentinels in the target vs. only 1 in the input.
 
+        print("inputs", inputs)
+        print("targets", targets)
         np.testing.assert_array_equal(jnp.isin(sentinel_ids, inputs), jnp.isin(sentinel_ids, targets))
         assert jnp.any(jnp.isin(sentinel_ids, inputs))
         assert jnp.any(jnp.isin(sentinel_ids, targets))
@@ -509,6 +723,127 @@ def test_create_ul2r_example():
 
     key = jax.random.PRNGKey(37)
 
+    # DEBUG START
+
+    # TODO Use NamedArrays more idiomatically
+    # `unique_seg_ids = [3, 4, ..., -1, ...]`
+    # Valid segment IDs come first, padded with -1.
+    # Sorted; assumes `segment_ids` is also sorted in ascending order.
+    # We use the same ordering for `out_starts` etc.
+    max_seg_id = jnp.max(segment_ids.array)
+    seg_ids = jnp.where(segment_ids.array == -1, max_seg_id, segment_ids.array)
+    unique_seg_ids = jnp.unique(seg_ids, size=max_segments_per_example, fill_value=-1)
+
+    def prepare_segment(id: int) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """
+        Returns `(in_start, in_length, out_length)` for segment `id`.
+        The result is undefined for ids not in `segment_ids` or the id -1.
+        """
+
+        mask = segment_ids.array == id
+        n = mask.shape[0]
+        idx = jnp.arange(n)
+
+        in_start = jnp.min(jnp.where(mask, idx, n))
+        in_end = jnp.max(jnp.where(mask, idx + 1, 0))
+        in_length = in_end - in_start
+
+        # Eventually we don't want to have to instantiate all of `offsets`
+        # and `task_indices` (because they could take up a lot of
+        # space). We can generate `task_params` / `task_idx` for each
+        # batch independently (but in a way that matches how we computed
+        # lengths for packing).
+        task_idx = task_indices[id]
+        out_length = compute_denoising_length(task_params[task_idx], in_length)
+
+        return in_start, in_length, out_length
+
+    in_starts, in_lengths, out_lengths = jax.vmap(prepare_segment)(unique_seg_ids)
+
+    # `out_starts[i]` is the offset of the beginning of the i-th output segment.
+    # Segment lengths increase when we turn them into denoising examples.
+    out_starts = jax.lax.cumsum(out_lengths) - out_lengths
+    out_starts = jnp.where(unique_seg_ids == -1, -1, out_starts)
+    out_starts = typing.cast(jnp.ndarray, out_starts)
+
+    print(out_starts)
+
+    def process_segment(key, id: int) -> tuple[jnp.ndarray, jnp.ndarray, int, int]:
+        """
+        Applies UL2R denoising to a single segment.
+        Returns `(input_mask, denoising_tokens, start, length)`.
+        `input_mask` is true when the token is an input given to the LLM
+        (i.e. one where we don't compute loss).
+        `denoising_tokens` is `0... to_ul2r_tokens(...) 0...` where the
+        prefix is `out_starts[idx]` zeros.
+        We'll or all the segments together at the end; the nonzero parts
+        shouldn't overlap.
+        """
+
+        task_idx = task_indices[id]
+
+        idx = jnp.nonzero(unique_seg_ids == id, size=1)[0]
+        in_start = typing.cast(int, jnp.squeeze(in_starts[idx]))
+        in_length = typing.cast(int, jnp.squeeze(in_lengths[idx]))
+        out_length = typing.cast(int, jnp.squeeze(out_lengths[idx]))
+        out_start = typing.cast(int, jnp.squeeze(out_starts[idx]))
+
+        segment = jnp.roll(tokens.array, -in_start)
+        print(key, task_params[task_idx], segment, in_length, QPos.size)
+        inputs_len, denoising_tokens = to_ul2r_tokens(key, task_params[task_idx], segment, in_length, SENTINEL_TOKEN_IDS, QPos.size)
+
+        n_tokens = tokens.array.shape[0]
+        input_mask = jnp.arange(n_tokens) < inputs_len
+        input_mask = jnp.roll(input_mask, out_start)
+        denoising_tokens = jnp.roll(denoising_tokens, out_start)
+        return (input_mask, denoising_tokens, out_start, out_length)
+
+    process_key, _key = jax.random.split(key)
+    print(process_key)
+    print(process_segment(process_key, 0))
+
+    def loop(
+        acc: tuple[PRNGKeyArray, int, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    ) -> tuple[PRNGKeyArray, int, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        (key, i, input_mask, denoising_tokens, out_seg_ids) = acc
+        process_key, key = jax.random.split(key)
+        id = unique_seg_ids[i]
+        (seg_input_mask, seg_denoising_tokens, start, length) = process_segment(process_key, id)
+        input_mask = input_mask | seg_input_mask
+        denoising_tokens = denoising_tokens | seg_denoising_tokens
+        indices = jnp.arange(out_seg_ids.shape[0])
+        out_seg_ids = jnp.where((indices >= start) & (indices < start + length), id, out_seg_ids)
+        out_seg_ids = typing.cast(jnp.ndarray, out_seg_ids)
+        return (key, i + 1, input_mask, denoising_tokens, out_seg_ids)
+
+    key2, i2, input_mask2, denoising_tokens2, out_seg_ids2 = loop(
+        (
+            key,
+            0,
+            jnp.zeros_like(tokens.array, dtype=jnp.bool_),
+            jnp.zeros_like(tokens.array),
+            jnp.full(tokens.array.shape, -1),
+        )
+    )
+    key3, i3, input_mask3, denoising_tokens3, out_seg_ids3 = loop(
+        (key2, i2, input_mask2, denoising_tokens2, out_seg_ids2)
+    )
+
+    jnp.set_printoptions(threshold=sys.maxsize, linewidth=sys.maxsize)
+
+    input_attn_mask = jnp.outer(input_mask3, input_mask3)
+    print("input_attn_mask")
+    print(input_attn_mask.astype(jnp.int32))
+    print("out_seg_ids3")
+    print(out_seg_ids3)
+    segment_mask = out_seg_ids3 == out_seg_ids3[:, jnp.newaxis]
+    print("segment_mask")
+    print(segment_mask.astype(jnp.int32))
+    prefix_mask = segment_mask & input_attn_mask
+    print("prefix_mask")
+    print(prefix_mask.astype(jnp.int32))
+
+    # DEBUG END
 
     example = create_ul2r_example(
         key,
@@ -539,6 +874,10 @@ def test_create_ul2r_example():
     is_padding = example.tokens.array == pad_token_id
     assert not jnp.any(example.loss_mask.array & is_padding)
 
+    print(example.tokens.array)
+    print(example.loss_mask.array.astype(jnp.int32))
+    print(example.attn_mask.segment_ids[0].array)
+    print(example.attn_mask.materialize(QPos, KPos).array.astype(jnp.int32))
 
     # The R-denoising example should contain exactly 2 of the first sentinel
     # (one to identify the masked span, one to identify the output span)

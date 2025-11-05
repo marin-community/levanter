@@ -26,12 +26,15 @@ trainer:
 
 data:
   #id: dlwh/wikitext_103_detokenized
-  id: roneneldan/TinyStories
+  #id: roneneldan/TinyStories
+  id: openai/gsm8k
+  name: socratic
   cache_dir: /workspace/marin_cache
   tokenizer: ./gpt2_ul2r_DEV
   format:
     type: ul2r
-    text_key: text
+    #text_key: text
+    text_key: question
     task_configs:
       r:
         type: rx
@@ -50,7 +53,7 @@ data:
         mask_prob: 0.5
         mean_span_length: 3.0
         random_roll: true
-        task_token_id: 50155
+        task_token_id: 50258
       s:
         type: s
         task_token_id: 50259

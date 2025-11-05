@@ -810,6 +810,8 @@ def test_attention_mask_with_prefix():
     # Materialize the mask
     materialized = mask.materialize(Pos, KPos)
 
+    print(materialized)
+
     # Check the materialized mask
     # The mask should allow:
     # - Causal attention for all positions
@@ -844,3 +846,45 @@ def test_attention_mask_with_prefix():
     # Should only follow causal pattern (is_prefix doesn't affect padding)
     assert materialized.array[6, 6] == True  # Can see self (causal)
     assert materialized.array[6, 7] == False  # Cannot see future
+
+
+def test_attention_mask_is_prefix_with_batch():
+    """Test that prefix attention masks work correctly with a batch axis."""
+    B, L = 2, 4
+    Batch = Axis("Batch", B)
+    Pos = Axis("Pos", L)
+    KPos = Pos.alias("KPos")
+
+    # Batch 0: [0, 0, 0, 0] with segment [0, 0, -1, -1]
+    # Batch 1: [1, 1, 0, 0] with segment [0, 0, 0, 0]
+    input_masks = jnp.array([[1, 0, 0, 0], [1, 1, 0, 0]], dtype=jnp.bool_)
+    segment_ids = jnp.array([[0, 0, -1, -1], [0, 0, 0, 0]])
+
+    input_masks_named = hax.named(input_masks, (Batch, Pos))
+    segment_ids_named = hax.named(segment_ids, (Batch, Pos))
+
+    mask = AttentionMask(
+        is_causal=True,
+        is_prefix=True,
+        input_mask=input_masks_named,
+        segment_ids=(segment_ids_named, segment_ids_named.rename({Pos.name: KPos.name}))
+    )
+
+    materialized = mask.materialize(Pos, KPos)
+
+    # Batch 0: only pos 0 is input, so only causal attention
+    # Batch 1: pos 0,1 are input, so they can attend bidirectionally to each other
+    expected = jnp.array([
+        [[True, False, False, False],   # Batch 0
+         [True, True, False, False],
+         [False, False, True, False],
+         [False, False, True, True]],
+        [[True, True, False, False],    # Batch 1: positions 0-1 see each other
+         [True, True, False, False],
+         [True, True, True, False],
+         [True, True, True, True]]
+    ])
+
+    # TODO Right now the batch axis isn't the outer axis. Is that right?
+    assert jnp.all(materialized[Batch, 0].array == expected[0])
+    assert jnp.all(materialized[Batch, 1].array == expected[1])
