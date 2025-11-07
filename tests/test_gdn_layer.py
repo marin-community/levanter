@@ -105,7 +105,8 @@ def _lev_state_from_hf_layer(lev_cfg: GatedDeltaNetConfig, hf_layer) -> dict[str
 # -------------------------------
 
 
-def test_layer_streaming_decode_matches_one_shot_prefill():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_layer_streaming_decode_matches_one_shot_prefill(use_flash: bool):
     """Streaming (per-token) with carried (conv_state, S_state) must match one-shot prefill."""
     key = jax.random.PRNGKey(0)
     B, L = 2, 20
@@ -118,7 +119,7 @@ def test_layer_streaming_decode_matches_one_shot_prefill():
         conv_kernel_size=4,
         rms_norm_eps=1e-6,
     )
-    layer = GatedDeltaNet.init(cfg, key=key)
+    layer = GatedDeltaNet.init(cfg, key=key, use_flash=use_flash)
 
     Batch, Pos, Embed = Axis("batch", B), Axis("position", L), cfg.Embed
     xkey = jax.random.PRNGKey(0)
@@ -137,14 +138,17 @@ def test_layer_streaming_decode_matches_one_shot_prefill():
     ys = []
     for t in range(L):
         xt = x["position", hax.ds(t, Axis("pos1", 1))]
-        y_t, (conv_state, S_state) = layer(xt, inference=True, chunk_size=8, decode_state=(conv_state, S_state))
+        y_t, state = layer(xt, inference=True, chunk_size=8, decode_state=(conv_state, S_state))
+        assert state is not None
+        conv_state, S_state = state
         ys.append(y_t.array)
 
     y_stream = np.concatenate(ys, axis=1)  # (B, L, Embed)
     np.testing.assert_allclose(y_stream, y_full.array, rtol=1e-5, atol=1e-5)
 
 
-def test_layer_masking_trailing_zeros_equivalence():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_layer_masking_trailing_zeros_equivalence(use_flash: bool):
     """Zeroing trailing positions via attention_mask should not change earlier outputs (causality)."""
     key = jax.random.PRNGKey(0)
     B, L = 2, 19
@@ -157,7 +161,7 @@ def test_layer_masking_trailing_zeros_equivalence():
         conv_kernel_size=4,
         rms_norm_eps=1e-6,
     )
-    layer = GatedDeltaNet.init(cfg, key=key)
+    layer = GatedDeltaNet.init(cfg, key=key, use_flash=use_flash)
 
     Batch, Pos, Embed = Axis("batch", B), Axis("position", L), cfg.Embed
     x = hax.named(jax.random.normal(key, (B, L, Embed.size), dtype=jnp.float32), (Batch, Pos, Embed))
@@ -176,7 +180,8 @@ def test_layer_masking_trailing_zeros_equivalence():
 
 
 @pytest.mark.parametrize("csize_a,csize_b", [(8, 16), (16, 32)])
-def test_layer_chunk_size_invariance(csize_a, csize_b):
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_layer_chunk_size_invariance(csize_a, csize_b, use_flash: bool):
     """Prefill outputs should be invariant to chunk size."""
     key = jax.random.PRNGKey(0)
     B, L = 2, 37
@@ -189,7 +194,7 @@ def test_layer_chunk_size_invariance(csize_a, csize_b):
         conv_kernel_size=4,
         rms_norm_eps=1e-6,
     )
-    layer = GatedDeltaNet.init(cfg, key=key)
+    layer = GatedDeltaNet.init(cfg, key=key, use_flash=use_flash)
 
     Batch, Pos, Embed = Axis("batch", B), Axis("position", L), cfg.Embed
     x = hax.named(jax.random.normal(key, (B, L, Embed.size), dtype=jnp.float32), (Batch, Pos, Embed))
@@ -199,7 +204,8 @@ def test_layer_chunk_size_invariance(csize_a, csize_b):
     np.testing.assert_allclose(y_a.array, y_b.array, rtol=1e-5, atol=1e-5)
 
 
-def test_layer_gradients_exist():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_layer_gradients_exist(use_flash: bool):
     """End-to-end differentiability: grads w.r.t. inputs exist and are finite."""
     key = jax.random.PRNGKey(0)
     B, L = 1, 12
@@ -212,7 +218,7 @@ def test_layer_gradients_exist():
         conv_kernel_size=4,
         rms_norm_eps=1e-6,
     )
-    layer = GatedDeltaNet.init(cfg, key=key)
+    layer = GatedDeltaNet.init(cfg, key=key, use_flash=use_flash)
 
     Batch, Pos, Embed = Axis("batch", B), Axis("position", L), cfg.Embed
     x0 = hax.named(jax.random.normal(key, (B, L, Embed.size), dtype=jnp.float32), (Batch, Pos, Embed))
@@ -227,7 +233,8 @@ def test_layer_gradients_exist():
 
 
 @skip_if_no_torch
-def test_gdn_layer_backward_matches_hf():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_gdn_layer_backward_matches_hf(use_flash: bool):
     import torch
 
     # Small configuration for a reasonably fast backward parity check
@@ -245,7 +252,7 @@ def test_gdn_layer_backward_matches_hf():
         rms_norm_eps=1e-6,
     )
     lev_state = _lev_state_from_hf_layer(lev_cfg, hf_layer)
-    lev_layer = GatedDeltaNet.from_state_dict(lev_cfg, lev_state, key=jax.random.PRNGKey(0))
+    lev_layer = GatedDeltaNet.from_state_dict(lev_cfg, lev_state, use_flash=use_flash, key=jax.random.PRNGKey(0))
 
     # Random input
     B, L = 1, 16
@@ -277,7 +284,8 @@ def test_gdn_layer_backward_matches_hf():
 
 
 @skip_if_no_torch
-def test_gdn_layer_matches_hf_prefill():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_gdn_layer_matches_hf_prefill(use_flash: bool):
     import torch  # local import for environments without torch
 
     def _to_torch(x):
@@ -288,7 +296,7 @@ def test_gdn_layer_matches_hf_prefill():
     lev_cfg, _ = _init_small_lev_layer(hidden_size, nk, nv, dk, dv, ksz)
 
     lev_state = _lev_state_from_hf_layer(lev_cfg, hf_layer)
-    lev_layer = GatedDeltaNet.from_state_dict(lev_cfg, lev_state, key=jax.random.PRNGKey(0))
+    lev_layer = GatedDeltaNet.from_state_dict(lev_cfg, lev_state, use_flash=use_flash, key=jax.random.PRNGKey(0))
 
     # random input
     B, L = 2, 64
@@ -335,7 +343,8 @@ def test_gdn_layer_matches_hf_prefill():
 
 
 @skip_if_no_torch
-def test_gdn_layer_decode_matches_hf_one_step():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_gdn_layer_decode_matches_hf_one_step(use_flash: bool):
     """
     Prefill to build state, then decode one token using the recurrent path in both Levanter and HF.
     Ensures conv-state length K and S-state handoff are correct and parity holds.
@@ -355,7 +364,7 @@ def test_gdn_layer_decode_matches_hf_one_step():
     )
 
     lev_state = _lev_state_from_hf_layer(lev_cfg, hf_layer)
-    lev_layer = GatedDeltaNet.from_state_dict(lev_cfg, lev_state, key=jax.random.PRNGKey(0))
+    lev_layer = GatedDeltaNet.from_state_dict(lev_cfg, lev_state, use_flash=use_flash, key=jax.random.PRNGKey(0))
 
     B, L = 2, 37
     x_full = jax.random.normal(jax.random.PRNGKey(1), (B, L, hidden_size), dtype=jnp.float32)
@@ -424,7 +433,73 @@ def test_depthwise_conv_update_equivalence():
 
 
 @skip_if_no_torch
-def test_ratio_equal_one_and_greater_than_one():
+def test_depthwise_conv_backward_matches_torch():
+    """Depthwise causal conv + SiLU: JAX vs Torch gradient parity wrt input and kernel."""
+    import torch
+    import torch.nn.functional as F
+
+    key = jax.random.PRNGKey(0)
+    N, C, L, K = 2, 5, 23, 7
+    x = jax.random.normal(key, (N, C, L), dtype=jnp.float32)
+    w = jax.random.normal(jax.random.PRNGKey(1), (C, K), dtype=jnp.float32)
+
+    def loss_jax(x_arr, w_arr):
+        y = _causal_depthwise_conv1d_full(x_arr, w_arr, None)
+        return jnp.sum(y)
+
+    gx_j, gw_j = jax.grad(loss_jax, argnums=(0, 1))(x, w)
+
+    # Torch reference: left-pad input by (K-1), depthwise conv (groups=C), no bias, SiLU
+    x_t = torch.from_numpy(np.array(x))
+    w_t = torch.from_numpy(np.array(w))
+    x_t.requires_grad_(True)
+    w_t.requires_grad_(True)
+    x_pad_t = F.pad(x_t, (K - 1, 0))  # left pad only
+    y_t = F.conv1d(x_pad_t, w_t[:, None, :], bias=None, stride=1, padding=0, groups=C)
+    y_t = F.silu(y_t)
+    loss_t = y_t.sum()
+    loss_t.backward()
+    gx_t = x_t.grad.detach().cpu().numpy()
+    gw_t = w_t.grad.detach().cpu().numpy()
+
+    np.testing.assert_allclose(np.array(gx_j), gx_t, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(np.array(gw_j), gw_t, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_layer_backward_chunk_size_invariance(use_flash: bool):
+    """Gradients wrt inputs should be invariant to chunk size choices in prefill/train path."""
+    key = jax.random.PRNGKey(0)
+    B, L = 1, 27
+    cfg = GatedDeltaNetConfig(
+        Embed=Axis("embed", 48),
+        num_k_heads=2,
+        num_v_heads=4,
+        head_k_dim=8,
+        head_v_dim=8,
+        conv_kernel_size=4,
+        rms_norm_eps=1e-6,
+    )
+    layer = GatedDeltaNet.init(cfg, key=key, use_flash=use_flash)
+
+    Batch, Pos, Embed = Axis("batch", B), Axis("position", L), cfg.Embed
+    x0 = hax.named(jax.random.normal(key, (B, L, Embed.size), dtype=jnp.float32), (Batch, Pos, Embed))
+
+    def loss_with_chunk(x_arr, chunk_size):
+        x = hax.named(x_arr, x0.axes)
+        y, _ = layer(x, inference=False, chunk_size=chunk_size)
+        return jnp.sum(y.array)
+
+    g8 = jax.grad(lambda arr: loss_with_chunk(arr, 8))(x0.array)
+    g32 = jax.grad(lambda arr: loss_with_chunk(arr, 32))(x0.array)
+
+    # fp32 accumulation order can cause tiny chunk-size dependent differences
+    np.testing.assert_allclose(np.array(g8), np.array(g32), rtol=3e-5, atol=3e-6)
+
+
+@skip_if_no_torch
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_ratio_equal_one_and_greater_than_one(use_flash: bool):
     """
     Exercise both ratio paths: nv == nk and nv > nk (repeat-interleave of Q/K).
     Run prefill parity vs HF in both cases.
@@ -444,7 +519,7 @@ def test_ratio_equal_one_and_greater_than_one():
         )
 
         lev_state = _lev_state_from_hf_layer(lev_cfg, hf_layer)
-        lev_layer = GatedDeltaNet.from_state_dict(lev_cfg, lev_state, key=jax.random.PRNGKey(0))
+        lev_layer = GatedDeltaNet.from_state_dict(lev_cfg, lev_state, use_flash=use_flash, key=jax.random.PRNGKey(0))
 
         B, L = 2, 64
         x_j = jax.random.normal(jax.random.PRNGKey(0), (B, L, hidden_size), dtype=jnp.float32)
@@ -462,7 +537,8 @@ def test_ratio_equal_one_and_greater_than_one():
 
 
 @skip_if_no_torch
-def test_linear_mask_zeroes_padded_tokens_prefill():
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_linear_mask_zeroes_padded_tokens_prefill(use_flash: bool):
     hidden_size, nk, nv, dk, dv, ksz = 96, 4, 8, 8, 8, 4
     hf_cfg, hf_layer = _init_small_hf_layer_with_linear_only(hidden_size, nk, nv, dk, dv, ksz)
     lev_cfg = GatedDeltaNetConfig(
@@ -475,7 +551,7 @@ def test_linear_mask_zeroes_padded_tokens_prefill():
     )
 
     lev_state = _lev_state_from_hf_layer(lev_cfg, hf_layer)
-    lev_layer = GatedDeltaNet.from_state_dict(lev_cfg, lev_state, key=jax.random.PRNGKey(0))
+    lev_layer = GatedDeltaNet.from_state_dict(lev_cfg, lev_state, use_flash=use_flash, key=jax.random.PRNGKey(0))
 
     B, L_core, L_pad = 2, 16, 8
     x_core = jax.random.normal(jax.random.PRNGKey(0), (B, L_core, hidden_size), dtype=jnp.float32)

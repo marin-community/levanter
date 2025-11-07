@@ -1992,7 +1992,8 @@ def _gdn_chunk_bwd_kernel_fused(
     dQ_attn_chunk_ref[dslice(nh, 1), dslice(0, 1), dslice(0, C), dslice(0, K)] = dQ_attn[None, None, :, :]
     dQ_inter_chunk_ref[dslice(nh, 1), dslice(0, 1), dslice(0, C), dslice(0, K)] = dQ_inter[None, None, :, :]
     dK_chunk_ref[dslice(nh, 1), dslice(0, 1), dslice(0, C), dslice(0, K)] = dK_tile[None, None, :, :]
-    dV_tile_ref[dslice(nh, 1), dslice(0, 1), dslice(0, BV)] = dV_tile[None, None, :, :]
+    # dV_tile_ref shape: [NH, 1, C, BV] — index C then BV
+    dV_tile_ref[dslice(nh, 1), dslice(0, 1), dslice(0, C), dslice(0, BV)] = dV_tile[None, None, :, :]
     dG_chunk_ref[dslice(nh, 1), dslice(0, 1)] = dG_tile[None, None, :]
     dB_chunk_ref[dslice(nh, 1), dslice(0, 1)] = dB_tile[None, None, :]
     dS_out_tile_ref[dslice(nh, 1), dslice(0, K), dslice(0, BV)] = dS_out[None, :, :]
@@ -3018,6 +3019,7 @@ class GatedDeltaNet(eqx.Module):
     """
 
     config: GatedDeltaNetConfig = eqx.field(static=True)
+    use_flash: bool = eqx.field(static=True)
 
     # projections
     in_proj_qkvz: hnn.Linear  # [Embed] -> [Q|K|V|Z]
@@ -3036,7 +3038,7 @@ class GatedDeltaNet(eqx.Module):
     out_proj: hnn.Linear  # [Heads, VHeadDim] -> [Embed]
 
     @staticmethod
-    def init(config: GatedDeltaNetConfig, *, key) -> "GatedDeltaNet":
+    def init(config: GatedDeltaNetConfig, *, use_flash: bool = True, key) -> "GatedDeltaNet":
         """Initializer mirrors the HF defaults: no biases in projections/out_proj;
         A_log ~ log U(0,16), dt_bias = 1, small conv kernel."""
         k_qkvz, k_ba, k_conv, k_out = jax.random.split(key, 4)
@@ -3072,7 +3074,7 @@ class GatedDeltaNet(eqx.Module):
         )
         dt_bias = hax.named(jnp.ones((config.Heads.size,), dtype=jnp.float32), (config.Heads.name,))
 
-        o_norm = FusedRMSNormGated.init(config.VHeadDim, eps=config.rms_norm_eps)
+        o_norm = FusedRMSNormGated.init(config.VHeadDim, eps=config.rms_norm_eps, use_flash=use_flash)
         out_proj = hnn.Linear.init(
             In=(config.Heads, config.VHeadDim), Out=config.Embed, out_first=True, use_bias=False, key=k_out
         )
@@ -3086,6 +3088,7 @@ class GatedDeltaNet(eqx.Module):
             dt_bias=dt_bias,
             o_norm=o_norm,
             out_proj=out_proj,
+            use_flash=use_flash,
         )
 
     def _fix_qkvz_ordering(
@@ -3285,6 +3288,7 @@ class GatedDeltaNet(eqx.Module):
                 initial_state=S_state,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
+                use_flash=self.use_flash,
             )
         else:
             out_bphd, S_new = chunk_gated_delta_rule(
@@ -3297,6 +3301,7 @@ class GatedDeltaNet(eqx.Module):
                 initial_state=None,
                 output_final_state=inference,
                 use_qk_l2norm_in_kernel=True,
+                use_flash=self.use_flash,
             )
 
         # Keep the kernel output on "heads" so TP can shard the out-projection.
@@ -3370,6 +3375,13 @@ class GatedDeltaNet(eqx.Module):
         )
 
     @classmethod
-    def from_state_dict(cls, config: GatedDeltaNetConfig, state: dict[str, jnp.ndarray], *, key) -> "GatedDeltaNet":
-        layer = cls.init(config, key=key)
+    def from_state_dict(
+        cls,
+        config: GatedDeltaNetConfig,
+        state: dict[str, jnp.ndarray],
+        use_flash: bool = True,
+        *,
+        key,
+    ) -> "GatedDeltaNet":
+        layer = cls.init(config, key=key, use_flash=use_flash)
         return layer.load_state_dict(state)

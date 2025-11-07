@@ -11,7 +11,13 @@ import haliax.nn as hnn
 from haliax import Axis
 import pytest
 
-from levanter.layers.gated_deltanet import FusedRMSNormGated, chunk_gated_delta_rule, recurrent_gated_delta_rule
+from levanter.layers.gated_deltanet import (
+    FusedRMSNormGated,
+    chunk_gated_delta_rule,
+    recurrent_gated_delta_rule,
+    _rmsnorm_gated_flash,
+    _rmsnorm_gated_reference,
+)
 from tests.test_utils import skip_if_no_torch
 
 jax.config.update("jax_default_matmul_precision", "float32")
@@ -70,6 +76,76 @@ def test_fused_rms_norm_gated_matches_reference():
 
     np.testing.assert_allclose(y_flash.array, y_ref.array, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(y_flash.array, expected.array, rtol=1e-6, atol=1e-6)
+
+
+def test_fused_rms_norm_gated_backward_matches_reference():
+    """Gradient parity for fused RMSNorm + SiLU gate against the reference JAX path.
+
+    Compares grads w.r.t. inputs (x, gate) and the weight parameter.
+    """
+    key = jax.random.PRNGKey(123)
+    kx, kg, kw = jax.random.split(key, 3)
+
+    N, D = 7, 9
+    x = jax.random.normal(kx, (N, D), dtype=jnp.float32)
+    gate = jax.random.normal(kg, (N, D), dtype=jnp.float32)
+    weight = jax.random.normal(kw, (D,), dtype=jnp.float32)
+    eps = 1e-6
+
+    def loss_flash(x_arr, g_arr, w_arr):
+        y = _rmsnorm_gated_flash(x_arr, g_arr, w_arr, eps)
+        return jnp.sum(y)
+
+    def loss_ref(x_arr, g_arr, w_arr):
+        y = _rmsnorm_gated_reference(x_arr, g_arr, w_arr, eps)
+        return jnp.sum(y)
+
+    gx_f, gg_f, gw_f = jax.grad(loss_flash, argnums=(0, 1, 2))(x, gate, weight)
+    gx_r, gg_r, gw_r = jax.grad(loss_ref, argnums=(0, 1, 2))(x, gate, weight)
+
+    np.testing.assert_allclose(np.array(gx_f), np.array(gx_r), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(np.array(gg_f), np.array(gg_r), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(np.array(gw_f), np.array(gw_r), rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("use_flash", [True, False])
+def test_flash_chunk_backward_chunk_size_invariance_kernel_level(use_flash: bool):
+    """Kernel-level: gradients should be invariant to chunk_size (flash path).
+
+    We compare grads wrt q,k,v,g,beta for two chunk sizes.
+    """
+    key = jax.random.PRNGKey(0)
+    B, H, L, dk, dv = 1, 2, 27, 8, 8
+    q, k, v, g, beta = _named_kernels_inputs(B, H, L, dk, dv, key)
+
+    def loss_with_chunk(q_arr, k_arr, v_arr, g_arr, b_arr, chunk_size):
+        qn = hax.named(q_arr, q.axes)
+        kn = hax.named(k_arr, k.axes)
+        vn = hax.named(v_arr, v.axes)
+        gn = hax.named(g_arr, g.axes)
+        bn = hax.named(b_arr, beta.axes)
+        out, _ = chunk_gated_delta_rule(
+            qn,
+            kn,
+            vn,
+            gn,
+            bn,
+            chunk_size=chunk_size,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            use_flash=use_flash,
+        )
+        return jnp.sum(out.array)
+
+    grads8 = jax.grad(lambda qa, ka, va, ga, ba: loss_with_chunk(qa, ka, va, ga, ba, 8), argnums=(0, 1, 2, 3, 4))(
+        q.array, k.array, v.array, g.array, beta.array
+    )
+    grads32 = jax.grad(lambda qa, ka, va, ga, ba: loss_with_chunk(qa, ka, va, ga, ba, 32), argnums=(0, 1, 2, 3, 4))(
+        q.array, k.array, v.array, g.array, beta.array
+    )
+
+    for g8, g32 in zip(grads8, grads32):
+        np.testing.assert_allclose(np.array(g8), np.array(g32), rtol=3e-5, atol=3e-6)
 
 
 @pytest.mark.parametrize("use_flash", [True, False])
