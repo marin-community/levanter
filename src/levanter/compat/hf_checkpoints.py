@@ -43,7 +43,7 @@ from tqdm_loggable.auto import tqdm
 
 import haliax
 from haliax import Axis
-from haliax.partitioning import ResourceMapping
+from haliax.partitioning import ResourceMapping, round_axis_for_partitioning
 from haliax.state_dict import from_torch_compatible_state_dict, save_state_dict
 
 from levanter.callbacks import StepInfo
@@ -679,6 +679,12 @@ class HFCheckpointConverter(Generic[LevConfig]):
         # Vocab: first we have to resize the vocab as loaded from the checkpoint
         tokenizer_Vocab = self.Vocab
         Vocab = tokenizer_Vocab.resize(hf_config.vocab_size)
+        # Round Vocab axis for partitioning if axis_mapping is provided
+        if axis_mapping is not None:
+            original_vocab_size = Vocab.size
+            Vocab = round_axis_for_partitioning(Vocab, axis_mapping)
+            if Vocab.size != original_vocab_size:
+                logger.info(f"Rounding vocab size from {original_vocab_size} to {Vocab.size} for partitioning")
 
         # TODO: in an ideal world, we would only load the part of the array we needed, but
         # AFAICT neither torch state dicts nor safetensors support this.
@@ -703,10 +709,21 @@ class HFCheckpointConverter(Generic[LevConfig]):
 
             if Vocab.size != tokenizer_Vocab.size:
                 if resize_vocab_to_match_tokenizer:
+                    # Round tokenizer vocab size for partitioning if axis_mapping is provided
+                    target_vocab_size = tokenizer_Vocab.size
+                    if axis_mapping is not None:
+                        rounded_tokenizer_Vocab = round_axis_for_partitioning(
+                            Axis("vocab", target_vocab_size), axis_mapping
+                        )
+                        target_vocab_size = rounded_tokenizer_Vocab.size
+                        if target_vocab_size != tokenizer_Vocab.size:
+                            logger.info(
+                                f"Rounding tokenizer vocab size from {tokenizer_Vocab.size} to {target_vocab_size} for partitioning"
+                            )
                     logger.info(
-                        f"Resizing model from {Vocab.size} to {tokenizer_Vocab.size} to match tokenizer vocab size"
+                        f"Resizing model from {Vocab.size} to {target_vocab_size} to match tokenizer vocab size"
                     )
-                    lev_model = lev_model.resize_vocab(tokenizer_Vocab.size)
+                    lev_model = lev_model.resize_vocab(target_vocab_size)
                 else:
                     logger.warning(
                         f"Model vocab size ({Vocab.size}) does not match tokenizer vocab size ({tokenizer_Vocab.size})"
