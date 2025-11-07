@@ -1,5 +1,18 @@
 # Levanter
 
+> [!IMPORTANT]
+> **Levanter has been merged into [Marin](https://github.com/marin-community/marin)** as of November 2025.
+>
+> All active development now happens in the [Marin monorepo](https://github.com/marin-community/marin) at [`lib/levanter/`](https://github.com/marin-community/marin/tree/main/lib/levanter).
+>
+> - **Issues**: Please open new issues at [marin-community/marin](https://github.com/marin-community/marin/issues)
+> - **Pull Requests**: Submit new PRs to [marin-community/marin](https://github.com/marin-community/marin)
+> - **Installation**: `pip install levanter` still works
+>
+> See [marin#1773](https://github.com/marin-community/marin/issues/1773) and [marin#1723](https://github.com/marin-community/marin/pull/1723) for details on the merger.
+
+---
+
 <a href="https://github.com/stanford-crfm/levanter/actions?query=branch%3Amain++">
     <img alt="Build Status" src="https://img.shields.io/github/actions/workflow/status/stanford-crfm/levanter/run_tests.yaml?branch=main">
 </a>

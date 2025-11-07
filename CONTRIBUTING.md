@@ -1,6 +1,10 @@
 Contributing
 ============
 
+> **Note**: Levanter has been merged into the [Marin monorepo](https://github.com/marin-community/marin). Please submit new contributions to [marin-community/marin](https://github.com/marin-community/marin) at [`lib/levanter/`](https://github.com/marin-community/marin/tree/main/lib/levanter).
+
+---
+
 Levanter is a growing code base, and we are excited for other folks to get involved. The instructions below walk you through our dev setup and how to submit a PR.
 
 Dev Installation
