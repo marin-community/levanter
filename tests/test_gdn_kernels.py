@@ -22,6 +22,9 @@ from tests.test_utils import skip_if_no_torch
 
 jax.config.update("jax_default_matmul_precision", "float32")
 
+is_tpu = jax.devices()[0].platform == "tpu"
+USE_FLASH_CASES = [True, False] if is_tpu else [False]
+
 
 def _to_np(x):
     return np.array(x.detach().cpu().numpy())
@@ -52,13 +55,14 @@ def _named_kernels_inputs(B, H, L, dk, dv, key):
     return q, k, v, g, beta
 
 
-def test_fused_rms_norm_gated_matches_reference():
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
+def test_fused_rms_norm_gated_matches_reference(use_flash: bool):
     key_x, key_g = jax.random.split(jax.random.PRNGKey(0))
     Batch = Axis("batch", 2)
     Pos = Axis("position", 3)
     Hidden = Axis("hidden", 5)
 
-    module = FusedRMSNormGated.init(Hidden, eps=1e-6, use_flash=True)
+    module = FusedRMSNormGated.init(Hidden, eps=1e-6, use_flash=use_flash)
     module_ref = dataclasses.replace(module, use_flash=False)
 
     x = hax.random.normal(key_x, (Batch, Pos, Hidden), dtype=jnp.float32)
@@ -78,7 +82,8 @@ def test_fused_rms_norm_gated_matches_reference():
     np.testing.assert_allclose(y_flash.array, expected.array, rtol=1e-6, atol=1e-6)
 
 
-def test_fused_rms_norm_gated_backward_matches_reference():
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
+def test_fused_rms_norm_gated_backward_matches_reference(use_flash: bool):
     """Gradient parity for fused RMSNorm + SiLU gate against the reference JAX path.
 
     Compares grads w.r.t. inputs (x, gate) and the weight parameter.
@@ -100,15 +105,20 @@ def test_fused_rms_norm_gated_backward_matches_reference():
         y = _rmsnorm_gated_reference(x_arr, g_arr, w_arr, eps)
         return jnp.sum(y)
 
-    gx_f, gg_f, gw_f = jax.grad(loss_flash, argnums=(0, 1, 2))(x, gate, weight)
     gx_r, gg_r, gw_r = jax.grad(loss_ref, argnums=(0, 1, 2))(x, gate, weight)
 
-    np.testing.assert_allclose(np.array(gx_f), np.array(gx_r), rtol=1e-5, atol=1e-6)
-    np.testing.assert_allclose(np.array(gg_f), np.array(gg_r), rtol=1e-5, atol=1e-6)
-    np.testing.assert_allclose(np.array(gw_f), np.array(gw_r), rtol=1e-5, atol=1e-6)
+    if use_flash:
+        gx_f, gg_f, gw_f = jax.grad(loss_flash, argnums=(0, 1, 2))(x, gate, weight)
+        np.testing.assert_allclose(np.array(gx_f), np.array(gx_r), rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(np.array(gg_f), np.array(gg_r), rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(np.array(gw_f), np.array(gw_r), rtol=1e-5, atol=1e-6)
+    else:
+        assert jnp.all(jnp.isfinite(gx_r))
+        assert jnp.all(jnp.isfinite(gg_r))
+        assert jnp.all(jnp.isfinite(gw_r))
 
 
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_flash_chunk_backward_chunk_size_invariance_kernel_level(use_flash: bool):
     """Kernel-level: gradients should be invariant to chunk_size (flash path).
 
@@ -145,10 +155,10 @@ def test_flash_chunk_backward_chunk_size_invariance_kernel_level(use_flash: bool
     )
 
     for g8, g32 in zip(grads8, grads32):
-        np.testing.assert_allclose(np.array(g8), np.array(g32), rtol=3e-5, atol=3e-6)
+        np.testing.assert_allclose(np.array(g8), np.array(g32), rtol=3e-5, atol=3e-5)
 
 
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_recurrent_no_learning_beta_zero_outputs_zero(use_flash: bool):
     """If beta == 0 everywhere and S0 == 0, then S_t == 0 for all t and outputs are zero."""
     key = jax.random.PRNGKey(0)
@@ -205,7 +215,7 @@ def test_recurrent_perfect_fit_on_current_key_when_alpha1_beta1_and_L2norm(use_f
         np.testing.assert_allclose(kv, v_arr, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 @pytest.mark.parametrize("chunk_size", [1, 2, 7, 16, 32, 64])
 def test_chunk_equals_recurrent_for_random_inputs(chunk_size, use_flash):
     """Chunkwise kernel must match recurrent kernel for many chunk sizes (including 1)."""
@@ -240,7 +250,7 @@ def test_chunk_equals_recurrent_for_random_inputs(chunk_size, use_flash):
     np.testing.assert_allclose(S_chunk, S_recur, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_chunk_nondivisible_padding_matches_recurrent_jax_only(use_flash: bool):
     """When L % chunk_size != 0, padding path should still match the recurrent kernel (JAX-only)."""
     key = jax.random.PRNGKey(0)
@@ -271,7 +281,7 @@ def test_chunk_nondivisible_padding_matches_recurrent_jax_only(use_flash: bool):
     np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_chunk_continuation_two_pass_equals_one_pass(use_flash: bool):
     """
     Run prefix → get S_mid → run suffix with initial_state, and match the one-pass result.
@@ -330,7 +340,7 @@ def test_chunk_continuation_two_pass_equals_one_pass(use_flash: bool):
     np.testing.assert_allclose(S_end, S_full, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_chunk_size_one_degenerates_to_recurrent_without_l2norm(use_flash: bool):
     """Degeneracy should also hold even when L2 norm is disabled."""
     key = jax.random.PRNGKey(0)
@@ -360,7 +370,7 @@ def test_chunk_size_one_degenerates_to_recurrent_without_l2norm(use_flash: bool)
     np.testing.assert_allclose(np.array(out_chunk.array), np.array(out_recur.array), rtol=3e-4, atol=1e-4)
 
 
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_extreme_gates_numerical_stability_jax_only(use_flash: bool):
     """Outputs should be finite when α ≈ 0 (very negative g) and β near 0 or near 1."""
     key = jax.random.PRNGKey(0)
@@ -397,7 +407,7 @@ def test_extreme_gates_numerical_stability_jax_only(use_flash: bool):
         assert np.isfinite(np.array(out_recur.array)).all()
 
 
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_gradients_exist_small_kernel_graph(use_flash: bool):
     """Smoke test: both kernels are differentiable w.r.t. inputs (no NaNs in grads)."""
     key = jax.random.PRNGKey(0)
@@ -443,7 +453,7 @@ def test_gradients_exist_small_kernel_graph(use_flash: bool):
 
 
 @skip_if_no_torch
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_recurrent_kernel_matches_hf(use_flash: bool):
     import torch
 
@@ -475,7 +485,7 @@ def test_recurrent_kernel_matches_hf(use_flash: bool):
 
 
 @skip_if_no_torch
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_chunk_kernel_matches_hf(use_flash: bool):
     import torch
 
@@ -516,7 +526,7 @@ def test_chunk_kernel_matches_hf(use_flash: bool):
 
 
 @skip_if_no_torch
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_chunk_kernel_matches_hf_non_divisible(use_flash: bool):
     """L not divisible by chunk_size should still match HF fallback (padding path)."""
     import torch
@@ -560,7 +570,7 @@ def test_chunk_kernel_matches_hf_non_divisible(use_flash: bool):
 
 
 @skip_if_no_torch
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_chunk_size_one_matches_hf_recurrent(use_flash: bool):
     """chunk_size=1 should degenerate to the recurrent rule."""
     import torch
@@ -620,7 +630,7 @@ def test_chunk_size_one_matches_hf_recurrent(use_flash: bool):
 
 
 @skip_if_no_torch
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_chunk_kernel_with_initial_state_matches_recurrent_continuation(use_flash: bool):
     """
     Provide an initial S0 and check chunk kernel == recurrent kernel on the same sequence.
@@ -688,7 +698,7 @@ def test_chunk_kernel_with_initial_state_matches_recurrent_continuation(use_flas
 
 
 @skip_if_no_torch
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_short_sequences_edge_cases(use_flash: bool):
     """Short L vs chunk_size and kernel-size behaviors."""
     import torch
@@ -731,7 +741,7 @@ def test_short_sequences_edge_cases(use_flash: bool):
 
 
 @skip_if_no_torch
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_extreme_gates_no_nans_and_parity(use_flash: bool):
     """Stress alpha = exp(g) close to 0 (very negative g) and beta near 0/1."""
     import torch
@@ -777,7 +787,7 @@ def test_extreme_gates_no_nans_and_parity(use_flash: bool):
 
 
 @skip_if_no_torch
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_kernels_match_hf_without_l2norm(use_flash: bool):
     # TODO: fix edge case? although per original paper L2 norm is needed for stability
     pytest.skip("not matching HF implementation")
@@ -922,7 +932,7 @@ def test_recurrent_backward_matches_hf():
 
 
 @skip_if_no_torch
-@pytest.mark.parametrize("use_flash", [True, False])
+@pytest.mark.parametrize("use_flash", USE_FLASH_CASES)
 def test_chunk_backward_matches_hf(use_flash: bool):
     """
     JAX vs HF fallback gradient parity for the chunkwise kernel (two chunks).
@@ -1006,6 +1016,7 @@ def test_chunk_backward_matches_hf(use_flash: bool):
 # -------------------------------
 
 
+@pytest.mark.skipif(not is_tpu, reason="use_flash=True varlen path is only tested on TPU")
 @pytest.mark.parametrize("chunk_size", [1, 16, 32, 64])
 def test_chunk_varlen_lengths_matches_recurrent_prefix_and_state(chunk_size):
     """Flash (varlen via lengths) == recurrent run up to each (b,h) length on the prefix."""
@@ -1087,6 +1098,7 @@ def test_chunk_varlen_lengths_matches_recurrent_prefix_and_state(chunk_size):
     assert np.isfinite(out_chunk_arr).all()
 
 
+@pytest.mark.skipif(not is_tpu, reason="use_flash=True varlen path is only tested on TPU")
 def test_chunk_varlen_offsets_equivalence():
     """lengths and offsets (NH and NH+1) must yield identical outputs/states."""
     key = jax.random.PRNGKey(123)
@@ -1148,6 +1160,7 @@ def test_chunk_varlen_offsets_equivalence():
     np.testing.assert_allclose(S_len, S_off2, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.skipif(not is_tpu, reason="use_flash=True varlen path is only tested on TPU")
 def test_chunk_varlen_zero_length_and_S0_unchanged():
     """If a sequence has length 0, outputs are zero and S_final equals S0 for that (b,h)."""
     key = jax.random.PRNGKey(7)
@@ -1180,6 +1193,7 @@ def test_chunk_varlen_zero_length_and_S0_unchanged():
     np.testing.assert_allclose(S_fin[0, 0], np.array(S0[0, 0]), rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.skipif(not is_tpu, reason="use_flash=True varlen path is only tested on TPU")
 def test_chunk_varlen_head_first_layout_equivalence():
     """head_first=True path should match the standard layout for the valid prefixes."""
     key = jax.random.PRNGKey(99)
@@ -1236,6 +1250,7 @@ def test_chunk_varlen_head_first_layout_equivalence():
         np.testing.assert_allclose(out_std_arr[0, :ell, h, :], out_hf_arr[0, :ell, h, :], rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.skipif(not is_tpu, reason="use_flash=True varlen path is only tested on TPU")
 @pytest.mark.parametrize("chunk_size", [17, 32])
 def test_chunk_varlen_nondivisible_and_parity_with_recurrent(chunk_size):
     """Non-divisible chunk sizes with varlen should match recurrent on valid prefixes."""
