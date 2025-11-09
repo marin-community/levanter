@@ -1177,12 +1177,13 @@ def _recurrent_gated_delta_rule_flash(
     out_trim = out_pad[:, :, :V_]
     if output_final_state:
         final_trim = final_pad[:, :, :K_, :V_]  # [B,H,K,V]
+    final_ret = None if not output_final_state else final_trim.reshape(B_, H_, Dk.size, Dv.size)
 
     out_bhTv = out_trim.reshape(B_, H_, T_, V_)
     out_named = hax.named(out_bhTv, (Batch, Heads, Pos, Dv))
-    out_final_named = hax.rearrange(out_named, (Batch, Pos, Heads, Dv))
+    out_final_named = hax.rearrange(out_named, (Batch, Pos, Heads, Dv))  # [B,T,H,V]
 
-    final_ret = None if not output_final_state else final_trim.reshape(B_, H_, Dk.size, Dv.size)
+    final_ret = None if not output_final_state else final_pad[:, :, :K_, :V_].reshape(B_, H_, Dk.size, Dv.size)
     return out_final_named, final_ret
 
 
@@ -1492,24 +1493,28 @@ def _chunk_gated_delta_rule_reference(
 
 
 # =========================
-# TPU FLASH CHUNK KERNEL (Phase B)
+# Flash CHUNK: TPU path (forward only)
 # =========================
 
-
-# =========================
-# Flash CHUNK: TPU path
-# =========================
+# ---------- TPU HEAD_FIRST in/out specs ----------
 
 
-def _in_specs_chunk_head_first_tpu(B, H, T, K_pad, V_pad):
-    """HEAD_FIRST + full-window last-two dims for TPU:
-    q,k: [B,H,T,K_pad] with block (1,1,T,K_pad)
-    v:   [B,H,T,V_pad] with block (1,1,T,V_pad)
-    g_raw: [B,H,T,1]   with block (1,1,T,1)       (per‑step g)
-    g_cum: [B,H,T,1]   with block (1,1,T,1)       (global cumulative g)
-    beta:  [B,H,T,1]   with block (1,1,T,1)       (headwise β)
-    init/final: [B,H,K_pad,V_pad] with block (1,1,K_pad,V_pad)
-    out: NH-major [NH,T,V_pad] with block (1,T,V_pad)
+def _in_specs_chunk_head_first_tpu(B, H, T, K_pad, V_pad, is_beta_headwise: bool):
+    """HEAD_FIRST + full-window last-two dims for TPU.
+
+    Arrays and their block specs (TPU requires that the *last two* block dims are either
+    equal to the array dims or divisible by (8, 128) respectively; using full windows satisfies this):
+
+      q,k:     [B, H, T, K_pad]   block (1, 1, T, K_pad)
+      v:       [B, H, T, V_pad]   block (1, 1, T, V_pad)
+      g_raw:   [B, H, T, 1]       block (1, 1, T, 1)     (per-step g; α=exp(g))
+      g_cum:   [B, H, T, 1]       block (1, 1, T, 1)     (global cumulative g)
+      beta:    [B, H, T, 1] *or* [B, H, T, V_pad] (see is_beta_headwise)
+      initS:   [B, H, K_pad, V_pad]  block (1, 1, K_pad, V_pad)
+
+    Outputs:
+      out:     [NH, T, V_pad]     block (1, T, V_pad)  (NH = B * H)
+      finalS:  [B, H, K_pad, V_pad]  block (1, 1, K_pad, V_pad)
     """
 
     def _bh(nh):
@@ -1521,49 +1526,61 @@ def _in_specs_chunk_head_first_tpu(B, H, T, K_pad, V_pad):
         pl.BlockSpec((1, 1, T, K_pad), lambda nh: (*_bh(nh), 0, 0)),  # q
         pl.BlockSpec((1, 1, T, K_pad), lambda nh: (*_bh(nh), 0, 0)),  # k
         pl.BlockSpec((1, 1, T, V_pad), lambda nh: (*_bh(nh), 0, 0)),  # v
-        pl.BlockSpec((1, 1, T, 1), lambda nh: (*_bh(nh), 0, 0)),  # g_raw  (4D)
-        pl.BlockSpec((1, 1, T, 1), lambda nh: (*_bh(nh), 0, 0)),  # g_cum  (4D, global cumulative)
-        pl.BlockSpec((1, 1, T, 1), lambda nh: (*_bh(nh), 0, 0)),  # beta   (4D)
+        pl.BlockSpec((1, 1, T, 1), lambda nh: (*_bh(nh), 0, 0)),  # g_raw (4D)
+        pl.BlockSpec((1, 1, T, 1), lambda nh: (*_bh(nh), 0, 0)),  # g_cum (4D)
+        (
+            pl.BlockSpec((1, 1, T, 1), lambda nh: (*_bh(nh), 0, 0))  # beta headwise
+            if is_beta_headwise
+            else pl.BlockSpec((1, 1, T, V_pad), lambda nh: (*_bh(nh), 0, 0))  # beta per-V
+        ),
         pl.BlockSpec((1, 1, K_pad, V_pad), lambda nh: (*_bh(nh), 0, 0)),  # init S
     )
     out_specs = (
-        pl.BlockSpec((1, T, V_pad), lambda nh: (nh, 0, 0)),  # out [NH,T,V_pad]
+        pl.BlockSpec((1, T, V_pad), lambda nh: (nh, 0, 0)),  # out [NH, T, V_pad]
         pl.BlockSpec((1, 1, K_pad, V_pad), lambda nh: (*_bh(nh), 0, 0)),  # final S
     )
     return in_specs, out_specs
 
 
+# ---------- TPU chunk forward kernel (static slices; no dynamic ops) ----------
+
+
 def _gdn_chunk_fwd_kernel_tpu(
-    q_ref,  # [1,1,T,K_pad]
-    k_ref,  # [1,1,T,K_pad]
-    v_ref,  # [1,1,T,V_pad]
-    graw4_ref,  # [1,1,T,1]  raw g (per step)
-    gcum4_ref,  # [1,1,T,1]  global cumulative g
-    beta4_ref,  # [1,1,T,1]  (headwise β)
-    init_ref,  # [1,1,K_pad,V_pad]
-    out_ref,  # [1,T,V_pad] (NH-major)
-    final_ref,  # [1,1,K_pad,V_pad]
+    q_ref,
+    k_ref,
+    v_ref,
+    graw4_ref,
+    gcum4_ref,
+    beta_ref,
+    init_ref,
+    out_ref,
+    final_ref,
     *,
     T: int,
     K_pad: int,
     V_pad: int,
-    BT: int,  # chunk size
+    BT: int,
     use_qk_l2norm: bool,
     has_initial_state: bool,
-    scale: float,  # 1/sqrt(dk)
+    is_beta_headwise: bool,
+    scale: float,
 ):
-    """Chunkwise-parallel forward on TPU.
+    """Chunkwise-parallel forward on TPU (no aux buffers, backward rematerializes)."""
 
-    Uses HEAD_FIRST layout and full-window last-two dims.
-    Converts global cumulative g to chunk-local inside each chunk.
-    """
-    # ---- Full-window local views ----
-    q_view = q_ref[dslice(0, 1), dslice(0, 1), dslice(0, T), dslice(0, K_pad)][0, 0]  # (T,K_pad)
-    k_view = k_ref[dslice(0, 1), dslice(0, 1), dslice(0, T), dslice(0, K_pad)][0, 0]  # (T,K_pad)
-    v_view = v_ref[dslice(0, 1), dslice(0, 1), dslice(0, T), dslice(0, V_pad)][0, 0]  # (T,V_pad)
+    # Ensure the caller padded T to a multiple of BT (compile-time constant loop count).
+    assert T % BT == 0, f"T={T} must be divisible by BT={BT}."
+
+    # ---- Full-window local views (match TPU last-two-dim rule) ----
+    q_view = q_ref[dslice(0, 1), dslice(0, 1), dslice(0, T), dslice(0, K_pad)][0, 0]  # (T, K_pad)
+    k_view = k_ref[dslice(0, 1), dslice(0, 1), dslice(0, T), dslice(0, K_pad)][0, 0]  # (T, K_pad)
+    v_view = v_ref[dslice(0, 1), dslice(0, 1), dslice(0, T), dslice(0, V_pad)][0, 0]  # (T, V_pad)
     g_raw_all = graw4_ref[dslice(0, 1), dslice(0, 1), dslice(0, T), dslice(0, 1)][0, 0, :, 0]  # (T,)
     g_cum_all = gcum4_ref[dslice(0, 1), dslice(0, 1), dslice(0, T), dslice(0, 1)][0, 0, :, 0]  # (T,)
-    b_view = beta4_ref[dslice(0, 1), dslice(0, 1), dslice(0, T), dslice(0, 1)][0, 0, :, 0]  # (T,)
+
+    if is_beta_headwise:
+        beta_h_all = beta_ref[dslice(0, 1), dslice(0, 1), dslice(0, T), dslice(0, 1)][0, 0, :, 0]  # (T,)
+    else:
+        beta_v_all = beta_ref[dslice(0, 1), dslice(0, 1), dslice(0, T), dslice(0, V_pad)][0, 0]  # (T, V_pad)
 
     # Cross-chunk state S ∈ R^{K×V}
     S = (
@@ -1572,42 +1589,43 @@ def _gdn_chunk_fwd_kernel_tpu(
         else jnp.zeros((K_pad, V_pad), dtype=jnp.float32)
     )
 
-    # out_tile = jnp.zeros((T, V_pad), dtype=out_ref.dtype)
     scale32 = jnp.asarray(scale, dtype=jnp.float32)
 
-    # Static masks for BT×BT
+    # Precompute static (BT×BT) masks, with iotas as int32 (TPU verifier requirement)
     ar_i32 = jnp.arange(BT, dtype=jnp.int32)
     strict_upper_mask_BT = ar_i32[:, None] < ar_i32[None, :]  # (i < j)
     lower_mask_BT = (~strict_upper_mask_BT).astype(jnp.float32)  # (i >= j)
     diag_mask_BT = ar_i32[:, None] == ar_i32[None, :]
 
-    NT = T // BT  # T padded to multiple of BT
+    NT = T // BT
 
     for ci in range(NT):
         t0 = ci * BT
 
-        # Static chunk slices
-        q_c = q_view[t0 : t0 + BT, :].astype(jnp.float32)  # (BT,K_pad)
-        k_c = k_view[t0 : t0 + BT, :].astype(jnp.float32)  # (BT,K_pad)
-        v_c = v_view[t0 : t0 + BT, :].astype(jnp.float32)  # (BT,V_pad)
+        # Static chunk loads
+        q_c = q_view[t0 : t0 + BT, :].astype(jnp.float32)  # (BT, K_pad)
+        k_c = k_view[t0 : t0 + BT, :].astype(jnp.float32)  # (BT, K_pad)
+        v_c = v_view[t0 : t0 + BT, :].astype(jnp.float32)  # (BT, V_pad)
         g_raw = g_raw_all[t0 : t0 + BT].astype(jnp.float32)  # (BT,)
-        g_cumG = g_cum_all[t0 : t0 + BT].astype(jnp.float32)  # (BT,) global cumulative
-        b_c = b_view[t0 : t0 + BT].astype(jnp.float32)  # (BT,)
+        g_cumG = g_cum_all[t0 : t0 + BT].astype(jnp.float32)  # (BT,)
 
-        # Convert global cumulative to chunk-local cumulative:
-        #   g_cum_chunk[i] = sum_{p=0..i} g_raw[p]
-        # via offset subtraction (offset = cumulative before this chunk).
-        if ci == 0:
-            g_cum = g_cumG  # already starts at 0
+        if is_beta_headwise:
+            b_head = beta_h_all[t0 : t0 + BT].astype(jnp.float32)  # (BT,)
         else:
-            offset = g_cum_all[t0 - 1].astype(jnp.float32)  # scalar, compile-time index
+            b_val = beta_v_all[t0 : t0 + BT, :].astype(jnp.float32)  # (BT, V_pad)
+
+        # Chunk-local cumulative g
+        if ci == 0:
+            g_cum = g_cumG
+        else:
+            offset = g_cum_all[t0 - 1].astype(jnp.float32)
             g_cum = g_cumG - offset
 
-        # Chunk tail sum (sum of g within this chunk), not global
-        g_tail = jnp.sum(g_raw)  # scalar
-        decay_tail = jnp.exp(g_tail)  # scalar
+        # Tail decay for S update
+        g_tail = jnp.sum(g_raw)
+        decay_tail = jnp.exp(g_tail)
 
-        # Optional L2 normalization and q scaling
+        # L2-norm + scale
         if use_qk_l2norm:
             qn = jnp.sqrt(jnp.sum(q_c * q_c, axis=1, keepdims=True) + 1e-6)
             kn = jnp.sqrt(jnp.sum(k_c * k_c, axis=1, keepdims=True) + 1e-6)
@@ -1615,61 +1633,61 @@ def _gdn_chunk_fwd_kernel_tpu(
             k_c = k_c / jnp.where(kn > 0.0, kn, 1.0)
         q_c = q_c * scale32
 
-        # β-weighted streams (headwise β)
-        v_beta = v_c * b_c[:, None]  # (BT,V_pad)
-        k_beta = k_c * b_c[:, None]  # (BT,K_pad)
+        # β streams
+        if is_beta_headwise:
+            v_beta = v_c * b_head[:, None]  # (BT,V_pad)
+            k_beta = k_c * b_head[:, None]  # (BT,K_pad)
+        else:
+            v_beta = v_c * b_val  # (BT,V_pad)
+            k_beta = k_c  # (BT,K_pad)
 
         # A_raw = -(βK) @ K^T
         A_raw = -jnp.matmul(k_beta, k_c.T)  # (BT,BT)
 
-        # Relative decays in-chunk using chunk-local cumulative
-        gi = g_cum[:, None]  # (BT,1)
-        gj = g_cum[None, :]  # (1,BT)
-        decay = jnp.exp((gi - gj) * lower_mask_BT)  # (BT,BT) lower incl diag
+        gi = g_cum[:, None]
+        gj = g_cum[None, :]
+        decay = jnp.exp((gi - gj) * lower_mask_BT)  # (BT,BT)
 
-        # Strictly lower-triangular A
         A = A_raw * decay
         A = jnp.where(strict_upper_mask_BT, 0.0, A)
         A = jnp.where(diag_mask_BT, 0.0, A)
 
-        # ---- Forward substitution: Tm = (I - A)^(-1) ----
+        # Forward substitution for Tm = (I - A)^-1
         T_low = A
         idxs_i32 = jnp.arange(BT, dtype=jnp.int32)
         for i in range(1, BT):
-            row_i_mask = (idxs_i32 == jnp.int32(i)).astype(T_low.dtype)[:, None]  # (BT,1)
+            row_sel = (idxs_i32 == jnp.int32(i)).astype(T_low.dtype)[:, None]  # (BT,1)
             before_i = (idxs_i32 < jnp.int32(i)).astype(T_low.dtype)  # (BT,)
             m2 = before_i[:, None] * before_i[None, :]  # (BT,BT)
 
-            old_row = jnp.sum(T_low * row_i_mask, axis=0)  # (BT,)
+            old_row = jnp.sum(T_low * row_sel, axis=0)  # (BT,)
             pref = old_row * before_i  # (BT,)
             sub_pref = T_low * m2  # (BT,BT)
             incr = jnp.matmul(pref[None, :], sub_pref)[0]  # (BT,)
 
             new_row = old_row + incr
-            T_low = T_low + row_i_mask * (new_row - old_row)[None, :]
+            T_low = T_low + row_sel * (new_row - old_row)[None, :]
 
-        Tm = T_low + jnp.eye(BT, dtype=T_low.dtype)  # lower-triangular with ones on diag
+        Tm = T_low + jnp.eye(BT, dtype=T_low.dtype)
 
-        # Pseudo values & decayed key summaries (chunk-local)
+        # Pseudo streams
         v_pseudo = jnp.matmul(Tm, v_beta)  # (BT,V_pad)
-        k_cumdecay = jnp.matmul(Tm, k_beta * jnp.exp(g_cum)[:, None])  # (BT,K_pad)
+        k_for_decay = k_beta if is_beta_headwise else k_c
+        k_cumdecay = jnp.matmul(Tm, k_for_decay * jnp.exp(g_cum)[:, None])  # (BT,K_pad)
 
-        # Predict from previous cross-chunk state; then innovation
+        # Innovation
         v_prime = jnp.matmul(k_cumdecay, S)  # (BT,V_pad)
         v_new = v_pseudo - v_prime
 
-        # In-chunk attention-like lower-triangular mixing (chunk-local decays)
+        # Output = inter + lower-triangular mix
         attn = jnp.matmul(q_c, k_c.T) * jnp.exp((gi - gj) * lower_mask_BT)
         attn = jnp.where(strict_upper_mask_BT, 0.0, attn)
+        inter = jnp.matmul(q_c * jnp.exp(g_cum)[:, None], S)
+        out_i = inter + jnp.matmul(attn, v_new)
 
-        # Inter‑chunk term from S (decayed up to position i within the chunk)
-        inter = jnp.matmul(q_c * jnp.exp(g_cum)[:, None], S)  # (BT,V_pad)
-
-        # Outputs for this chunk
-        out_i = inter + jnp.matmul(attn, v_new)  # (BT,V_pad)
         out_ref[dslice(0, 1), dslice(t0, BT), dslice(0, V_pad)] = out_i[None, :, :].astype(out_ref.dtype)
 
-        # Cross‑chunk S update with chunk‑local tail decay
+        # Cross-chunk S update
         weights = jnp.exp(g_tail - g_cum)  # (BT,)
         add = jnp.matmul((k_c * weights[:, None]).T, v_new)  # (K_pad,V_pad)
         S = S * decay_tail + add
@@ -1677,6 +1695,9 @@ def _gdn_chunk_fwd_kernel_tpu(
     final_ref[dslice(0, 1), dslice(0, 1), dslice(0, K_pad), dslice(0, V_pad)] = S[None, None, :, :].astype(
         final_ref.dtype
     )
+
+
+# ---------- Public entry (forward flash chunk) ----------
 
 
 def _chunk_gated_delta_rule_flash(
@@ -1695,7 +1716,7 @@ def _chunk_gated_delta_rule_flash(
     use_varlen: bool = False,
     lengths: Optional[jnp.ndarray] = None,
 ):
-    # ---- axes & shapes ----
+    # ---- axes & sizes ----
     Batch = query.resolve_axis("batch")
     Pos = query.resolve_axis("position")
     Heads = query.resolve_axis("heads")
@@ -1713,20 +1734,35 @@ def _chunk_gated_delta_rule_flash(
         have = tuple(ax.name for ax in x_named.axes)
         return x_named.array if have == layout else hax.rearrange(x_named, layout).array
 
+    # ---- Layouts (TPU: enforce HEAD_FIRST) ----
     if use_head_first:
         q_arr = _ensure_layout(query.astype(jnp.float32), (Batch.name, Heads.name, Pos.name, Dk.name))
         k_arr = _ensure_layout(key.astype(jnp.float32), (Batch.name, Heads.name, Pos.name, Dk.name))
         v_arr = _ensure_layout(value.astype(jnp.float32), (Batch.name, Heads.name, Pos.name, Dv.name))
         g_arr = _ensure_layout(g.astype(jnp.float32), (Batch.name, Heads.name, Pos.name))  # raw g
-        beta_arr = _ensure_layout(beta.astype(jnp.float32), (Batch.name, Heads.name, Pos.name))
+        beta_axis_names = tuple(ax.name for ax in beta.axes)
+        is_beta_headwise = Dv.name not in beta_axis_names
+        if is_beta_headwise:
+            beta_arr = _ensure_layout(beta.astype(jnp.float32), (Batch.name, Heads.name, Pos.name))  # [B,H,T]
+        else:
+            beta_arr = _ensure_layout(
+                beta.astype(jnp.float32), (Batch.name, Heads.name, Pos.name, Dv.name)
+            )  # [B,H,T,V]
     else:
         q_arr = _ensure_layout(query.astype(jnp.float32), (Batch.name, Pos.name, Heads.name, Dk.name))
         k_arr = _ensure_layout(key.astype(jnp.float32), (Batch.name, Pos.name, Heads.name, Dk.name))
         v_arr = _ensure_layout(value.astype(jnp.float32), (Batch.name, Pos.name, Heads.name, Dv.name))
         g_arr = _ensure_layout(g.astype(jnp.float32), (Batch.name, Pos.name, Heads.name))
-        beta_arr = _ensure_layout(beta.astype(jnp.float32), (Batch.name, Pos.name, Heads.name))
+        beta_axis_names = tuple(ax.name for ax in beta.axes)
+        is_beta_headwise = Dv.name not in beta_axis_names
+        if is_beta_headwise:
+            beta_arr = _ensure_layout(beta.astype(jnp.float32), (Batch.name, Pos.name, Heads.name))  # [B,T,H]
+        else:
+            beta_arr = _ensure_layout(
+                beta.astype(jnp.float32), (Batch.name, Pos.name, Heads.name, Dv.name)
+            )  # [B,T,H,V]
 
-    # ---- initial S ----
+    # ---- Initial state S ----
     if initial_state is None:
         init_arr = jnp.zeros((B_, H_, K_, V_), dtype=jnp.float32)
         has_initial = False
@@ -1743,7 +1779,7 @@ def _chunk_gated_delta_rule_flash(
             ).array
         has_initial = True
 
-    # ---- pad T and last dims to tiles ----
+    # ---- Pad T to chunk size; pad K/V to tile sizes ----
     BT = int(chunk_size)
     pad_T = (BT - (T_ % BT)) % BT
     if use_head_first:
@@ -1752,14 +1788,20 @@ def _chunk_gated_delta_rule_flash(
             k_arr = jnp.pad(k_arr, ((0, 0), (0, 0), (0, pad_T), (0, 0)))
             v_arr = jnp.pad(v_arr, ((0, 0), (0, 0), (0, pad_T), (0, 0)))
             g_arr = jnp.pad(g_arr, ((0, 0), (0, 0), (0, pad_T)))
-            beta_arr = jnp.pad(beta_arr, ((0, 0), (0, 0), (0, pad_T)))
+            if is_beta_headwise:
+                beta_arr = jnp.pad(beta_arr, ((0, 0), (0, 0), (0, pad_T)))
+            else:
+                beta_arr = jnp.pad(beta_arr, ((0, 0), (0, 0), (0, pad_T), (0, 0)))
     else:
         if pad_T > 0:
             q_arr = jnp.pad(q_arr, ((0, 0), (0, pad_T), (0, 0), (0, 0)))
             k_arr = jnp.pad(k_arr, ((0, 0), (0, pad_T), (0, 0), (0, 0)))
             v_arr = jnp.pad(v_arr, ((0, 0), (0, pad_T), (0, 0), (0, 0)))
             g_arr = jnp.pad(g_arr, ((0, 0), (0, pad_T), (0, 0)))
-            beta_arr = jnp.pad(beta_arr, ((0, 0), (0, pad_T), (0, 0)))
+            if is_beta_headwise:
+                beta_arr = jnp.pad(beta_arr, ((0, 0), (0, pad_T), (0, 0)))
+            else:
+                beta_arr = jnp.pad(beta_arr, ((0, 0), (0, pad_T), (0, 0), (0, 0)))
 
     Tp = T_ + pad_T
 
@@ -1777,6 +1819,7 @@ def _chunk_gated_delta_rule_flash(
         ps[-1] = (0, pad)
         return jnp.pad(arr, tuple(ps))
 
+    # Pad last dims of q/k/v/S; construct 4D views for g and beta
     if use_head_first:
         q_pad = _pad_last_axis(q_arr, K_pad)
         k_pad = _pad_last_axis(k_arr, K_pad)
@@ -1788,48 +1831,84 @@ def _chunk_gated_delta_rule_flash(
             pad_S_V = max(0, V_pad - init_kpad.shape[-1])
             init_kpad = jnp.pad(init_kpad, ((0, 0), (0, 0), (0, pad_S_K), (0, pad_S_V)))
 
-        # Precompute global cumulative on host, and expand to 4D
-        g_cum = jnp.cumsum(g_arr, axis=2)  # [B,H,Tp]
         g4_raw = g_arr[..., None]  # [B,H,Tp,1]
-        g4_cum = g_cum[..., None]  # [B,H,Tp,1]
-        b4 = beta_arr[..., None]  # [B,H,Tp,1]
+        g4_cum = jnp.cumsum(g_arr, axis=2, dtype=jnp.float32)[..., None]  # [B,H,Tp,1]
+        beta4 = (
+            beta_arr[..., None] if is_beta_headwise else _pad_last_axis(beta_arr, V_pad)
+        )  # [B,H,Tp,1] or [B,H,Tp,V_pad]
     else:
-        # (TPU path does not use this, included for completeness)
+        # Not used on TPU; included for completeness
         q_pad = _pad_last_axis(q_arr, K_pad)
         k_pad = _pad_last_axis(k_arr, K_pad)
         v_pad = _pad_last_axis(v_arr, V_pad)
+
         init_kpad = init_arr
         if init_kpad.shape[-2] != K_pad or init_kpad.shape[-1] != V_pad:
             pad_S_K = max(0, K_pad - init_kpad.shape[-2])
             pad_S_V = max(0, V_pad - init_kpad.shape[-1])
             init_kpad = jnp.pad(init_kpad, ((0, 0), (0, 0), (0, pad_S_K), (0, pad_S_V)))
-        g_cum = jnp.cumsum(g_arr, axis=1)
-        g4_raw = g_arr[..., None]
-        g4_cum = g_cum[..., None]
-        b4 = beta_arr[..., None]
 
-    # Optional varlen masking (ahead of the kernel)
-    if is_tpu and lengths is not None:
-        lf = lengths.astype(jnp.int32)
-        if lf.ndim == 2 and lf.shape == (B_, H_):
-            lf = lf.reshape(NH)
+        g4_raw = g_arr[..., None]
+        g4_cum = jnp.cumsum(g_arr, axis=1, dtype=jnp.float32)[..., None]
+        beta4 = beta_arr[..., None] if is_beta_headwise else _pad_last_axis(beta_arr, V_pad)
+
+    # ---------- Variable-length handling (lengths or offsets) ----------
+    if is_tpu and use_varlen and (lengths is not None or offsets is not None):
+        if lengths is not None:
+            lf = lengths.astype(jnp.int32)
+            if lf.ndim == 2 and lf.shape == (B_, H_):
+                lf = lf.reshape(NH)
+            elif lf.ndim == 1 and lf.shape == (NH,):
+                pass
+            else:
+                raise ValueError(f"lengths must be shape (B,H) or (NH,), got {tuple(lf.shape)}")
+        elif offsets is not None:
+            off = jnp.asarray(offsets, dtype=jnp.int32)
+            if off.ndim != 1:
+                raise ValueError(f"offsets must be 1-D, got {tuple(off.shape)}")
+            if off.shape[0] == NH + 1:
+                lf = off[1:] - off[:-1]
+            elif off.shape[0] == NH:
+                lf = off
+            else:
+                raise ValueError(f"offsets must be shape (NH,) or (NH+1,), got {tuple(off.shape)}")
+        else:
+            raise AssertionError("use_varlen=True but neither lengths nor offsets were provided.")
+
+        lf = jnp.clip(lf, 0, Tp)
         t_idx = jnp.arange(Tp, dtype=lf.dtype)[None, :]
-        mask_nh_t = (t_idx < lf[:, None]).astype(v_pad.dtype)  # [NH,Tp]
+        mask_nh_t = (t_idx < lf[:, None]).astype(v_pad.dtype)
         mask_bht1 = mask_nh_t.reshape(B_, H_, Tp, 1)
 
-        q_pad = q_pad * mask_bht1
-        k_pad = k_pad * mask_bht1
-        v_pad = v_pad * mask_bht1
+        q_pad *= mask_bht1
+        k_pad *= mask_bht1
+        v_pad *= mask_bht1
+        beta4 = beta4 * mask_bht1
         g4_raw = g4_raw * mask_bht1
-        g4_cum = g4_cum * mask_bht1  # safe: zeros beyond length
-        b4 = b4 * mask_bht1
+        g4_cum = jnp.cumsum(jnp.squeeze(g4_raw, -1), axis=2, dtype=jnp.float32)[..., None]
 
-    # ---- Pallas shapes & call ----
+    # ---- Pallas call (TPU) or pure-JAX fallback ----
     out_struct = jax.ShapeDtypeStruct((NH, Tp, V_pad), value.dtype)
     final_struct = jax.ShapeDtypeStruct((B_, H_, K_pad, V_pad), jnp.float32)
 
+    if not is_tpu:
+        # Non-TPU: use pure-JAX reference. It requires headwise beta.
+        if not is_beta_headwise:
+            raise NotImplementedError("Per-V beta is not supported by the pure-JAX reference fallback on non-TPU.")
+        return _chunk_gated_delta_rule_reference(
+            hax.named(q_arr, (Batch, Heads, Pos, Dk)),
+            hax.named(k_arr, (Batch, Heads, Pos, Dk)),
+            hax.named(v_arr, (Batch, Heads, Pos, Dv)),
+            hax.named(g_arr, (Batch, Heads, Pos)),
+            hax.named(beta_arr, (Batch, Heads, Pos)),
+            chunk_size=BT,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+
     grid = (NH,)
-    in_specs_tpu, out_specs_tpu = _in_specs_chunk_head_first_tpu(B_, H_, Tp, K_pad, V_pad)
+    in_specs_tpu, out_specs_tpu = _in_specs_chunk_head_first_tpu(B_, H_, Tp, K_pad, V_pad, is_beta_headwise)
     kernel_tpu = functools.partial(
         _gdn_chunk_fwd_kernel_tpu,
         T=Tp,
@@ -1838,6 +1917,7 @@ def _chunk_gated_delta_rule_flash(
         BT=int(BT),
         use_qk_l2norm=use_qk_l2norm_in_kernel,
         has_initial_state=has_initial,
+        is_beta_headwise=is_beta_headwise,
         scale=Dk.size**-0.5,
     )
     out_pad, final_pad = pl.pallas_call(
@@ -1847,25 +1927,178 @@ def _chunk_gated_delta_rule_flash(
         in_specs=in_specs_tpu,
         out_specs=out_specs_tpu,
         interpret=_should_interpret_pallas(),
-    )(
-        q_pad,
-        k_pad,
-        v_pad,
-        g4_raw,  # NEW: raw g
-        g4_cum,  # NEW: global cumulative g
-        b4,
-        init_kpad,
-    )
+    )(q_pad, k_pad, v_pad, g4_raw, g4_cum, beta4, init_kpad)
 
     # Trim and wrap
     out_trim = out_pad[:, :T_, :V_]
-    if output_final_state:
-        final_trim = final_pad[:, :, :K_, :V_]
+    final_ret = final_pad[:, :, :K_, :V_].reshape(B_, H_, Dk.size, Dv.size) if output_final_state else None
     out_bhTv = out_trim.reshape(B_, H_, T_, V_)
     out_named = hax.named(out_bhTv, (Batch, Heads, Pos, Dv))
     out_final_named = hax.rearrange(out_named, (Batch, Pos, Heads, Dv))
-    final_ret = None if not output_final_state else final_trim.reshape(B_, H_, Dk.size, Dv.size)
     return out_final_named, final_ret
+
+
+# =========================
+# Stage 2 — Rematerialized backward for TPU flash chunk
+# =========================
+
+
+def _make_flash_chunk_with_vjp(
+    *,
+    chunk_size: int,
+    use_qk_l2norm_in_kernel: bool,
+    head_first: bool,
+    offsets: Optional[jnp.ndarray],
+    lengths: Optional[jnp.ndarray],
+    use_varlen: bool,
+    output_final_state: bool,
+):
+    """Returns a function f(q,k,v,g,beta,S0) with a custom VJP.
+    Forward uses the TPU flash chunk kernel (Pallas); backward rematerializes
+    via the JAX reference chunk implementation to compute all grads.
+    """
+
+    @jax.custom_vjp
+    def _flash_chunk_call(
+        query: NamedArray,
+        key: NamedArray,
+        value: NamedArray,
+        g: NamedArray,
+        beta: NamedArray,
+        initial_state: Optional[jnp.ndarray],
+    ) -> Tuple[NamedArray, Optional[jnp.ndarray]]:
+        # Forward pass: call the existing flash path (Stage 1)
+        return _chunk_gated_delta_rule_flash(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            chunk_size=chunk_size,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            head_first=head_first,
+            offsets=offsets,
+            use_varlen=use_varlen,
+            lengths=lengths,
+        )
+
+    def _fwd(
+        query: NamedArray,
+        key: NamedArray,
+        value: NamedArray,
+        g: NamedArray,
+        beta: NamedArray,
+        initial_state: Optional[jnp.ndarray],
+    ):
+        out_named, final_state = _chunk_gated_delta_rule_flash(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            chunk_size=chunk_size,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            head_first=head_first,
+            offsets=offsets,
+            use_varlen=use_varlen,
+            lengths=lengths,
+        )
+        # Residuals: only primals (no large activations saved).
+        res = (query, key, value, g, beta, initial_state)
+        return (out_named, final_state), res
+
+    def _bwd(res, *cts):
+        """
+        Rematerialized backward:
+        grads := grad_{q,k,v,g,beta,S0} ( <out_ref, dOut> + <final_ref, dFinal> )
+        Accepts cotangents as:
+        - (d_out,)                           when only 'out' was used
+        - (d_out, d_final)                   when both were used
+        - ((d_out, d_final),)                when packed as a single tuple
+        """
+        qN, kN, vN, gN, bN, S0 = res
+
+        # ---- Unpack cotangents robustly ----
+        d_out_named = None
+        d_final_state = None
+
+        if len(cts) == 1:
+            only = cts[0]
+            if isinstance(only, tuple) or isinstance(only, list):
+                if len(only) == 2:
+                    d_out_named, d_final_state = only
+                elif len(only) == 1:
+                    d_out_named = only[0]
+                else:
+                    raise ValueError(f"Unexpected cotangent tuple length: {len(only)}")
+            else:
+                d_out_named = only
+        elif len(cts) == 2:
+            d_out_named, d_final_state = cts
+        else:
+            raise ValueError(f"custom_vjp bwd received unexpected #cotangents: {len(cts)}")
+
+        use_dht = bool(d_final_state is not None)
+
+        # ---- Build scalar loss via the reference forward and differentiate it ----
+        def _loss_fn(q_arr, k_arr, v_arr, g_arr, b_arr, S0_arr):
+            q_named = hax.named(q_arr, qN.axes)
+            k_named = hax.named(k_arr, kN.axes)
+            v_named = hax.named(v_arr, vN.axes)
+            g_named = hax.named(g_arr, gN.axes)
+            b_named = hax.named(b_arr, bN.axes)
+
+            # Always compute final_state in reference bwd; zero its cot if unused
+            out_ref, fin_ref = _chunk_gated_delta_rule_reference(
+                q_named,
+                k_named,
+                v_named,
+                g_named,
+                b_named,
+                chunk_size=chunk_size,
+                initial_state=S0_arr,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+
+            loss = jnp.sum(out_ref.array * d_out_named.array)
+            if use_dht:
+                loss = loss + jnp.sum(fin_ref * d_final_state)
+            return loss
+
+        # If S0 was None at fwd, substitute zeros here and return None grad later
+        if S0 is None:
+            B = qN.resolve_axis("batch").size
+            H = qN.resolve_axis("heads").size
+            K = qN.resolve_axis("k_head_dim").size
+            V = vN.resolve_axis("v_head_dim").size
+            S0_for_grad = jnp.zeros((B, H, K, V), dtype=vN.array.dtype)
+            need_S0_grad = False
+        else:
+            S0_for_grad = S0
+            need_S0_grad = True
+
+        gqs, gks, gvs, ggs, gbs, gS0 = jax.grad(_loss_fn, argnums=(0, 1, 2, 3, 4, 5))(
+            qN.array, kN.array, vN.array, gN.array, bN.array, S0_for_grad
+        )
+
+        # Wrap grads back into NamedArrays
+        dq = hax.named(gqs, qN.axes)
+        dk = hax.named(gks, kN.axes)
+        dv = hax.named(gvs, vN.axes)
+        dg = hax.named(ggs, gN.axes)
+        db = hax.named(gbs, bN.axes)
+        dS0 = gS0 if need_S0_grad else None
+
+        # Return exactly one grad per primal input: (q, k, v, g, beta, initial_state)
+        return (dq, dk, dv, dg, db, dS0)
+
+    _flash_chunk_call.defvjp(_fwd, _bwd)
+    return _flash_chunk_call
 
 
 def chunk_gated_delta_rule(
@@ -1885,27 +2118,43 @@ def chunk_gated_delta_rule(
     use_varlen: bool = False,
     lengths: Optional[jnp.ndarray] = None,
 ) -> tuple[NamedArray, Optional[jnp.ndarray]]:
+    """Top-level API: picks flash path and registers custom VJP on TPU."""
     if use_flash:
-        try:
-            return _chunk_gated_delta_rule_flash(
-                query,
-                key,
-                value,
-                g,
-                beta,
+        is_tpu = jax.devices()[0].platform == "tpu"
+        # Force HEAD_FIRST on TPU to satisfy block-shape rules (Stage 1 behavior).
+        use_hf = True if is_tpu else head_first
+
+        # Use rematerialized backward on TPU; on non-TPU keep flash forward without custom VJP.
+        if is_tpu:
+            flash_with_vjp = _make_flash_chunk_with_vjp(
                 chunk_size=chunk_size,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                head_first=head_first,
+                head_first=use_hf,
                 offsets=offsets,
-                use_varlen=use_varlen,
                 lengths=lengths,
+                use_varlen=use_varlen,
+                output_final_state=output_final_state,
             )
-        except Exception:
-            if use_flash:
-                raise
-    # reference fallback
+            return flash_with_vjp(query, key, value, g, beta, initial_state)
+
+        # Non-TPU: existing flash path (no custom VJP needed here).
+        return _chunk_gated_delta_rule_flash(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            chunk_size=chunk_size,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            head_first=use_hf,
+            offsets=offsets,
+            use_varlen=use_varlen,
+            lengths=lengths,
+        )
+
+    # Reference fallback
     return _chunk_gated_delta_rule_reference(
         query,
         key,
