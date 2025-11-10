@@ -1,0 +1,27 @@
+name: Run torch tests
+
+on: [push, pull_request]
+
+jobs:
+  torch_tests:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.7.20"
+          python-version: "3.11"
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install
+      - name: Install dependencies
+        run: uv sync --dev
+      - name: Install PyTorch CPU wheels
+        run: uv pip install --index-url https://download.pytorch.org/whl/cpu torch
+      - name: Run PyTorch-marked tests
+        run: |
+          PYTHONPATH=tests:src:. uv run pytest tests -m "torch and not entry and not slow and not ray" --durations=20
