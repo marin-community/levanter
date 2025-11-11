@@ -1,6 +1,7 @@
 # Copyright 2025 The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import tempfile
 from typing import Any, Dict, Iterator, List, Sequence
 
@@ -42,6 +43,21 @@ class SimpleShardSource(ShardedDataSource[List[int]]):
         # parse the shard name to get the shard number
         shard_num = int(shard_name.split("_")[1])
         return ([shard_num * 10 + i] * 10 for i in range(row, 10))
+
+
+def test_tree_store_resolves_relative_cache_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    exemplar = {"data": np.array([0], dtype=np.int64)}
+    relative_path = "cache_dir"
+
+    store = TreeStore.open(exemplar, relative_path, mode="w")
+
+    expected_path = os.path.abspath(relative_path)
+    assert store.path == expected_path
+    assert os.path.isabs(store.path)
+
+    reloaded = store.reload()
+    assert reloaded.path == expected_path
 
 
 def test_tree_builder_with_processor():

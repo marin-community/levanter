@@ -3,6 +3,7 @@
 
 import asyncio
 import os
+import urllib.parse
 from typing import Generic, List, Sequence, TypeVar
 
 import jax
@@ -48,7 +49,7 @@ class TreeStore(Generic[T]):
     tree: PyTree[JaggedArrayStore]
 
     def __init__(self, tree, path: str, mode: str):
-        self.path = path
+        self.path = _normalize_cache_dir(path)
         self.mode = mode
         self.tree = tree
 
@@ -61,8 +62,9 @@ class TreeStore(Generic[T]):
         """
         Open a TreeStoreBuilder from a file.
         """
-        tree = _construct_builder_tree(exemplar, path, mode, cache_metadata)
-        return TreeStore(tree, path, mode)
+        resolved_path = _normalize_cache_dir(path)
+        tree = _construct_builder_tree(exemplar, resolved_path, mode, cache_metadata)
+        return TreeStore(tree, resolved_path, mode)
 
     def append(self, ex: T):
         return self.extend([ex])
@@ -177,6 +179,31 @@ class TreeStore(Generic[T]):
 
     async def async_len(self) -> int:
         return await jax.tree.leaves(self.tree)[0].num_rows_async()
+
+
+def _normalize_cache_dir(path: os.PathLike[str] | str) -> str:
+    """Resolve relative file paths to absolute paths while leaving URLs untouched."""
+
+    path_str = os.fspath(path)
+
+    if _is_probably_url(path_str):
+        return path_str
+
+    expanded = os.path.expanduser(path_str)
+    return os.path.abspath(expanded)
+
+
+def _is_probably_url(path: str) -> bool:
+    parsed = urllib.parse.urlparse(path)
+
+    if parsed.scheme in ("", "file"):
+        return False
+
+    # Handle Windows drive letters like "C:\\" which urllib parses as a scheme.
+    if len(parsed.scheme) == 1 and path[1:2] == ":":
+        return False
+
+    return True
 
 
 def _construct_builder_tree(exemplar, path, mode, cache_metadata):
