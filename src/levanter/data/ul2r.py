@@ -286,9 +286,9 @@ def random_spans_noise_mask(
 @functools.partial(jax.jit, static_argnames=["force_initial_sentinel"])
 def noise_span_to_unique_sentinel(
     tokens: jnp.ndarray,
+    length: int,
     noise_mask: jnp.ndarray,
     sentinel_tokens: jnp.ndarray,
-    length: int,
     force_initial_sentinel: bool,
 ) -> jnp.ndarray:
     """
@@ -369,6 +369,7 @@ def to_ul2r_rx_tokens(
     mask_prob: float,
     mean_noise_span_length: float,
     random_roll: bool,
+    pad_token_id: int,
     sentinel_token_ids: jnp.ndarray,
     max_length: int,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -384,8 +385,8 @@ def to_ul2r_rx_tokens(
         - The length of `inputs` (before `targets`).
           For use when generating the loss mask / PrefixLM attention mask.
         - A tensor with the same shape as `tokens` containing
-          `inputs targets 0...` where `inputs targets` is truncated to
-          fit `max_length`. There is no leading padding.
+          `inputs targets 0...` where `inputs targets` is truncated to fit `max_length`.
+          There is no leading padding.
     """
 
     padded_length = tokens.shape[0]
@@ -407,16 +408,16 @@ def to_ul2r_rx_tokens(
 
     inputs = noise_span_to_unique_sentinel(
         tokens,
+        length,
         noise_mask,
         sentinel_token_ids,
-        length,
         force_initial_sentinel=False,
     )
     targets = noise_span_to_unique_sentinel(
         tokens,
+        target_in_len,
         ~noise_mask,
         sentinel_token_ids,
-        target_in_len,
         force_initial_sentinel=True,
     )
 
@@ -440,7 +441,7 @@ def to_ul2r_rx_tokens(
     trunc_target_len = jnp.maximum(target_len - drop_targets, 0)
 
     # Truncate `targets` to the new length; `inputs` are gated by `new_input_len` below
-    targets = jnp.where(indices < trunc_target_len, targets, 0)
+    targets = jnp.where(indices < trunc_target_len, targets, pad_token_id)
     targets = typing.cast(jnp.ndarray, targets)
 
     targets = jnp.roll(targets, trunc_input_len)
@@ -512,6 +513,7 @@ def to_ul2r_tokens(
     task_params: jnp.ndarray,
     tokens: jnp.ndarray,
     length: int,
+    pad_token_id: int,
     sentinel_token_ids: jnp.ndarray,
     # TODO maybe we don't actually need the truncation logic in
     # to_ul2r_rx_tokens given that we truncate while packing
@@ -547,6 +549,7 @@ def to_ul2r_tokens(
             noise_density,
             mean_noise_span_length,
             True,
+            pad_token_id,
             sentinel_token_ids,
             max_length - 1,
         )
@@ -616,6 +619,7 @@ def ul2r_loss_mask(
 def compute_denoising_length(
     task_params: jnp.ndarray,
     length: jnp.ndarray,
+    random_roll: bool,
 ) -> jnp.ndarray:
     def rx_length() -> jnp.ndarray:
         noise_density = RXDenoisingConfig.mask_prob_from_task_params(task_params)
@@ -623,6 +627,10 @@ def compute_denoising_length(
         _num_noise_tokens, num_noise_spans, _num_nonnoise_tokens = num_noise_spans_tokens_and_spans(
             length, noise_density, mean_noise_span_length
         )
+        # When random_roll is True, we might create an additional noise span by
+        # rolling a noise span so that it is cut by the beginning/end. Reserve
+        # space for it.
+        num_noise_spans = jax.lax.select(random_roll, num_noise_spans + 1, num_noise_spans)
         # [task_token] one <sentinel_0> three <sentinel_0> two
         return 1 + 2 * num_noise_spans + length
 
@@ -678,7 +686,7 @@ def create_ul2r_example(
         # batch independently (but in a way that matches how we computed
         # lengths for packing).
         task_idx = task_indices[id]
-        out_length = compute_denoising_length(task_params[task_idx], in_length)
+        out_length = compute_denoising_length(task_params[task_idx], in_length, False)
 
         return in_start, in_length, out_length
 
@@ -711,8 +719,11 @@ def create_ul2r_example(
         out_start = typing.cast(int, jnp.squeeze(out_starts[idx]))
 
         segment = jnp.roll(tokens.array, -in_start)
+        # TODO this should return the actual length, not just out_length which
+        # might include an extra token? Or we could just use padding. Loss
+        # shouldn't be compute don padding anyways.
         inputs_len, denoising_tokens = to_ul2r_tokens(
-            key, task_params[task_idx], segment, in_length, sentinel_token_ids, QPos.size
+            key, task_params[task_idx], segment, in_length, pad_token_id, sentinel_token_ids, QPos.size
         )
 
         n_tokens = tokens.array.shape[0]
@@ -825,7 +836,7 @@ class Ul2rDataset(MappedAsyncDataset[tuple[TokenizedDict, TokenizedDict], LmExam
         # to turn each input batch into a denoising batch while still staying
         # under the max sequence length for the model.
         def _compute_length(task_idx: jnp.ndarray, length: jnp.ndarray) -> int:
-            return compute_denoising_length(task_params[task_idx], length)
+            return compute_denoising_length(task_params[task_idx], length, False)
 
         out_token_counts = jax.vmap(_compute_length)(task_indices, in_token_counts)
         out_lengths = {**in_lengths, "input_ids": out_token_counts}

@@ -18,6 +18,7 @@ from levanter.data.text import (
     preprocessor_for_format,
 )
 from levanter.data.ul2r import (
+    RX_TASK_KIND,
     TokenizedDict,
     compute_denoising_length,
     noise_span_to_unique_sentinel,
@@ -291,7 +292,7 @@ def test_noise_span_to_unique_sentinel():
     )
     noise_mask = jnp.pad(noise_mask, (0, padded_length - 10), constant_values=False)
 
-    result = noise_span_to_unique_sentinel(tokens, noise_mask, sentinel_tokens, 10, force_initial_sentinel=False)
+    result = noise_span_to_unique_sentinel(tokens, 10, noise_mask, pad_token_id, sentinel_tokens, force_initial_sentinel=False)
 
     expected = jnp.array([100, 13, 14, 15, 16, 17, 18, 19])
     np.testing.assert_array_equal(result[:8], expected)
@@ -323,7 +324,7 @@ def test_noise_span_to_unique_sentinel():
     )
     noise_mask = jnp.pad(noise_mask, (0, padded_length - 15), constant_values=False)
 
-    result = noise_span_to_unique_sentinel(tokens, noise_mask, sentinel_tokens, 15, force_initial_sentinel=True)
+    result = noise_span_to_unique_sentinel(tokens, 15, noise_mask, pad_token_id, sentinel_tokens, force_initial_sentinel=True)
 
     # Should still start with sentinel
     expected = jnp.array([100, 10, 101, 13, 14, 15, 102, 17, 18, 19, 103, 23, 24])
@@ -335,7 +336,7 @@ def test_noise_span_to_unique_sentinel():
     tokens = jnp.pad(tokens, (0, padded_length - 10), constant_values=pad_token_id)
     noise_mask = jnp.zeros(padded_length, dtype=jnp.bool_)
 
-    result = noise_span_to_unique_sentinel(tokens, noise_mask, sentinel_tokens, 10, force_initial_sentinel=False)
+    result = noise_span_to_unique_sentinel(tokens, 10, noise_mask, pad_token_id, sentinel_tokens, force_initial_sentinel=False)
 
     # Should be unchanged except for padding
     np.testing.assert_array_equal(result[:10], jnp.arange(10, 20))
@@ -405,16 +406,18 @@ def test_to_ul2r_rx_tokens():
 
     inputs = noise_span_to_unique_sentinel(
         tokens,
-        noise_mask,
-        sentinel_tokens,
         length,
+        noise_mask,
+        pad_token_id,
+        sentinel_tokens,
         force_initial_sentinel=False,
     )
     targets = noise_span_to_unique_sentinel(
         tokens,
-        ~noise_mask,
-        sentinel_tokens,
         length,
+        ~noise_mask,
+        pad_token_id,
+        sentinel_tokens,
         force_initial_sentinel=True,
     )
 
@@ -430,6 +433,7 @@ def test_to_ul2r_rx_tokens():
         mask_prob=0.3,
         mean_noise_span_length=3.0,
         random_roll=False,
+        pad_token_id=pad_token_id,
         sentinel_token_ids=sentinel_tokens,
         max_length=max_length,
     )
@@ -502,6 +506,7 @@ def test_to_ul2r_rx_tokens_roll():
             mask_prob=0.3,
             mean_noise_span_length=3.0,
             random_roll=True,
+            pad_token_id=pad_token_id,
             sentinel_token_ids=sentinel_ids,
             max_length=max_length,
         )
@@ -528,6 +533,51 @@ def test_to_ul2r_rx_tokens_roll():
         np.testing.assert_array_equal(jnp.isin(sentinel_ids, inputs), jnp.isin(sentinel_ids, targets))
         assert jnp.any(jnp.isin(sentinel_ids, inputs))
         assert jnp.any(jnp.isin(sentinel_ids, targets))
+
+
+def test_compute_denoising_length_rx_random_roll():
+    """
+    Test that compute_denoising_length with random_roll=True reserves enough
+    space and sets pad_token_id when it doesn't create an extra span.
+
+    When random_roll=True, we reserve space for an extra span. However, rolling doesn't
+    always create an additional span, so we should see both cases:
+    - no pad_token_id (rolling created an extra span)
+    - 1 pad_token_id (rolling created an extra span)
+    """
+    max_length = 16
+    pad_token_id = 999  # Use non-zero pad token to verify it's actually being used
+    sentinel_ids = jnp.arange(100, 120)
+
+    length = 12
+    tokens = jnp.arange(1, length + 1)
+    tokens = jnp.pad(tokens, (0, max_length - length), constant_values=pad_token_id)
+
+    mask_prob = 0.3
+    mean_noise_span_length = 3.0
+    task_params = jnp.array([RX_TASK_KIND, R_TASK_TOKEN_ID, mask_prob, mean_noise_span_length])
+
+    predicted_length = compute_denoising_length(task_params, length, random_roll=True)
+
+    padding_counts = []
+    for i in range(16):
+        key = jax.random.PRNGKey(i)
+        _input_length, result = to_ul2r_rx_tokens(
+            key, tokens, length, mask_prob, mean_noise_span_length, True,
+            pad_token_id, sentinel_ids, max_length
+        )
+
+        # Subtract 1 because `result` doesn't include the task token.
+        # print(result[:predicted_length - 1])
+        num_padding = jnp.sum(result[:predicted_length - 1] == pad_token_id)
+        padding_counts.append(int(num_padding))
+
+        actual_length = jnp.sum(result != pad_token_id)
+        assert actual_length <= predicted_length
+
+    assert any(p == 0 for p in padding_counts)
+    assert any(p == 2 for p in padding_counts)
+    assert all(p == 0 or p == 2 for p in padding_counts)
 
 
 def test_ul2r_loss_mask():
@@ -597,6 +647,7 @@ def test_to_ul2r_rx_tokens_truncates_both_sections_and_contains_sentinels():
         mask_prob=mask_prob,
         mean_noise_span_length=mean_noise_span_length,
         random_roll=random_roll,
+        pad_token_id=pad_token_id,
         sentinel_token_ids=sentinel_tokens,
         max_length=padded_length,
     )
@@ -612,6 +663,7 @@ def test_to_ul2r_rx_tokens_truncates_both_sections_and_contains_sentinels():
         mask_prob=mask_prob,
         mean_noise_span_length=mean_noise_span_length,
         random_roll=random_roll,
+        pad_token_id=pad_token_id,
         sentinel_token_ids=sentinel_tokens,
         max_length=max_length,
     )
@@ -687,9 +739,9 @@ def test_create_ul2r_example():
     in_len_s = 5
     in_len = in_len_r + in_len_x + in_len_s
 
-    out_len_r = compute_denoising_length(task_params[0], in_len_r)
-    out_len_x = compute_denoising_length(task_params[1], in_len_x)
-    out_len_s = compute_denoising_length(task_params[2], in_len_s)
+    out_len_r = compute_denoising_length(task_params[0], in_len_r, False)
+    out_len_x = compute_denoising_length(task_params[1], in_len_x, False)
+    out_len_s = compute_denoising_length(task_params[2], in_len_s, False)
 
     tokens = jnp.concatenate(
         [
@@ -754,7 +806,7 @@ def test_create_ul2r_example():
         # batch independently (but in a way that matches how we computed
         # lengths for packing).
         task_idx = task_indices[id]
-        out_length = compute_denoising_length(task_params[task_idx], in_length)
+        out_length = compute_denoising_length(task_params[task_idx], in_length, False)
 
         return in_start, in_length, out_length
 
@@ -790,7 +842,7 @@ def test_create_ul2r_example():
 
         segment = jnp.roll(tokens.array, -in_start)
         print(key, task_params[task_idx], segment, in_length, QPos.size)
-        inputs_len, denoising_tokens = to_ul2r_tokens(key, task_params[task_idx], segment, in_length, SENTINEL_TOKEN_IDS, QPos.size)
+        inputs_len, denoising_tokens = to_ul2r_tokens(key, task_params[task_idx], segment, in_length, pad_token_id, SENTINEL_TOKEN_IDS, QPos.size)
 
         n_tokens = tokens.array.shape[0]
         input_mask = jnp.arange(n_tokens) < inputs_len
