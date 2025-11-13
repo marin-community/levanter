@@ -680,8 +680,8 @@ class HFCheckpointConverter(Generic[LevConfig]):
         tokenizer_Vocab = self.Vocab
         Vocab = tokenizer_Vocab.resize(hf_config.vocab_size)
 
-        print(f"tokenizer_Vocab.size={tokenizer_Vocab.size}")
-        print(f"hf_config.vocab_size={hf_config.vocab_size}")
+        # print(f"tokenizer_Vocab.size={tokenizer_Vocab.size}")
+        # print(f"hf_config.vocab_size={hf_config.vocab_size}")
 
         # TODO: in an ideal world, we would only load the part of the array we needed, but
         # AFAICT neither torch state dicts nor safetensors support this.

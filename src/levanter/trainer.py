@@ -486,7 +486,7 @@ class Trainer:
                 jnp.set_printoptions(threshold=sys.maxsize, linewidth=sys.maxsize)
                 jax.debug.print(f"tokens={batch[0].tokens.array.astype(dtype=jnp.int32)}")
                 jax.debug.print(f"loss_mask={batch[0].loss_mask.array.astype(dtype=jnp.int32)}")
-                print(f"batch={batch}")
+                # print(f"batch={batch}")
                 jax.debug.print("{result}", result=result)
                 jax.debug.print(f"attn_mask={batch[0].attn_mask}")
                 jax.debug.print("input_mask={x}", x=batch[0].attn_mask.input_mask.array)

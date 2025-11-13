@@ -154,7 +154,7 @@ def dot_product_attention(
 
     attention_out = None
 
-    jax.debug.print("attn_backend={}", attn_backend)
+    # jax.debug.print("attn_backend={}", attn_backend)
 
     match attn_backend:
         case AttentionBackend.NVTE:
@@ -281,7 +281,7 @@ def dot_product_attention(
     else:
         # local import to avoid circular imports
         from levanter.models.flash_attention import flash_attention
-        jax.debug.print("flash_attention")
+        # jax.debug.print("flash_attention")
 
         return flash_attention(
             QPos,

@@ -247,41 +247,41 @@ class Gpt2Block(eqx.Module):
         # Debug: input to block
         x_norm = jnp.linalg.norm(x.array)
         x_has_nan = jnp.any(jnp.isnan(x.array))
-        jax.debug.print("Block {layer} input: norm={norm}, has_nan={nan}", layer=layer_idx, norm=x_norm, nan=x_has_nan)
+        # jax.debug.print("Block {layer} input: norm={norm}, has_nan={nan}", layer=layer_idx, norm=x_norm, nan=x_has_nan)
 
         ln1_out = self.ln_1(x)
         ln1_norm = jnp.linalg.norm(ln1_out.array)
         ln1_has_nan = jnp.any(jnp.isnan(ln1_out.array))
-        jax.debug.print("Block {layer} ln_1: norm={norm}, has_nan={nan}", layer=layer_idx, norm=ln1_norm, nan=ln1_has_nan)
+        # jax.debug.print("Block {layer} ln_1: norm={norm}, has_nan={nan}", layer=layer_idx, norm=ln1_norm, nan=ln1_has_nan)
 
         attn_output = self.attn(ln1_out, mask=mask, layer_idx=layer_idx, key=k1)
         attn_norm = jnp.linalg.norm(attn_output.array)
         attn_has_nan = jnp.any(jnp.isnan(attn_output.array))
-        jax.debug.print("Block {layer} attn: norm={norm}, has_nan={nan}", layer=layer_idx, norm=attn_norm, nan=attn_has_nan)
+        # jax.debug.print("Block {layer} attn: norm={norm}, has_nan={nan}", layer=layer_idx, norm=attn_norm, nan=attn_has_nan)
 
         attn_output = self.resid_dropout(attn_output, key=k2)
         x = x + attn_output
 
         post_attn_norm = jnp.linalg.norm(x.array)
         post_attn_has_nan = jnp.any(jnp.isnan(x.array))
-        jax.debug.print("Block {layer} post_attn: norm={norm}, has_nan={nan}", layer=layer_idx, norm=post_attn_norm, nan=post_attn_has_nan)
+        # jax.debug.print("Block {layer} post_attn: norm={norm}, has_nan={nan}", layer=layer_idx, norm=post_attn_norm, nan=post_attn_has_nan)
 
         ln2_out = self.ln_2(x)
         ln2_norm = jnp.linalg.norm(ln2_out.array)
         ln2_has_nan = jnp.any(jnp.isnan(ln2_out.array))
-        jax.debug.print("Block {layer} ln_2: norm={norm}, has_nan={nan}", layer=layer_idx, norm=ln2_norm, nan=ln2_has_nan)
+        # jax.debug.print("Block {layer} ln_2: norm={norm}, has_nan={nan}", layer=layer_idx, norm=ln2_norm, nan=ln2_has_nan)
 
         ff_output = self.mlp(ln2_out, key=k3)
         mlp_norm = jnp.linalg.norm(ff_output.array)
         mlp_has_nan = jnp.any(jnp.isnan(ff_output.array))
-        jax.debug.print("Block {layer} mlp: norm={norm}, has_nan={nan}", layer=layer_idx, norm=mlp_norm, nan=mlp_has_nan)
+        # jax.debug.print("Block {layer} mlp: norm={norm}, has_nan={nan}", layer=layer_idx, norm=mlp_norm, nan=mlp_has_nan)
 
         ff_output = self.resid_dropout(ff_output, key=k4)
         x = x + ff_output
 
         output_norm = jnp.linalg.norm(x.array)
         output_has_nan = jnp.any(jnp.isnan(x.array))
-        jax.debug.print("Block {layer} output: norm={norm}, has_nan={nan}", layer=layer_idx, norm=output_norm, nan=output_has_nan)
+        # jax.debug.print("Block {layer} output: norm={norm}, has_nan={nan}", layer=layer_idx, norm=output_norm, nan=output_has_nan)
 
         return x
 

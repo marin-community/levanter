@@ -823,7 +823,7 @@ class Ul2rDataset(MappedAsyncDataset[tuple[TokenizedDict, TokenizedDict], LmExam
         in_token_counts = jnp.array(in_lengths["input_ids"])
         n_docs = in_token_counts.shape[0]
 
-        print("Ul2rDataset after in_lengths")
+        # print("Ul2rDataset after in_lengths")
 
         task_items = [(config, task_probs[name]) for name, config in task_configs.items()]
         n_tasks = len(task_items)
