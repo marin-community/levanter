@@ -11,7 +11,7 @@ model:
   num_layers: 2
 trainer:
   mp: f32
-  num_train_steps: 100
+  num_train_steps: 1000
 
   checkpointer:
     keep:
