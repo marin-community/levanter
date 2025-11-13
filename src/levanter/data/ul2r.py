@@ -104,6 +104,7 @@ class RXDenoisingConfig(DenoisingConfig):
             self.task_token_id,
             self.mask_prob,
             self.mean_span_length,
+            int(self.random_roll),
         ]
         return jnp.array(args)
 
@@ -115,13 +116,17 @@ class RXDenoisingConfig(DenoisingConfig):
     def mean_span_length_from_task_params(task_params: jnp.ndarray) -> jnp.ndarray:
         return task_params[3]
 
+    @staticmethod
+    def random_roll_from_task_params(task_params: jnp.ndarray) -> jnp.ndarray:
+        return task_params[4].astype(jnp.bool_)
+
 
 @DenoisingConfig.register_subclass("s")
 @dataclass(frozen=True)
 class SDenoisingConfig(DenoisingConfig):
     def to_task_params(self) -> jnp.ndarray:
         # should match size of RXDenoisingConfig
-        return jnp.array([S_TASK_KIND, self.task_token_id, 0, 0])
+        return jnp.array([S_TASK_KIND, self.task_token_id, 0, 0, 0])
 
 
 @functools.partial(jax.jit, static_argnames=["padded_length"])
@@ -541,14 +546,14 @@ def to_ul2r_tokens(
     def rx_tokens():
         noise_density = RXDenoisingConfig.mask_prob_from_task_params(task_params)
         mean_noise_span_length = RXDenoisingConfig.mean_span_length_from_task_params(task_params)
-        # TODO allow configuring random_roll
+        random_roll = RXDenoisingConfig.random_roll_from_task_params(task_params)
         inputs_len, out = to_ul2r_rx_tokens(
             key,
             tokens[:-1],
             length,
             noise_density,
             mean_noise_span_length,
-            True,
+            random_roll,
             pad_token_id,
             sentinel_token_ids,
             max_length - 1,
@@ -619,11 +624,11 @@ def ul2r_loss_mask(
 def compute_denoising_length(
     task_params: jnp.ndarray,
     length: jnp.ndarray,
-    random_roll: bool,
 ) -> jnp.ndarray:
-    def rx_length() -> jnp.ndarray:
+    def _rx_length() -> jnp.ndarray:
         noise_density = RXDenoisingConfig.mask_prob_from_task_params(task_params)
         mean_noise_span_length = RXDenoisingConfig.mean_span_length_from_task_params(task_params)
+        random_roll = RXDenoisingConfig.random_roll_from_task_params(task_params)
         _num_noise_tokens, num_noise_spans, _num_nonnoise_tokens = num_noise_spans_tokens_and_spans(
             length, noise_density, mean_noise_span_length
         )
@@ -634,12 +639,12 @@ def compute_denoising_length(
         # [task_token] one <sentinel_0> three <sentinel_0> two
         return 1 + 2 * num_noise_spans + length
 
-    def s_length() -> jnp.ndarray:
+    def _s_length() -> jnp.ndarray:
         # [task_token] one <sentinel_0> two three
         return jax.lax.select(length < MIN_S_LENGTH, length, 2 + length)
 
     task_kind = DenoisingConfig.task_kind_from_task_params(task_params)
-    return jax.lax.cond(task_kind == RX_TASK_KIND, rx_length, s_length)
+    return jax.lax.cond(task_kind == RX_TASK_KIND, _rx_length, _s_length)
 
 
 @functools.partial(jax.jit, static_argnames=("max_segments_per_example", "QPos", "KPos"))
@@ -666,7 +671,7 @@ def create_ul2r_example(
     seg_ids = jnp.where(segment_ids.array == -1, max_seg_id, segment_ids.array)
     unique_seg_ids = jnp.unique(seg_ids, size=max_segments_per_example, fill_value=-1)
 
-    def prepare_segment(id: int) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def _prepare_segment(id: int) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """
         Returns `(in_start, in_length, out_length)` for segment `id`.
         The result is undefined for ids not in `segment_ids` or the id -1.
@@ -686,11 +691,11 @@ def create_ul2r_example(
         # batch independently (but in a way that matches how we computed
         # lengths for packing).
         task_idx = task_indices[id]
-        out_length = compute_denoising_length(task_params[task_idx], in_length, False)
+        out_length = compute_denoising_length(task_params[task_idx], in_length)
 
         return in_start, in_length, out_length
 
-    in_starts, in_lengths, out_lengths = jax.vmap(prepare_segment)(unique_seg_ids)
+    in_starts, in_lengths, out_lengths = jax.vmap(_prepare_segment)(unique_seg_ids)
 
     # `out_starts[i]` is the offset of the beginning of the i-th output segment.
     # Segment lengths increase when we turn them into denoising examples.
@@ -698,7 +703,7 @@ def create_ul2r_example(
     out_starts = jnp.where(unique_seg_ids == -1, -1, out_starts)
     out_starts = typing.cast(jnp.ndarray, out_starts)
 
-    def process_segment(key: PRNGKeyArray, id: int) -> tuple[jnp.ndarray, jnp.ndarray, int, int]:
+    def _process_segment(key: PRNGKeyArray, id: int) -> tuple[jnp.ndarray, jnp.ndarray, int, int]:
         """
         Applies UL2R denoising to a single segment.
         Returns `(input_mask, denoising_tokens, out_seg_ids)`.
@@ -732,18 +737,18 @@ def create_ul2r_example(
         denoising_tokens = jnp.roll(denoising_tokens, out_start)
         return (input_mask, denoising_tokens, out_start, out_length)
 
-    def should_loop(
+    def _should_loop(
         acc: tuple[PRNGKeyArray, int, jnp.ndarray, jnp.ndarray, jnp.ndarray],
     ) -> bool:
         (_, i, _, _, _) = acc
         return (i < max_segments_per_example) & (unique_seg_ids[i] != -1)
 
-    def loop(
+    def _loop(
         acc: tuple[PRNGKeyArray, int, jnp.ndarray, jnp.ndarray, jnp.ndarray],
     ) -> tuple[PRNGKeyArray, int, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         (key, i, input_mask, denoising_tokens, out_seg_ids) = acc
         process_key, key = jax.random.split(key)
-        (seg_input_mask, seg_denoising_tokens, out_start, out_length) = process_segment(process_key, unique_seg_ids[i])
+        (seg_input_mask, seg_denoising_tokens, out_start, out_length) = _process_segment(process_key, unique_seg_ids[i]) # type: ignore
         input_mask = input_mask | seg_input_mask
         denoising_tokens = denoising_tokens | seg_denoising_tokens
 
@@ -761,7 +766,7 @@ def create_ul2r_example(
 
     # jax.debug.print("create_ul2r_example loop")
 
-    (_, _, input_mask, denoising_tokens, out_seg_ids) = jax.lax.while_loop(should_loop, loop, acc)
+    (_, _, input_mask, denoising_tokens, out_seg_ids) = jax.lax.while_loop(_should_loop, _loop, acc)
 
     # jax.debug.print("create_ul2r_example loss_mask")
     # TODO GreedyPrepackedDataset pads w/ zeros so can we end up with two
@@ -808,13 +813,13 @@ class Ul2rDataset(MappedAsyncDataset[tuple[TokenizedDict, TokenizedDict], LmExam
         offsets = jax.tree.map(lambda store: store.offsets[0 : store.num_rows + 1].read(), cache.store.tree)
         offsets = jax.tree.map(lambda fut: fut.result(), offsets)
 
-        def diff_offsets(offsets: np.ndarray):
+        def _diff_offsets(offsets: np.ndarray):
             # fine to mutate since we have a copy
             # the array store has the number of rows in the 0th offset
             offsets[0] = 0
             return offsets[1:] - offsets[:-1]
 
-        in_lengths = jax.tree.map(diff_offsets, offsets)
+        in_lengths = jax.tree.map(_diff_offsets, offsets)
         in_token_counts = jnp.array(in_lengths["input_ids"])
         n_docs = in_token_counts.shape[0]
 
@@ -836,7 +841,7 @@ class Ul2rDataset(MappedAsyncDataset[tuple[TokenizedDict, TokenizedDict], LmExam
         # to turn each input batch into a denoising batch while still staying
         # under the max sequence length for the model.
         def _compute_length(task_idx: jnp.ndarray, length: jnp.ndarray) -> int:
-            return compute_denoising_length(task_params[task_idx], length, False)
+            return compute_denoising_length(task_params[task_idx], length)
 
         out_token_counts = jax.vmap(_compute_length)(task_indices, in_token_counts)
         out_lengths = {**in_lengths, "input_ids": out_token_counts}

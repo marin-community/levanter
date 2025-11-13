@@ -292,7 +292,7 @@ def test_noise_span_to_unique_sentinel():
     )
     noise_mask = jnp.pad(noise_mask, (0, padded_length - 10), constant_values=False)
 
-    result = noise_span_to_unique_sentinel(tokens, 10, noise_mask, pad_token_id, sentinel_tokens, force_initial_sentinel=False)
+    result = noise_span_to_unique_sentinel(tokens, 10, noise_mask, sentinel_tokens, force_initial_sentinel=False)
 
     expected = jnp.array([100, 13, 14, 15, 16, 17, 18, 19])
     np.testing.assert_array_equal(result[:8], expected)
@@ -324,7 +324,7 @@ def test_noise_span_to_unique_sentinel():
     )
     noise_mask = jnp.pad(noise_mask, (0, padded_length - 15), constant_values=False)
 
-    result = noise_span_to_unique_sentinel(tokens, 15, noise_mask, pad_token_id, sentinel_tokens, force_initial_sentinel=True)
+    result = noise_span_to_unique_sentinel(tokens, 15, noise_mask, sentinel_tokens, force_initial_sentinel=True)
 
     # Should still start with sentinel
     expected = jnp.array([100, 10, 101, 13, 14, 15, 102, 17, 18, 19, 103, 23, 24])
@@ -336,7 +336,7 @@ def test_noise_span_to_unique_sentinel():
     tokens = jnp.pad(tokens, (0, padded_length - 10), constant_values=pad_token_id)
     noise_mask = jnp.zeros(padded_length, dtype=jnp.bool_)
 
-    result = noise_span_to_unique_sentinel(tokens, 10, noise_mask, pad_token_id, sentinel_tokens, force_initial_sentinel=False)
+    result = noise_span_to_unique_sentinel(tokens, 10, noise_mask, sentinel_tokens, force_initial_sentinel=False)
 
     # Should be unchanged except for padding
     np.testing.assert_array_equal(result[:10], jnp.arange(10, 20))
@@ -408,7 +408,6 @@ def test_to_ul2r_rx_tokens():
         tokens,
         length,
         noise_mask,
-        pad_token_id,
         sentinel_tokens,
         force_initial_sentinel=False,
     )
@@ -416,7 +415,6 @@ def test_to_ul2r_rx_tokens():
         tokens,
         length,
         ~noise_mask,
-        pad_token_id,
         sentinel_tokens,
         force_initial_sentinel=True,
     )
@@ -555,9 +553,10 @@ def test_compute_denoising_length_rx_random_roll():
 
     mask_prob = 0.3
     mean_noise_span_length = 3.0
-    task_params = jnp.array([RX_TASK_KIND, R_TASK_TOKEN_ID, mask_prob, mean_noise_span_length])
+    random_roll = True
+    task_params = jnp.array([RX_TASK_KIND, R_TASK_TOKEN_ID, mask_prob, mean_noise_span_length, int(random_roll)])
 
-    predicted_length = compute_denoising_length(task_params, length, random_roll=True)
+    predicted_length = compute_denoising_length(task_params, length)
 
     padding_counts = []
     for i in range(16):
@@ -739,9 +738,9 @@ def test_create_ul2r_example():
     in_len_s = 5
     in_len = in_len_r + in_len_x + in_len_s
 
-    out_len_r = compute_denoising_length(task_params[0], in_len_r, False)
-    out_len_x = compute_denoising_length(task_params[1], in_len_x, False)
-    out_len_s = compute_denoising_length(task_params[2], in_len_s, False)
+    out_len_r = compute_denoising_length(task_params[0], in_len_r)
+    out_len_x = compute_denoising_length(task_params[1], in_len_x)
+    out_len_s = compute_denoising_length(task_params[2], in_len_s)
 
     tokens = jnp.concatenate(
         [
@@ -806,7 +805,7 @@ def test_create_ul2r_example():
         # batch independently (but in a way that matches how we computed
         # lengths for packing).
         task_idx = task_indices[id]
-        out_length = compute_denoising_length(task_params[task_idx], in_length, False)
+        out_length = compute_denoising_length(task_params[task_idx], in_length)
 
         return in_start, in_length, out_length
 
