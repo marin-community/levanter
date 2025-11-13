@@ -484,15 +484,15 @@ class Trainer:
 
             if self.config.crash_on_nan and jnp.isnan(loss):
                 jnp.set_printoptions(threshold=sys.maxsize, linewidth=sys.maxsize)
-                jax.debug.print(f"tokens={batch[0].tokens.array.astype(dtype=jnp.int32)}")
-                jax.debug.print(f"loss_mask={batch[0].loss_mask.array.astype(dtype=jnp.int32)}")
+                # jax.debug.print(f"tokens={batch[0].tokens.array.astype(dtype=jnp.int32)}")
+                # jax.debug.print(f"loss_mask={batch[0].loss_mask.array.astype(dtype=jnp.int32)}")
                 # print(f"batch={batch}")
-                jax.debug.print("{result}", result=result)
-                jax.debug.print(f"attn_mask={batch[0].attn_mask}")
-                jax.debug.print("input_mask={x}", x=batch[0].attn_mask.input_mask.array)
-                jax.debug.print("segment_ids={x}", x=batch[0].attn_mask.segment_ids[0].array)
-                materialized = batch[0].attn_mask.materialize(hax.Axis(name='position', size=1024), hax.Axis(name='key_position', size=1024))
-                jax.debug.print(f"attn_mask={materialized.array}")
+                # jax.debug.print("{result}", result=result)
+                # jax.debug.print(f"attn_mask={batch[0].attn_mask}")
+                # jax.debug.print("input_mask={x}", x=batch[0].attn_mask.input_mask.array)
+                # jax.debug.print("segment_ids={x}", x=batch[0].attn_mask.segment_ids[0].array)
+                # materialized = batch[0].attn_mask.materialize(hax.Axis(name='position', size=1024), hax.Axis(name='key_position', size=1024))
+                # jax.debug.print(f"attn_mask={materialized.array}")
                 raise RuntimeError("Loss is NaN")
 
             if self.config.crash_on_inf and jnp.isinf(loss):
