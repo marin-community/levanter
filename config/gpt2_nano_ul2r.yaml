@@ -1,7 +1,8 @@
 #data:
 #  id: dlwh/wikitext_103_detokenized
 
-disable_jit: true
+#disable_jit: true
+#data_only: true
 
 model:
   type: gpt2
@@ -25,16 +26,15 @@ trainer:
   batch_axis: "batch"
 
 data:
-  #id: dlwh/wikitext_103_detokenized
-  #id: roneneldan/TinyStories
-  id: openai/gsm8k
-  name: socratic
+  id: dlwh/wikitext_103_detokenized
+  # id: openai/gsm8k # This is super tiny. It's just for smoke tests.
+  # name: socratic
   cache_dir: /workspace/marin_cache
   tokenizer: ./gpt2_ul2r_DEV
   format:
     type: ul2r
-    #text_key: text
-    text_key: question
+    #text_key: text # only for gsm8k
+    #text_key: question
     task_configs:
       r:
         type: rx
