@@ -237,6 +237,7 @@ class ReplContext:
                 model_config=self.config.model,
                 hf_checkpoint=path,
                 levanter_checkpoint=None,
+                tokenizer_path=tokenizer,
                 key=jrandom.PRNGKey(self.config.server.seed),
             )
         else:
@@ -248,6 +249,7 @@ class ReplContext:
                 model_config=self.config.model,
                 hf_checkpoint=None,
                 levanter_checkpoint=path,
+                tokenizer_path=tokenizer,
                 key=jrandom.PRNGKey(self.config.server.seed),
             )
 
