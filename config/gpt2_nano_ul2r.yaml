@@ -14,11 +14,11 @@ initialize_from_hf: openai-community/gpt2
 use_hf_model_config: true
 
 trainer:
-  checkpointer:
-    # base_path: "checkpoints"
-    # keep:
-    #   - every: 50
-    # save_interval: 5m
+  # checkpointer:
+  #   base_path: "checkpoints"
+  #   keep:
+  #     - every: 50
+  #   save_interval: 5m
 
   # per_device_parallelism: -1
   batch_axis: "batch"
