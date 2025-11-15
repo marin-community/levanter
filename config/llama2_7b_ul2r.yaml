@@ -2,7 +2,7 @@ data:
   tokenizer: ./llama_2_7b_hf_ul2r/
   configs:
     pile:
-      id: EleutherAI/pile
+      id: dlwh/wikitext_103_detokenized
     ul2r:
       id: dlwh/wikitext_103_detokenized
       cache_dir: /workspace/marin_cache
