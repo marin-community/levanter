@@ -6,24 +6,27 @@
 
 model:
   type: gpt2
-  hidden_dim: 32
-  num_heads: 4
-  num_layers: 2
+  # hidden_dim: 32
+  # num_heads: 4
+  # num_layers: 2
+
+initialize_from_hf: openai-community/gpt2
+use_hf_model_config: true
+
 trainer:
-  mp: f32
-  num_train_steps: 1000
-
   checkpointer:
-    keep:
-      - every: 50
-    save_interval: 5m
+    # base_path: "checkpoints"
+    # keep:
+    #   - every: 50
+    # save_interval: 5m
 
-  per_device_parallelism: -1
-  train_batch_size: 32
-
-  tensor_parallel_axes: ["mlp", "heads"]
-  fsdp_axis: "embed"
+  # per_device_parallelism: -1
   batch_axis: "batch"
+  fsdp_axis: "embed"
+  mp: f32
+  num_train_steps: 100000
+  tensor_parallel_axes: ["mlp", "heads"]
+  train_batch_size: 32 # what's good?
 
 data:
   id: dlwh/wikitext_103_detokenized
