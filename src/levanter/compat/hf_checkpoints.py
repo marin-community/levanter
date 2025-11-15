@@ -686,6 +686,9 @@ class HFCheckpointConverter(Generic[LevConfig]):
             if Vocab.size != original_vocab_size:
                 logger.info(f"Rounding vocab size from {original_vocab_size} to {Vocab.size} for partitioning")
 
+        # print(f"tokenizer_Vocab.size={tokenizer_Vocab.size}")
+        # print(f"hf_config.vocab_size={hf_config.vocab_size}")
+
         # TODO: in an ideal world, we would only load the part of the array we needed, but
         # AFAICT neither torch state dicts nor safetensors support this.
         state_dict = self.load_state_dict(ref, dtype)
