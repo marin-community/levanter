@@ -3,6 +3,7 @@ data:
   configs:
     pile:
       id: dlwh/wikitext_103_detokenized
+      cache_dir: /tmp/marin_cache
     ul2r:
       id: dlwh/wikitext_103_detokenized
       cache_dir: /tmp/marin_cache
