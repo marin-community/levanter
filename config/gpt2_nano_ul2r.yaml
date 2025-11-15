@@ -32,7 +32,7 @@ data:
   id: dlwh/wikitext_103_detokenized
   # id: openai/gsm8k # This is super tiny. It's just for smoke tests.
   # name: socratic
-  cache_dir: /workspace/marin_cache
+  cache_dir: /tmp/marin_cache
   tokenizer: ./gpt2_ul2r_DEV
   format:
     type: ul2r

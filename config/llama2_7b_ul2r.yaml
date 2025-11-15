@@ -5,7 +5,7 @@ data:
       id: dlwh/wikitext_103_detokenized
     ul2r:
       id: dlwh/wikitext_103_detokenized
-      cache_dir: /workspace/marin_cache
+      cache_dir: /tmp/marin_cache
       format:
         type: ul2r
         task_configs:
