@@ -1,43 +1,44 @@
 data:
-  pile:
-    id: EleutherAI/pile
-    tokenizer: NousResearch/Llama-2-7b-hf
-  ul2r:
-    id: dlwh/wikitext_103_detokenized
-    cache_dir: /workspace/marin_cache
-    tokenizer: ./llama_2_7b_hf_ul2r/
-    format:
-      type: ul2r
-      task_configs:
-        r:
-          type: rx
-          mask_prob: 0.15
-          mean_span_length: 3.0
-          random_roll: true
-          task_token_id: 32000
-        x1:
-          type: rx
-          mask_prob: 0.15
-          mean_span_length: 32.0
-          random_roll: true
-          task_token_id: 32001
-        x2:
-          type: rx
-          mask_prob: 0.5
-          mean_span_length: 3.0
-          random_roll: true
-          task_token_id: 32001
-        s:
-          type: s
-          task_token_id: 32002
-      task_probs:
-        r: 0.5
-        x1: 0.125
-        x2: 0.125
-        s: 0.25
-      rng_seed: 42
-      sentinel_token_id_start: 32003
-      sentinel_token_id_count: 100
+  configs:
+    pile:
+      id: EleutherAI/pile
+      tokenizer: NousResearch/Llama-2-7b-hf
+    ul2r:
+      id: dlwh/wikitext_103_detokenized
+      cache_dir: /workspace/marin_cache
+      tokenizer: ./llama_2_7b_hf_ul2r/
+      format:
+        type: ul2r
+        task_configs:
+          r:
+            type: rx
+            mask_prob: 0.15
+            mean_span_length: 3.0
+            random_roll: true
+            task_token_id: 32000
+          x1:
+            type: rx
+            mask_prob: 0.15
+            mean_span_length: 32.0
+            random_roll: true
+            task_token_id: 32001
+          x2:
+            type: rx
+            mask_prob: 0.5
+            mean_span_length: 3.0
+            random_roll: true
+            task_token_id: 32001
+          s:
+            type: s
+            task_token_id: 32002
+        task_probs:
+          r: 0.5
+          x1: 0.125
+          x2: 0.125
+          s: 0.25
+        rng_seed: 42
+        sentinel_token_id_start: 32003
+        sentinel_token_id_count: 100
   train_weights:
     pile: 0 # only use Pile for evaluation; UL2R says loss should decrease
     ul2r: 1
