@@ -1451,6 +1451,7 @@ class AttentionConfig:
     num_kv_heads: int
     head_dim: int | None = None
     use_bias: bool = False
+    use_mup: bool = False
     use_output_bias: Optional[bool] = None  # If None, uses use_bias
     upcast_attn: bool = False
     attn_backend: Optional[AttentionBackend] = None
@@ -1462,6 +1463,9 @@ class AttentionConfig:
     """Configuration for QK normalization. If None, no normalization is applied."""
 
     def __post_init__(self):
+        if self.use_mup and self.scaling_factor is None:
+            object.__setattr__(self, "scaling_factor", 1 / self.head_size)
+
         assert (
             self.num_heads % self.num_kv_heads == 0
         ), f"num_heads={self.num_heads} not divisible by num_kv_heads={self.num_kv_heads}."
@@ -1522,6 +1526,7 @@ class Attention(eqx.Module):
     @staticmethod
     def init(config: AttentionConfig, *, key) -> "Attention":
         use_bias = config.use_bias
+        use_mup = config.use_mup
         use_output_bias = config.use_output_bias if config.use_output_bias is not None else use_bias
         k_q, k_k, k_v, k_o = jrandom.split(key, 4)
         q_proj = hnn.Linear.init(
@@ -1530,6 +1535,7 @@ class Attention(eqx.Module):
             key=k_q,
             use_bias=use_bias,
             out_first=True,
+            reparam_cls=hnn.Linear.hidden_reparam(use_mup=use_mup),
         )
         k_proj = hnn.Linear.init(
             In=config.Embed,
@@ -1537,6 +1543,7 @@ class Attention(eqx.Module):
             key=k_k,
             use_bias=use_bias,
             out_first=True,
+            reparam_cls=hnn.Linear.hidden_reparam(use_mup=use_mup),
         )
         v_proj = hnn.Linear.init(
             In=(config.Embed),
@@ -1544,6 +1551,7 @@ class Attention(eqx.Module):
             key=k_v,
             use_bias=use_bias,
             out_first=True,
+            reparam_cls=hnn.Linear.hidden_reparam(use_mup=use_mup),
         )
         o_proj = hnn.Linear.init(
             In=(config.Heads, config.HeadSize),
@@ -1551,6 +1559,7 @@ class Attention(eqx.Module):
             key=k_o,
             use_bias=use_output_bias,
             out_first=True,
+            reparam_cls=hnn.Linear.hidden_reparam(use_mup=use_mup),
         )
 
         q_norm = None

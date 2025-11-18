@@ -15,6 +15,14 @@ from levanter.distributed import DistributedConfig, RayConfig
 from levanter.tracker import NoopConfig
 
 
+def test_configure_use_mup_sets_flags():
+    config = train_lm.TrainLmConfig(use_mup=True)
+    config = train_lm._configure_use_mup(config)
+
+    assert getattr(config.model, "use_mup", False) is True
+    assert getattr(config.optimizer, "use_mup", False) is True
+
+
 @pytest.mark.entry
 def test_train_lm():
     # just testing if train_lm has a pulse

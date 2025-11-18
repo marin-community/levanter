@@ -1,7 +1,15 @@
 # Copyright 2025 The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
+
 import numpy as np
+import jax
+from jax import numpy as jnp
+import jax.random as jr
+
+import haliax as hax
+from haliax import Axis
 
 from levanter.optim.config import AdamConfig
 
@@ -246,3 +254,57 @@ def test_wsds_schedule_with_cycle_points():
     assert np.isclose(sched_fn(701), 1e-3)
     assert np.isclose(sched_fn(969), 1e-3)
     assert sched_fn(971) < 1e-3
+
+
+def test_adam_use_mup_scales_updates():
+    base_args = dict(
+        learning_rate=1.0,
+        weight_decay=0.0,
+        warmup=0.0,
+        min_lr_ratio=1.0,
+        lr_schedule="constant",
+        max_grad_norm=None,
+    )
+
+    optimizer_plain = AdamConfig(**base_args, use_mup=False).build(num_train_steps=1)
+    optimizer_mup = AdamConfig(**base_args, use_mup=True).build(num_train_steps=1)
+
+    class ConstantScaleReparam(hax.nn.mup.AbstractLinearReparam):
+        @staticmethod
+        def init_scale(In, Out):
+            return 1.0
+
+        @property
+        def lr_scale(self):
+            return 0.5
+
+        @property
+        def active_scale(self):
+            return 1.0
+
+    In = Axis("in", 1)
+    Out = Axis("out", 1)
+    layer = hax.nn.Linear.init(In, Out, key=jr.PRNGKey(0), use_bias=False)
+    layer = dataclasses.replace(layer, reparam=ConstantScaleReparam(layer.In, layer.Out))
+
+    params = {"layer": layer}
+
+    def _unit_updates(x):
+        if isinstance(x, hax.NamedArray):
+            return hax.ones_like(x)
+        if isinstance(x, jnp.ndarray):
+            return jnp.ones_like(x)
+        if x is None:
+            return None
+        return x
+
+    grads = jax.tree_util.tree_map(_unit_updates, params)
+
+    state_plain = optimizer_plain.init(params)
+    state_mup = optimizer_mup.init(params)
+
+    updates_plain, state_plain = optimizer_plain.update(grads, state_plain, params)
+    updates_mup, state_mup = optimizer_mup.update(grads, state_mup, params)
+
+    ratio = updates_mup["layer"].weight.array / updates_plain["layer"].weight.array
+    assert np.allclose(np.asarray(ratio), 0.5)

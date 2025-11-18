@@ -35,12 +35,37 @@ from levanter.utils.jax_utils import parameter_count
 logger = logging.getLogger(__name__)
 
 
+def _configure_use_mup(config: "TrainLmConfig") -> "TrainLmConfig":
+    """Normalize MuP settings across model and optimizer configs."""
+
+    requested = config.use_mup
+    model_supports = hasattr(config.model, "use_mup")
+    optimizer_supports = hasattr(config.optimizer, "use_mup")
+    model_use_mup = getattr(config.model, "use_mup", None) if model_supports else None
+    optimizer_use_mup = getattr(config.optimizer, "use_mup", None) if optimizer_supports else None
+
+    if requested is not None:
+        if requested and not model_supports:
+            raise ValueError("Model config does not support MuP but TrainLmConfig.use_mup=True was provided.")
+        if requested and not optimizer_supports:
+            raise ValueError("Optimizer config does not support MuP but TrainLmConfig.use_mup=True was provided.")
+
+        if model_supports and model_use_mup != requested:
+            config.model = dataclasses.replace(config.model, use_mup=requested)
+        if optimizer_supports and optimizer_use_mup != requested:
+            config.optimizer = dataclasses.replace(config.optimizer, use_mup=requested)
+
+    return config
+
+
 @dataclass
 class TrainLmConfig:
     data: Union[SingleDatasetLMConfig, LMMixtureDatasetConfig] = field(default_factory=UrlSingleDatasetLMConfig)
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
     model: LmConfig = field(default_factory=LlamaConfig)
     optimizer: OptimizerConfig = field(default_factory=AdamConfig)
+    use_mup: Optional[bool] = None
+    """If set, toggles MuP for both the model and optimizer configs."""
 
     # config related to continued pretraining
     initialize_from_hf: Union[bool, str] = False
@@ -99,6 +124,8 @@ def main(config: TrainLmConfig):
         converter = converter.replaced(tokenizer=tokenizer)
     else:
         converter = None
+
+    config = _configure_use_mup(config)
 
     levanter.initialize(config)
     optimizer = config.optimizer.build(config.trainer.num_train_steps)
