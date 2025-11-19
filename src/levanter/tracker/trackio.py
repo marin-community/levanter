@@ -78,6 +78,11 @@ def _convert_value_to_loggable_rec(value: Any):
         return [_convert_value_to_loggable_rec(v) for v in value]
     elif isinstance(value, typing.Mapping):
         return {k: _convert_value_to_loggable_rec(v) for k, v in value.items()}
+    elif isinstance(value, jax.Array):
+        if value.ndim == 0:
+            return value.item()
+        else:
+            return np.array(value)
     elif isinstance(value, Histogram):
         counts, limits = value.to_numpy_histogram()
         return {
