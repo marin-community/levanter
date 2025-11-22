@@ -30,7 +30,7 @@ classifiers = [
 dependencies = [
     "haliax>=1.4.dev450",
     "equinox>=0.11.7,!=0.12.0",
-    "jax>=0.6.2,!=0.7.0,!=0.7.1",
+    "jax>=0.7.2",
     "jaxtyping>=0.2.34",
     "tokenizers>=0.15.2",
     "transformers>=4.57.1,<5.0",
@@ -62,6 +62,7 @@ dependencies = [
     "protobuf>=6,<7",  # ensure TB/XProf compatibility; avoid 7+ due to ray
   # "lm-eval==0.4.2",
   # "lm-eval @ git+https://github.com/dlwh/lm-evaluation-harness.git@no_torch"
+    "vllm-tpu",
 ]
 
 [project.urls]
@@ -69,8 +70,8 @@ Homepage = "https://github.com/stanford-crfm/levanter"
 "Bug Tracker" = "https://github.com/stanford-crfm/levanter/issues"
 
 [project.optional-dependencies]
-gpu = ["jax[cuda12]>=0.6.2"]
-tpu = ["jax[tpu]>=0.6.2"]
+gpu = ["jax[cuda12]>=0.7.2"]
+tpu = ["jax[tpu]>=0.7.2"]
 torch_test = [
   "torch>=2.7.0",
   "peft>=0.12.0",

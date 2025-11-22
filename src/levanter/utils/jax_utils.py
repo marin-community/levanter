@@ -288,10 +288,8 @@ def best_effort_sharding(shape, *, devices=None, mesh=None):
     if mesh is None:
         # TODO: we shouldn't be getting a concrete mesh here. Need to fix/remove this whole function
         mesh = get_concrete_mesh()
-        if mesh is not None and mesh.shape == ():
-            mesh = None
 
-    if mesh is None:
+    if not mesh or mesh.empty:
         device_shape = (len(devices),)
         # we want to shard an array with shape shape across len(devices)
         # each axis in the array has to be divisible by the corresponding axis in device_shape, so

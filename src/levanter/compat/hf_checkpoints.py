@@ -281,7 +281,11 @@ def _to_state_dict_with_dtype(
                 logger.debug(f"Skipping dtype conversion for non-floating point array {k} with dtype {v.dtype}")
 
     # deshard. We could be smarter here and use a process mesh or host offloading, but this is simpler for now
-    state_dict = jax.lax.with_sharding_constraint(state_dict, PartitionSpec())
+    mesh = None
+    with contextlib.suppress(RuntimeError, ValueError):
+        mesh = get_concrete_mesh()
+    if mesh and not mesh.empty:
+        state_dict = jax.lax.with_sharding_constraint(state_dict, PartitionSpec())
 
     return state_dict
 
