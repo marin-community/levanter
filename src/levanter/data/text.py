@@ -1093,8 +1093,14 @@ class SingleDatasetLMConfigBase(LmDatasetSourceConfigBase, LMTaskConfig):
                 pass
 
         if source is None:
-            logger.warning(f"Skipping {split} because no source was provided")
-            return None
+            if split == "train":
+                raise ValueError(
+                    f"No source provided for split '{split}' and no usable cache found at '{cache_dir}'. "
+                    "Each dataset source must supply raw URLs or a finished cache."
+                )
+            else:
+                logger.warning(f"Skipping {split} because no source was provided")
+                return None
 
         return build_lm_dataset_cache(cache_dir, source, format, tokenizer, options, enforce_eos, monitors)
 
@@ -1364,8 +1370,16 @@ class LMMixtureDatasetConfig(LMTaskConfig):
                         self.enforce_eos,
                     )
                 except FileNotFoundError:
-                    logger.warning(f"No source for {name} in {split} split and no cache either, skipping")
-                    continue
+                    if split == "train":
+                        # Fail fast: each source must provide raw URLs or a usable cache for training
+                        raise ValueError(
+                            f"Dataset '{name}' in split '{split}' has neither raw URLs nor a usable cache at "
+                            f"'{os.path.join(cache_dir, split)}'. Each dataset source must supply raw URLs or a "
+                            "finished cache."
+                        )
+                    else:
+                        logger.warning(f"No source for {name} in {split} split and no cache either, skipping")
+                        continue
             else:
                 caches[name] = build_lm_dataset_cache(
                     os.path.join(cache_dir, split),
