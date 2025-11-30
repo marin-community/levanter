@@ -4,6 +4,7 @@
 import functools
 import logging
 import math
+import os
 import warnings
 from dataclasses import dataclass
 from enum import Enum
@@ -45,6 +46,40 @@ from .normalization import LayerNormConfigBase
 from .rotary import RotaryEmbeddings, RotaryEmbeddingsConfig
 
 logger = logging.getLogger(__name__)
+
+RAGGED_PAGED_ATTENTION_COMPARE_ENV = "LEVANTER_RAGGED_PAGED_ATTENTION_COMPARE"
+
+
+def _should_compare_ragged_paged_attention() -> bool:
+    value = os.environ.get(RAGGED_PAGED_ATTENTION_COMPARE_ENV, "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_print_ragged_paged_attention_metrics(tpu_out: NamedArray, reference_out: NamedArray) -> None:
+    tpu_arr = tpu_out.array
+    ref_arr = reference_out.array
+    abs_diff = jnp.abs(tpu_arr - ref_arr)
+    ref_abs = jnp.abs(ref_arr)
+    rel_denom = jnp.where(ref_abs > 0, ref_abs, jnp.ones_like(ref_abs))
+    rel_diff = jnp.where(ref_abs > 0, abs_diff / rel_denom, jnp.zeros_like(abs_diff))
+
+    max_abs = jnp.max(abs_diff)
+    mean_abs = jnp.mean(abs_diff)
+    max_rel = jnp.max(rel_diff)
+    mean_rel = jnp.mean(rel_diff)
+    max_tpu = jnp.max(jnp.abs(tpu_arr))
+    max_ref = jnp.max(ref_abs)
+
+    jax.debug.print(
+        "ragged_paged_attention compare: max_abs={max_abs}, mean_abs={mean_abs}, max_rel={max_rel}, "
+        "mean_rel={mean_rel}, max_ref={max_ref}, max_tpu={max_tpu}",
+        max_abs=max_abs,
+        mean_abs=mean_abs,
+        max_rel=max_rel,
+        mean_rel=mean_rel,
+        max_ref=max_ref,
+        max_tpu=max_tpu,
+    )
 
 
 class AttentionBackend(Enum):
@@ -1724,6 +1759,8 @@ def ragged_paged_attention(
             return False
         return True
 
+    compare_outputs = _should_compare_ragged_paged_attention()
+
     if _tpu_rpa_available():
         try:
             out = _do_tpu_ragged_paged_attention(
@@ -1736,6 +1773,18 @@ def ragged_paged_attention(
                 sm_scale=sm_scale,
                 soft_cap=soft_cap,
             )
+            if compare_outputs:
+                reference_out = default_ragged_paged_attention(
+                    q,
+                    kv_pages,
+                    kv_lens,
+                    page_indices,
+                    cu_q_lens.array,
+                    num_seqs,
+                    sm_scale=sm_scale,
+                    soft_cap=soft_cap,
+                )
+                _debug_print_ragged_paged_attention_metrics(out, reference_out)
             return out
         except Exception:  # pragma: no cover - fall back if kernel fails
             warnings.warn("TPU ragged paged attention failed. Falling back to reference implementation.")
