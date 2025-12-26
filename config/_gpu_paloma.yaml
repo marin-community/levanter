@@ -1,0 +1,97 @@
+data:
+  cache_dir: /scr-ssd/sampark/levanter/data_cache/dolma_olmo_paloma
+  configs:
+    dolma-algebraic-stack:
+      train_urls:
+        - gs://marin-us-central2/raw/dolma/v1.7/algebraic-stack-train-{0000..0000}.json.gz
+    dolma-arxiv:
+      train_urls:
+        - gs://marin-us-central2/raw/dolma/v1.7/arxiv-{0000..0000}.json.gz
+    #dolma-stackexchange:
+    #  train_urls:
+    #    - gs://marin-us-central2/raw/dolma/v1.7/stackexchange-{0000..0000}.json.gz
+    # these are just for eval
+    "paloma/dolma_100_programing_languages":
+      validation_urls:
+        - gs://levanter-data/paloma/dolma_100_programing_languages/val/val*.jsonl.gz
+  train_weights:
+    # sampling proportion comes from https://huggingface.co/datasets/allenai/dolma
+    dolma-algebraic-stack: 1.0 # 12.6 * 1.0
+    dolma-arxiv: 1.0 # 28.0 * 1.0
+    #dolma-stackexchange: 1.0 # 1.0
+    paloma/dolma_100_programing_languages: 0.0
+  zero_loss_datasets:
+    - dolma-algebraic-stack
+
+eval_harness:
+  task_spec:
+    - task: arc_easy
+      num_fewshot: 0
+  max_eval_length: 128
+  max_examples: 10
+
+model:
+  type: gpt2
+  hidden_dim: 768
+  num_heads: 2
+  num_layers: 2
+  seq_len: 128
+  gradient_checkpointing: true
+  layer_norm_epsilon: 1e-2
+  #qk_norm: true
+trainer:
+  mp: p=f32,c=f32
+  model_axis_size: 1
+  fsdp_axis: "embed"
+  per_device_parallelism: 4
+  per_device_eval_parallelism: 4
+
+  profiler: false
+  profiler_start_step: 2
+  profiler_num_steps: 2
+  backward_profiler: false
+  backward_profiler_start_step: 4
+  backward_profiler_num_steps: 2
+  log_dir: "jax_profile_traces"
+
+  train_batch_size: 16
+  num_train_steps: 8
+  max_eval_batches: 1
+
+  ray:
+    auto_start_cluster: false
+
+  tracker:
+    - type: wandb
+      project: "levanter"
+      save_xla_dumps: true
+
+  checkpointer:
+    keep:
+      - every: 1
+    save_interval: 5m
+    base_path: /juice5b/scr5b/sampark/levanter/checkpoints/test_mixture
+
+  load_debug_weights: false
+
+  metagrad_checkpoint_frequency: 1
+  metagrad_segment_size: 4
+
+  # Enable logging of gradients, parameters, and Adam optimizer state (mu and nu)
+  watch:
+    watch_targets: ["grads", "params"]
+    include_norms: true
+    include_per_parameter_norms: true
+    interval: 10
+
+  debug_print_loss_mask: true
+  debug_print_loss_mask_values: true
+
+out_dir: out_dir_test
+optimizer:
+  lr_schedule: linear
+  learning_rate: 1E-4
+  weight_decay: 0.1
+  warmup: 0.1
+
+initialize_from_checkpoint_path: "gs://marin-us-central1/checkpoints/data_grads/smoothness-v4-bs1024-s24000-lr1.0e-03-wd0.10-gc1.0-er1.00e-08/checkpoints/step-23999"

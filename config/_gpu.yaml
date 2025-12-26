@@ -1,0 +1,74 @@
+data:
+  cache_dir: /scr-ssd/sampark/levanter/data_cache/wiki_mixed
+  configs:
+    wikiA:
+      id: dlwh/wikitext_103_detokenized
+    dolma-stackexchange:
+      train_urls:
+        - gs://marin-us-central2/raw/dolma/v1.7/stackexchange-{0000..0001}.json.gz
+  train_weights:
+    # sampling proportion comes from https://huggingface.co/datasets/allenai/dolma
+    wikiA: 1.0 # 12.6 * 1.0
+    dolma-stackexchange: 1.0 # 28.0 * 1.0
+  shuffle: false
+
+model:
+  type: gpt2
+  hidden_dim: 768
+  num_heads: 2
+  num_layers: 2
+  seq_len: 128
+  gradient_checkpointing: true
+  layer_norm_epsilon: 1e-2
+  #qk_norm: true
+trainer:
+  mp: p=f32,c=f32
+  model_axis_size: 1
+  fsdp_axis: "embed"
+  per_device_parallelism: 1
+  per_device_eval_parallelism: 1
+
+  profiler: false
+  profiler_start_step: 2
+  profiler_num_steps: 2
+  backward_profiler: false
+  backward_profiler_start_step: 4
+  backward_profiler_num_steps: 2
+  log_dir: "jax_profile_traces"
+
+  train_batch_size: 4
+  num_train_steps: 4
+  max_eval_batches: 1
+
+  ray:
+    auto_start_cluster: false
+
+  tracker:
+    - type: noop
+
+  checkpointer:
+    keep:
+      - every: 1
+    save_interval: 5m
+    base_path: /juice5b/scr5b/sampark/levanter/checkpoints/gpu_debug
+
+  #id: gpu_debug_conda
+
+  load_debug_weights: false
+
+  metagrad_checkpoint_frequency: 1
+  metagrad_segment_size: 2
+
+  # Enable logging of gradients, parameters, and Adam optimizer state (mu and nu)
+  watch:
+    watch_targets: ["grads", "params"]
+    include_norms: true
+    include_per_parameter_norms: true
+    interval: 10
+
+out_dir: out_dir_test
+optimizer:
+  lr_schedule: linear
+  learning_rate: 1E-4
+  weight_decay: 0.1
+  warmup: 0.1

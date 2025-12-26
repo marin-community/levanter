@@ -1,0 +1,73 @@
+ ### Finetunes a pre-trained (smooth) GPT-2 model on wikitext
+
+data:
+  # CHANGE (only downside to /scr-ssd is that if you change machines, you need to redownload)
+  cache_dir: /scr-ssd/sampark/levanter/data_cache/
+  id: dlwh/wikitext_103_detokenized
+
+model:
+  type: gpt2
+  hidden_dim: 768
+  num_heads: 12
+  num_layers: 12
+  seq_len: 128
+  gradient_checkpointing: true
+  layer_norm_epsilon: 1e-2
+  qk_norm: true
+
+trainer:
+  mp: p=f32,c=f32
+  model_axis_size: 1
+  fsdp_axis: null
+  per_device_parallelism: 128
+  per_device_eval_parallelism: 128
+
+  steps_per_eval: 100
+
+  profiler: false
+  profiler_start_step: 7
+  profiler_num_steps: 2
+  backward_profiler: false
+  backward_profiler_start_step: 3
+  backward_profiler_num_steps: 2
+  log_dir: "jax_profile_traces"
+
+  train_batch_size: 1024
+  num_train_steps: 100
+  max_eval_batches: 1
+
+  debug_print_loss_mask: false
+
+  ray:
+    auto_start_cluster: false
+
+  tracker:
+    - type: wandb
+      # CHANGE (if you want)
+      project: "data_grads"
+      #name: "test_fineweb_meta"
+      #save_xla_dumps: true
+
+  checkpointer:
+    keep:
+      - every: 1
+    save_interval: 10m
+    # CHANGE: where checkpoints get saved
+    base_path: /juice5b/scr5b/sampark/marin/checkpoints/
+
+  load_debug_weights: false
+  metagrad_segment_size: 100
+
+# CHANGE: where results get saved
+out_dir: /juice5b/scr5b/sampark/marin/results/gpt2_finetune_wiki
+
+optimizer:
+  lr_schedule: linear
+  learning_rate: 1E-4
+  weight_decay: 0.1
+  warmup: 0.1
+  max_grad_norm: 1.0
+
+initialize_from_checkpoint_path: "gs://marin-us-central1/checkpoints/data_grads/smoothness-v4-bs1024-s24000-lr1.0e-03-wd0.10-gc1.0-er1.00e-08/checkpoints/step-23999"
+# If you can't access above, try this instead:
+# initialize_from_checkpoint_path: "/juice5b/scr5b/sampark/marin/checkpoints/smooth-gpt2-bs1024-s24000-lr1.0e-03-wd0.10-gc1.0-er1.00e-08/step-23999"
