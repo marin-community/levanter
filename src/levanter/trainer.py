@@ -1104,7 +1104,10 @@ class Trainer:
             resumed_step = int(jax.device_get(state.step))
         logger.info(f"> Resuming forward checkpoint: step-{resumed_step} from {checkpoint_path}")
 
-                # --- Force FSDP sharding on state once, pre-JIT ---
+        # NOTE: Disabled FSDP constraint block - was causing resume non-determinism
+        # The checkpoint restoration should already provide correct sharding.
+        '''
+        # --- Force FSDP sharding on state once, pre-JIT ---
         with hax.axis_mapping(self.parameter_axis_mapping):
             mesh = self.device_mesh
 
@@ -1123,8 +1126,9 @@ class Trainer:
             )
 
             state = eqx.tree_at(lambda s: (s.model, s.opt_state), state, (constrained_model, constrained_opt))
-
+        '''
         return state
+
 
     @property
     def checkpoint_path(self) -> str:
