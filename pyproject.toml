@@ -43,7 +43,7 @@ dependencies = [
     "gcsfs>=2024.2,<2026",
     "braceexpand>=0.1.7",
     "jmp>=0.0.3",
-    "fsspec[http]>=2024.2,<2026",
+    "fsspec[http]>=2024.2,<2027",
     "tensorstore>=0.1.73",
     "pytimeparse>=1.1.8",
     "humanfriendly==10.0",
